@@ -1,0 +1,50 @@
+[project]
+name = "terminal-desktop-next"
+version = "0.1.0"
+description = "An isolated plugin-driven terminal desktop"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "textual==8.2.8",
+    "pydantic>=2.10,<3",
+    "typer>=0.15,<1",
+    "anyio>=4,<5",
+    "ghostty-textual==0.1.0; (sys_platform == 'linux' or sys_platform == 'darwin') and (platform_machine == 'x86_64' or platform_machine == 'aarch64' or platform_machine == 'arm64')",
+]
+
+[project.scripts]
+tdnext = "tdnext.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "anyio>=4,<5", "ruff>=0.8", "basedpyright>=1.21"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+skip-excluded-dirs = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tdnext"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/zellij-navigator-broker/target"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-config --strict-markers"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.basedpyright]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+include = ["src"]
+venvPath = "."
+venv = ".venv"
