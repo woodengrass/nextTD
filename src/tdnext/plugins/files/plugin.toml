@@ -1,0 +1,10 @@
+id = "files"
+name = "Files"
+version = "0.1.0"
+description = "Browse and manage local files"
+entrypoint = "tdnext.plugins.files.plugin:FilesPlugin"
+icon = "▤"
+icon_key = "files"
+capabilities = ["desktop.view", "files.browse"]
+requires_plugins = ["desktop"]
+requires_executables = []
