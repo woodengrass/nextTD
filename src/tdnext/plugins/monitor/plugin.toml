@@ -1,0 +1,10 @@
+id = "monitor"
+name = "Monitor"
+version = "0.1.0"
+description = "Launch the real btop system monitor"
+entrypoint = "tdnext.plugins.monitor.plugin:MonitorPlugin"
+icon = "▥"
+icon_key = "monitor"
+capabilities = ["desktop.view", "system.monitor"]
+requires_plugins = ["desktop"]
+requires_executables = ["btop"]

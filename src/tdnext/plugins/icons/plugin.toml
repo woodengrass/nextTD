@@ -1,0 +1,8 @@
+id = "icons"
+name = "Codicons"
+version = "0.1.0"
+description = "Optional compatibility text and Nerd Font Codicons service"
+entrypoint = "tdnext.plugins.icons.plugin:CodiconsProvider"
+capabilities = ["icons.provider"]
+requires_plugins = []
+requires_executables = []
