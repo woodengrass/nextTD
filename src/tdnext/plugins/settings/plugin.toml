@@ -1,0 +1,10 @@
+id = "settings"
+name = "Settings"
+version = "0.1.0"
+description = "Manage installed and enabled plugins"
+entrypoint = "tdnext.plugins.settings.plugin:SettingsPlugin"
+placement = "header"
+icon_key = "settings"
+capabilities = ["desktop.view", "settings.manage"]
+requires_plugins = ["desktop"]
+requires_executables = []
