@@ -1,0 +1,1332 @@
+diff --git a/zellij-client/src/input_handler.rs b/zellij-client/src/input_handler.rs
+index a7f2ab3..3aafee9 100644
+--- a/zellij-client/src/input_handler.rs
++++ b/zellij-client/src/input_handler.rs
+@@ -451,8 +451,11 @@ impl InputHandler {
+             | Action::GoToPreviousTab
+             | Action::CloseTab
+             | Action::GoToTab { .. }
+-            | Action::MoveTab { .. }
+             | Action::GoToTabName { .. }
++            | Action::OpenTabWithReturn { .. }
++            | Action::ReturnToOrigin
++            | Action::RestoreFocusFromHeader
++            | Action::MoveTab { .. }
+             | Action::ToggleTab
+             | Action::MoveFocusOrTab { .. } => {
+                 self.command_is_executing.blocking_input_thread();
+diff --git a/zellij-server/src/lib.rs b/zellij-server/src/lib.rs
+index c86de12..925e14a 100644
+--- a/zellij-server/src/lib.rs
++++ b/zellij-server/src/lib.rs
+@@ -763,6 +763,11 @@ impl SessionState {
+     pub fn get_last_active_client(&self) -> Option<ClientId> {
+         self.last_active_client
+     }
++    fn unique_navigable_client(&self) -> Option<ClientId> {
++        let mut clients = self.clients.iter().filter_map(|(id, data)| data.as_ref().map(|_| *id));
++        let client = clients.next()?;
++        if clients.next().is_some() { None } else { Some(client) }
++    }
+     pub fn clear_last_active_client(&mut self, client_id: ClientId) {
+         if self.last_active_client == Some(client_id) {
+             self.last_active_client = None;
+@@ -792,6 +797,18 @@ impl SessionState {
+ mod session_state_tests {
+     use super::*;
+ 
++    #[test]
++    fn navigation_cli_fallback_requires_one_attached_non_watcher() {
++        let mut state = SessionState::new();
++        state.clients.insert(2, None);
++        assert_eq!(state.unique_navigable_client(), None);
++        state.set_client_data(1, Size { cols: 120, rows: 36 }, false);
++        state.watchers.insert(3, true);
++        assert_eq!(state.unique_navigable_client(), Some(1));
++        state.set_client_data(4, Size { cols: 120, rows: 36 }, true);
++        assert_eq!(state.unique_navigable_client(), None);
++    }
++
+     fn with_client(id: ClientId) -> SessionState {
+         let mut s = SessionState::new();
+         s.clients.insert(id, None);
+diff --git a/zellij-server/src/route.rs b/zellij-server/src/route.rs
+index 7ee9e0d..df5585d 100644
+--- a/zellij-server/src/route.rs
++++ b/zellij-server/src/route.rs
+@@ -1118,6 +1118,32 @@ pub(crate) fn route_action(
+                 ))
+                 .with_context(err_context)?;
+         },
++        Action::OpenTabWithReturn { name, from_header } => {
++            senders
++                .send_to_screen(ScreenInstruction::OpenTabWithReturn(
++                    name,
++                    from_header,
++                    if from_header && cli_client_id.is_some() { pane_id } else { None },
++                    client_id,
++                    Some(NotificationEnd::new(completion_tx)),
++                ))
++                .with_context(err_context)?;
++        },
++        Action::ReturnToOrigin => {
++            senders
++                .send_to_screen(ScreenInstruction::ReturnToOrigin(
++                    client_id,
++                    Some(NotificationEnd::new(completion_tx)),
++                ))
++                .with_context(err_context)?;
++        },
++        Action::RestoreFocusFromHeader => {
++            senders.send_to_screen(ScreenInstruction::RestoreFocusFromHeader(
++                if cli_client_id.is_some() { pane_id } else { None },
++                client_id,
++                Some(NotificationEnd::new(completion_tx)),
++            )).with_context(err_context)?;
++        },
+         Action::TabNameInput { input } => {
+             senders
+                 .send_to_screen(ScreenInstruction::UpdateTabName(
+@@ -2422,10 +2448,16 @@ pub(crate) fn route_thread_main(
+                                 // detach, etc.) for which using the cli client id will not be
+                                 // doing the right thing - using the last_active_client is almost
+                                 // certainly correct in almost all cases
+-                                session_state
+-                                    .read()
+-                                    .unwrap()
++                                let state = session_state.read().unwrap();
++                                state
+                                     .get_last_active_client()
++                                    .or_else(|| {
++                                        if matches!(action, Action::ReturnToOrigin) {
++                                            state.unique_navigable_client()
++                                        } else {
++                                            None
++                                        }
++                                    })
+                                     .or(maybe_client_id)
+                                     .unwrap_or(client_id)
+                             } else {
+diff --git a/zellij-server/src/screen.rs b/zellij-server/src/screen.rs
+index 0f6c5c9..0aaa484 100644
+--- a/zellij-server/src/screen.rs
++++ b/zellij-server/src/screen.rs
+@@ -526,6 +526,9 @@ pub enum ScreenInstruction {
+         Option<ClientId>,
+         Option<NotificationEnd>,
+     ),
++    OpenTabWithReturn(String, bool, Option<PaneId>, ClientId, Option<NotificationEnd>),
++    RestoreFocusFromHeader(Option<PaneId>, ClientId, Option<NotificationEnd>),
++    ReturnToOrigin(ClientId, Option<NotificationEnd>),
+     ToggleTab(ClientId, Option<NotificationEnd>),
+     UpdateTabName(Vec<u8>, ClientId, Option<NotificationEnd>),
+     UndoRenameTab(ClientId, Option<NotificationEnd>),
+@@ -1083,6 +1086,9 @@ impl From<&ScreenInstruction> for ScreenContext {
+             ScreenInstruction::CloseTab(..) => ScreenContext::CloseTab,
+             ScreenInstruction::GoToTab(..) => ScreenContext::GoToTab,
+             ScreenInstruction::GoToTabName(..) => ScreenContext::GoToTabName,
++            ScreenInstruction::OpenTabWithReturn(..) => ScreenContext::GoToTabName,
++            ScreenInstruction::ReturnToOrigin(..) => ScreenContext::GoToTab,
++            ScreenInstruction::RestoreFocusFromHeader(..) => ScreenContext::GoToTab,
+             ScreenInstruction::UpdateTabName(..) => ScreenContext::UpdateTabName,
+             ScreenInstruction::UndoRenameTab(..) => ScreenContext::UndoRenameTab,
+             ScreenInstruction::MoveTabLeft(..) => ScreenContext::MoveTabLeft,
+@@ -1516,6 +1522,13 @@ fn format_guest_modal_shortcut(keys: &[KeyWithModifier]) -> Vec<String> {
+     keys.iter().map(|key| key.to_string()).collect()
+ }
+ 
++#[derive(Clone, Copy)]
++struct NavigationOrigin {
++    tab_id: usize,
++    pane_id: PaneId,
++    destination_id: usize,
++}
++
+ /// A [`Screen`] holds multiple [`Tab`]s, each one holding multiple [`panes`](crate::client::panes).
+ /// It only directly controls which tab is active, delegating the rest to the individual `Tab`.
+ pub(crate) struct Screen {
+@@ -1543,6 +1556,8 @@ pub(crate) struct Screen {
+     client_sizes: HashMap<ClientId, Size>,
+     global_last_active_tab_id: usize,
+     tab_history: BTreeMap<ClientId, Vec<usize>>,
++    navigation_origins: BTreeMap<ClientId, NavigationOrigin>,
++    detached_navigation_origin: Option<NavigationOrigin>,
+     pane_history: BTreeMap<ClientId, Vec<PaneId>>,
+     mode_info: BTreeMap<ClientId, ModeInfo>,
+     default_mode_info: ModeInfo, // TODO: restructure ModeInfo to prevent this duplication
+@@ -1757,6 +1772,8 @@ impl Screen {
+             terminal_emulator_colors: Rc::new(RefCell::new(Palette::default())),
+             terminal_emulator_color_codes: Rc::new(RefCell::new(HashMap::new())),
+             tab_history: BTreeMap::new(),
++            navigation_origins: BTreeMap::new(),
++            detached_navigation_origin: None,
+             pane_history: BTreeMap::new(),
+             mode_info: BTreeMap::new(),
+             default_mode_info: mode_info,
+@@ -2258,10 +2275,142 @@ impl Screen {
+         self.switch_active_tab_name(name, client_id)
+     }
+ 
++    fn open_tab_with_return(&mut self, name: &str, client_id: ClientId) -> Result<()> {
++        self.open_tab_with_return_mode(name, client_id, false)
++    }
++
++    fn open_tab_with_return_mode(&mut self, name: &str, client_id: ClientId, from_header: bool) -> Result<()> {
++        let source = if from_header { self.get_active_pane_id(&client_id) } else { None };
++        self.open_tab_with_return_source(name, client_id, from_header, source)
++    }
++
++    fn header_previous_pane(&self, client_id: ClientId, source: PaneId) -> Option<PaneId> {
++        let tab_id = self.active_tab_ids.get(&client_id)?;
++        let tab = self.tabs.get(tab_id)?;
++        if !tab.has_pane_with_pid(&source) {
++            return None;
++        }
++        self.pane_history.get(&client_id)?.iter().rev().copied().find(|pane| {
++            *pane != source && tab.has_pane_with_pid(pane)
++        })
++    }
++
++    fn header_client(&self, source: PaneId) -> Option<ClientId> {
++        let mut clients = self.active_tab_ids.iter().filter_map(|(client_id, tab_id)| {
++            self.tabs.get(tab_id).filter(|tab| tab.has_pane_with_pid(&source)).map(|_| *client_id)
++        });
++        let client_id = clients.next()?;
++        if clients.next().is_some() { None } else { Some(client_id) }
++    }
++
++    fn restore_focus_from_header(&mut self, _client_id: ClientId, source: PaneId) -> Result<()> {
++        let Some(client_id) = self.header_client(source) else {
++            return Ok(());
++        };
++        let Some(pane_id) = self.header_previous_pane(client_id, source) else {
++            return Ok(());
++        };
++        let old_pane_id = self.get_active_pane_id(&client_id);
++        if let Ok(tab) = self.get_active_tab_mut(client_id) {
++            tab.focus_pane_with_id(pane_id, true, false, client_id)?;
++        }
++        if let (Some(old), Some(new)) = (old_pane_id, self.get_active_pane_id(&client_id)) {
++            self.report_key_passthrough_state(client_id, old, new);
++        }
++        self.sync_scroll_mode_on_focus(client_id)?;
++        self.render(None)
++    }
++
++    fn open_tab_with_return_source(&mut self, name: &str, client_id: ClientId, from_header: bool, source: Option<PaneId>) -> Result<()> {
++        let client_id = if from_header {
++            let Some(client_id) = source.and_then(|source| self.header_client(source)) else {
++                return Ok(());
++            };
++            client_id
++        } else {
++            client_id
++        };
++        let Some(destination) = self.tabs.values().find(|tab| tab.name == name) else {
++            return Ok(());
++        };
++        let destination_id = destination.id;
++        let destination_position = destination.position;
++        let Some(&origin_tab_id) = self.active_tab_ids.get(&client_id) else {
++            return Ok(());
++        };
++        if origin_tab_id == destination_id {
++            if from_header {
++                if let Some(source) = source {
++                    self.restore_focus_from_header(client_id, source)?;
++                }
++            }
++            return Ok(());
++        }
++        let Some(active_pane_id) = self.get_active_pane_id(&client_id) else {
++            return Ok(());
++        };
++        let origin_pane_id = if from_header {
++            let Some(origin) = source.and_then(|source| self.header_previous_pane(client_id, source)) else {
++                return Ok(());
++            };
++            origin
++        } else {
++            active_pane_id
++        };
++        self.switch_active_tab(destination_position, None, true, client_id)?;
++        self.navigation_origins.insert(
++            client_id,
++            NavigationOrigin {
++                tab_id: origin_tab_id,
++                pane_id: origin_pane_id,
++                destination_id,
++            },
++        );
++        Ok(())
++    }
++
++    fn return_to_origin(&mut self, client_id: ClientId) -> Result<()> {
++        let Some(&NavigationOrigin {
++            tab_id,
++            pane_id,
++            destination_id,
++        }) = self.navigation_origins.get(&client_id)
++        else {
++            return Ok(());
++        };
++        if self.active_tab_ids.get(&client_id) != Some(&destination_id) {
++            return Ok(());
++        }
++        let Some(tab) = self
++            .tabs
++            .get(&tab_id)
++            .filter(|tab| tab.has_pane_with_pid(&pane_id))
++        else {
++            self.navigation_origins.remove(&client_id);
++            return Ok(());
++        };
++        let position = tab.position;
++        self.switch_active_tab(position, None, true, client_id)?;
++        let old_pane_id = self.get_active_pane_id(&client_id);
++        if let Some(tab) = self.tabs.get_mut(&tab_id) {
++            tab.focus_pane_with_id(pane_id, true, false, client_id)?;
++        }
++        if let (Some(old), Some(new)) = (old_pane_id, self.get_active_pane_id(&client_id)) {
++            self.report_key_passthrough_state(client_id, old, new);
++        }
++        self.sync_scroll_mode_on_focus(client_id)?;
++        self.navigation_origins.remove(&client_id);
++        self.render(None)
++    }
++
+     fn close_tab_by_id(&mut self, tab_id: usize) -> Result<()> {
+         let err_context = || format!("failed to close tab at index {tab_id:?}");
+ 
+         let mut tab_to_close = self.tabs.remove(&tab_id).with_context(err_context)?;
++        self.navigation_origins.retain(|_, origin| origin.tab_id != tab_id && origin.destination_id != tab_id);
++        if self.detached_navigation_origin.as_ref().is_some_and(|origin| origin.tab_id == tab_id || origin.destination_id == tab_id) {
++            self.detached_navigation_origin = None;
++        }
+         let mut pane_ids = tab_to_close.get_all_pane_ids();
+ 
+         // here we extract the suppressed panes (these are background panes that don't care which
+@@ -5041,6 +5190,7 @@ impl Screen {
+         }
+ 
+         let is_watcher = self.watcher_clients.contains_key(&client_id);
++        let adopt_detached_origin = !is_watcher && !self.active_tab_ids.keys().any(|id| !self.watcher_clients.contains_key(id));
+         let attach_to_first_tab_on_tiled_surface = is_web_client && !is_watcher;
+         let first_tab_index = self
+             .tabs
+@@ -5095,6 +5245,15 @@ impl Screen {
+         if attach_to_first_tab_on_tiled_surface && tab.are_floating_panes_visible() {
+             tab.hide_floating_panes();
+         }
++        if adopt_detached_origin {
++            if let Some(origin) = self.detached_navigation_origin.take() {
++                if self.tabs.contains_key(&origin.destination_id)
++                    && self.tabs.get(&origin.tab_id).is_some_and(|tab| tab.has_pane_with_pid(&origin.pane_id))
++                {
++                    self.navigation_origins.insert(client_id, origin);
++                }
++            }
++        }
+         self.recompute_tab_size(tab_index)
+             .with_context(|| err_context(tab_index))?;
+         if !self.nested_ancestry.is_empty() || !self.host_descend_keys.is_empty() {
+@@ -5105,6 +5264,9 @@ impl Screen {
+ 
+     pub fn remove_client(&mut self, client_id: ClientId) -> Result<()> {
+         let err_context = || format!("failed to remove client {client_id}");
++        let final_navigable_client = self.active_tab_ids.contains_key(&client_id)
++            && !self.watcher_clients.contains_key(&client_id)
++            && !self.active_tab_ids.keys().any(|id| *id != client_id && !self.watcher_clients.contains_key(id));
+ 
+         self.set_client_dimmed(client_id, false, None);
+         let passthrough_panes: Vec<PaneId> = self
+@@ -5168,6 +5330,10 @@ impl Screen {
+         if self.tab_history.contains_key(&client_id) {
+             self.tab_history.remove(&client_id);
+         }
++        let removed_origin = self.navigation_origins.remove(&client_id);
++        if final_navigable_client {
++            self.detached_navigation_origin = removed_origin;
++        }
+         self.connected_clients.borrow_mut().remove(&client_id);
+         self.client_kitty_host_state.borrow_mut().remove(&client_id);
+         let removed_kitty_capability = self
+@@ -9922,6 +10088,40 @@ pub(crate) fn screen_thread_main(
+                     },
+                 }
+             },
++            ScreenInstruction::OpenTabWithReturn(name, from_header, source, client_id, completion_tx) => {
++                if pending_tab_ids.is_empty() {
++                    if from_header {
++                        screen.open_tab_with_return_source(&name, client_id, true, source)?;
++                    } else {
++                        screen.open_tab_with_return(&name, client_id)?;
++                    }
++                } else {
++                    pending_events_waiting_for_tab.push(ScreenInstruction::OpenTabWithReturn(
++                        name,
++                        from_header,
++                        source,
++                        client_id,
++                        completion_tx,
++                    ));
++                }
++            },
++            ScreenInstruction::RestoreFocusFromHeader(source, client_id, completion_tx) => {
++                if pending_tab_ids.is_empty() {
++                    if let Some(source) = source {
++                        screen.restore_focus_from_header(client_id, source)?;
++                    }
++                } else {
++                    pending_events_waiting_for_tab.push(ScreenInstruction::RestoreFocusFromHeader(source, client_id, completion_tx));
++                }
++            },
++            ScreenInstruction::ReturnToOrigin(client_id, completion_tx) => {
++                if pending_tab_ids.is_empty() {
++                    screen.return_to_origin(client_id)?;
++                } else {
++                    pending_events_waiting_for_tab
++                        .push(ScreenInstruction::ReturnToOrigin(client_id, completion_tx));
++                }
++            },
+             ScreenInstruction::GoToTabName(
+                 tab_name,
+                 default_shell,
+diff --git a/zellij-server/src/unit/screen_tests.rs b/zellij-server/src/unit/screen_tests.rs
+index ddc7a67..8643afd 100644
+--- a/zellij-server/src/unit/screen_tests.rs
++++ b/zellij-server/src/unit/screen_tests.rs
+@@ -915,6 +915,536 @@ fn new_tab(screen: &mut Screen, pid: u32, tab_index: usize) {
+         .expect("TEST");
+ }
+ 
++fn navigation_screen(mirrored: bool) -> Screen {
++    let size = Size {
++        cols: 121,
++        rows: 20,
++    };
++    let (mut screen, _, _) = create_new_screen_with_capture(size, true, true, true, mirrored);
++    new_tab(&mut screen, 1, 0);
++    new_tab(&mut screen, 2, 1);
++    screen.tabs.get_mut(&0).unwrap().name = "origin".into();
++    screen.tabs.get_mut(&1).unwrap().name = "tools".into();
++    screen.go_to_tab(1, 1).unwrap();
++    screen
++}
++
++#[test]
++fn navigation_returns_to_original_tab_and_pane() {
++    let mut screen = navigation_screen(false);
++    let origin = screen.get_active_pane_id(&1);
++    screen.open_tab_with_return("tools", 1).unwrap();
++    screen.return_to_origin(1).unwrap();
++    assert_eq!(
++        (
++            screen.get_active_tab(1).unwrap().id,
++            screen.get_active_pane_id(&1)
++        ),
++        (0, origin)
++    );
++}
++
++#[test]
++fn navigation_reconnect_restores_original_tab_and_pane() {
++    for client_id in [1, 2] {
++        let mut screen = navigation_screen(false);
++        let origin = screen.get_active_pane_id(&1);
++        screen.open_tab_with_return("tools", 1).unwrap();
++        screen.remove_client(1).unwrap();
++        screen.add_client(client_id, false).unwrap();
++        screen.return_to_origin(client_id).unwrap();
++        assert_eq!(
++            (screen.get_active_tab(client_id).unwrap().id, screen.get_active_pane_id(&client_id)),
++            (0, origin),
++            "reconnected client {client_id}"
++        );
++    }
++}
++
++#[test]
++fn navigation_reconnect_survives_unknown_and_duplicate_removals() {
++    let mut screen = navigation_screen(false);
++    let origin = screen.get_active_pane_id(&1);
++    screen.open_tab_with_return("tools", 1).unwrap();
++    screen.remove_client(1).unwrap();
++    screen.remove_client(999).unwrap();
++    screen.remove_client(1).unwrap();
++    screen.add_client(2, false).unwrap();
++    screen.return_to_origin(2).unwrap();
++    assert_eq!((screen.get_active_tab(2).unwrap().id, screen.get_active_pane_id(&2)), (0, origin));
++}
++
++#[test]
++fn navigation_reconnect_does_not_transfer_nonfinal_client_origin() {
++    let mut screen = navigation_screen(false);
++    screen.add_client(2, false).unwrap();
++    screen.open_tab_with_return("tools", 1).unwrap();
++    screen.remove_client(1).unwrap();
++    screen.remove_client(2).unwrap();
++    screen.add_client(3, false).unwrap();
++    screen.go_to_tab(2, 3).unwrap();
++    screen.return_to_origin(3).unwrap();
++    assert_eq!(screen.get_active_tab(3).unwrap().id, 1);
++}
++
++#[test]
++fn navigation_reconnect_preserves_origin_while_away_from_destination() {
++    let mut screen = navigation_screen(false);
++    new_tab(&mut screen, 3, 2);
++    screen.go_to_tab(1, 1).unwrap();
++    screen.open_tab_with_return("tools", 1).unwrap();
++    screen.remove_client(1).unwrap();
++    screen.add_client(2, true).unwrap();
++    screen.return_to_origin(2).unwrap();
++    screen.go_to_tab(2, 2).unwrap();
++    screen.return_to_origin(2).unwrap();
++    assert_eq!(screen.get_active_tab(2).unwrap().id, 0);
++}
++
++#[test]
++fn navigation_reconnect_closed_origin_before_reuse_is_not_restored() {
++    let mut screen = navigation_screen(false);
++    screen.open_tab_with_return("tools", 1).unwrap();
++    screen.remove_client(1).unwrap();
++    screen.close_tab_by_id(0).unwrap();
++    screen.add_client(2, false).unwrap();
++    new_tab(&mut screen, 99, 0);
++    let position = screen.tabs.get(&1).unwrap().position;
++    screen.go_to_tab(position + 1, 2).unwrap();
++    screen.return_to_origin(2).unwrap();
++    assert_eq!(screen.get_active_tab(2).unwrap().id, 1);
++}
++
++#[test]
++fn navigation_reconnect_repeated_cycles_restore_once() {
++    let mut screen = navigation_screen(false);
++    for (old, new) in [(1, 2), (2, 1)] {
++        let origin = screen.get_active_pane_id(&old);
++        screen.open_tab_with_return("tools", old).unwrap();
++        screen.remove_client(old).unwrap();
++        screen.add_client(new, false).unwrap();
++        screen.return_to_origin(new).unwrap();
++        assert_eq!((screen.get_active_tab(new).unwrap().id, screen.get_active_pane_id(&new)), (0, origin));
++        screen.go_to_tab(2, new).unwrap();
++        screen.return_to_origin(new).unwrap();
++        assert_eq!(screen.get_active_tab(new).unwrap().id, 1);
++        screen.go_to_tab(1, new).unwrap();
++    }
++}
++
++#[test]
++fn navigation_reconnect_closed_pane_does_not_switch() {
++    let mut screen = navigation_screen(false);
++    screen.get_active_tab_mut(1).unwrap().new_pane(
++        PaneId::Terminal(3), None, None, false, true,
++        NewPanePlacement::default(), Some(1), None,
++    ).unwrap();
++    let origin = screen.get_active_pane_id(&1).unwrap();
++    screen.open_tab_with_return("tools", 1).unwrap();
++    screen.remove_client(1).unwrap();
++    screen.tabs.get_mut(&0).unwrap().close_pane(origin, false, None);
++    screen.add_client(2, false).unwrap();
++    screen.return_to_origin(2).unwrap();
++    assert_eq!(screen.get_active_tab(2).unwrap().id, 1);
++}
++
++#[test]
++fn navigation_reconnect_closed_destination_before_reuse_is_not_restored() {
++    let mut screen = navigation_screen(false);
++    screen.open_tab_with_return("tools", 1).unwrap();
++    screen.remove_client(1).unwrap();
++    screen.close_tab_by_id(1).unwrap();
++    screen.add_client(2, false).unwrap();
++    new_tab(&mut screen, 99, 1);
++    screen.return_to_origin(2).unwrap();
++    assert_eq!(screen.get_active_tab(2).unwrap().id, 1);
++}
++
++#[test]
++fn navigation_reconnect_does_not_cross_screens() {
++    let mut first = navigation_screen(false);
++    let mut second = navigation_screen(false);
++    first.open_tab_with_return("tools", 1).unwrap();
++    first.remove_client(1).unwrap();
++    second.remove_client(1).unwrap();
++    second.add_client(2, false).unwrap();
++    second.go_to_tab(2, 2).unwrap();
++    second.return_to_origin(2).unwrap();
++    assert_eq!(second.get_active_tab(2).unwrap().id, 1);
++    first.add_client(2, false).unwrap();
++    first.return_to_origin(2).unwrap();
++    assert_eq!(first.get_active_tab(2).unwrap().id, 0);
++}
++
++#[test]
++fn navigation_reconnect_watcher_does_not_adopt_or_replace_origin() {
++    let mut screen = navigation_screen(false);
++    let origin = screen.get_active_pane_id(&1);
++    screen.open_tab_with_return("tools", 1).unwrap();
++    screen.remove_client(1).unwrap();
++    screen.watcher_clients.insert(2, super::WatcherState::new(Size { cols: 121, rows: 20 }));
++    screen.add_client(2, true).unwrap();
++    screen.return_to_origin(2).unwrap();
++    assert_eq!(screen.get_active_tab(2).unwrap().id, 1);
++    screen.add_client(3, false).unwrap();
++    screen.return_to_origin(3).unwrap();
++    assert_eq!((screen.get_active_tab(3).unwrap().id, screen.get_active_pane_id(&3)), (0, origin));
++}
++
++#[test]
++fn navigation_reconnect_final_client_without_origin_does_not_inherit_other_client_origin() {
++    let mut screen = navigation_screen(false);
++    screen.add_client(2, false).unwrap();
++    screen.open_tab_with_return("tools", 1).unwrap();
++    screen.remove_client(1).unwrap();
++    screen.remove_client(2).unwrap();
++    screen.add_client(3, false).unwrap();
++    screen.go_to_tab(2, 3).unwrap();
++    screen.return_to_origin(3).unwrap();
++    assert_eq!(screen.get_active_tab(3).unwrap().id, 1);
++}
++
++#[test]
++fn navigation_header_uses_previous_pane_in_current_tab() {
++    let mut screen = navigation_screen(false);
++    let origin = screen.get_active_pane_id(&1).unwrap();
++    screen.get_active_tab_mut(1).unwrap().new_pane(
++        PaneId::Terminal(3), None, None, false, true,
++        NewPanePlacement::default(), Some(1), None,
++    ).unwrap();
++    let header = screen.get_active_pane_id(&1).unwrap();
++    screen.pane_history.insert(1, vec![origin, PaneId::Terminal(2), header]);
++    screen.open_tab_with_return_mode("tools", 1, true).unwrap();
++    screen.return_to_origin(1).unwrap();
++    assert_eq!(screen.get_active_pane_id(&1), Some(origin));
++}
++
++#[test]
++fn navigation_header_source_is_excluded_after_focus_returns() {
++    let mut screen = navigation_screen(false);
++    let origin = screen.get_active_pane_id(&1).unwrap();
++    screen.get_active_tab_mut(1).unwrap().new_pane(
++        PaneId::Terminal(3), None, None, false, true,
++        NewPanePlacement::default(), Some(1), None,
++    ).unwrap();
++    let header = screen.get_active_pane_id(&1).unwrap();
++    screen.pane_history.insert(1, vec![origin, header, origin]);
++    screen.get_active_tab_mut(1).unwrap().focus_pane_with_id(origin, true, false, 1).unwrap();
++    screen.open_tab_with_return_source("tools", 1, true, Some(header)).unwrap();
++    screen.return_to_origin(1).unwrap();
++    assert_eq!(screen.get_active_pane_id(&1), Some(origin));
++}
++
++#[test]
++fn navigation_header_restores_floating_pane() {
++    let mut screen = navigation_screen(false);
++    let header = screen.get_active_pane_id(&1).unwrap();
++    screen.get_active_tab_mut(1).unwrap().new_pane(
++        PaneId::Terminal(3), None, None, false, true,
++        NewPanePlacement::Floating(None), Some(1), None,
++    ).unwrap();
++    let floating = screen.get_active_pane_id(&1).unwrap();
++    screen.pane_history.insert(1, vec![floating, header]);
++    screen.get_active_tab_mut(1).unwrap().focus_pane_with_id(header, true, false, 1).unwrap();
++    screen.restore_focus_from_header(1, header).unwrap();
++    assert_eq!(screen.get_active_pane_id(&1), Some(floating));
++}
++
++#[test]
++fn navigation_restores_floating_after_header_focus_with_unattached_cli_client() {
++    let mut screen = navigation_screen(false);
++    let header = screen.get_active_pane_id(&1).unwrap();
++    screen.get_active_tab_mut(1).unwrap().new_pane(
++        PaneId::Terminal(3), None, None, false, true,
++        NewPanePlacement::Floating(None), Some(1), None,
++    ).unwrap();
++    let floating = screen.get_active_pane_id(&1).unwrap();
++    screen.update_active_pane_ids();
++    screen.handle_mouse_event(MouseEvent::new_left_press_event(Position::new(0, 0)), 1);
++    assert_eq!(screen.get_active_pane_id(&1), Some(header));
++
++    screen.restore_focus_from_header(2, header).unwrap();
++
++    assert_eq!(screen.get_active_pane_id(&1), Some(floating));
++}
++
++#[test]
++fn navigation_active_target_header_restores_focus_without_losing_origin() {
++    let mut screen = navigation_screen(false);
++    let original = screen.get_active_pane_id(&1).unwrap();
++    screen.open_tab_with_return("tools", 1).unwrap();
++    let tool = screen.get_active_pane_id(&1).unwrap();
++    screen.get_active_tab_mut(1).unwrap().new_pane(
++        PaneId::Terminal(3), None, None, false, true,
++        NewPanePlacement::default(), Some(1), None,
++    ).unwrap();
++    let header = screen.get_active_pane_id(&1).unwrap();
++    screen.pane_history.insert(1, vec![tool, header]);
++    screen.open_tab_with_return_source("tools", 1, true, Some(header)).unwrap();
++    assert_eq!(screen.get_active_pane_id(&1), Some(tool));
++    screen.return_to_origin(1).unwrap();
++    assert_eq!(screen.get_active_pane_id(&1), Some(original));
++}
++
++#[test]
++fn navigation_header_already_at_destination_preserves_origin() {
++    let mut screen = navigation_screen(false);
++    let origin = screen.get_active_pane_id(&1);
++    screen.open_tab_with_return("tools", 1).unwrap();
++    screen.open_tab_with_return_mode("tools", 1, true).unwrap();
++    screen.return_to_origin(1).unwrap();
++    assert_eq!(screen.get_active_pane_id(&1), origin);
++}
++
++#[test]
++fn navigation_does_not_overwrite_origin_when_already_at_target() {
++    let mut screen = navigation_screen(false);
++    screen.open_tab_with_return("tools", 1).unwrap();
++    screen.open_tab_with_return("tools", 1).unwrap();
++    screen.return_to_origin(1).unwrap();
++    assert_eq!(screen.get_active_tab(1).unwrap().id, 0);
++}
++
++#[test]
++fn navigation_missing_destination_preserves_previous_origin() {
++    let mut screen = navigation_screen(false);
++    screen.open_tab_with_return("tools", 1).unwrap();
++    screen.open_tab_with_return("missing", 1).unwrap();
++    screen.return_to_origin(1).unwrap();
++    assert_eq!(screen.get_active_tab(1).unwrap().id, 0);
++}
++
++#[test]
++fn navigation_closed_origin_does_not_switch_tab() {
++    let mut screen = navigation_screen(false);
++    screen.open_tab_with_return("tools", 1).unwrap();
++    screen.close_tab_by_id(0).unwrap();
++    screen.return_to_origin(1).unwrap();
++    assert_eq!(screen.get_active_tab(1).unwrap().id, 1);
++}
++
++#[test]
++fn navigation_close_discards_origin_before_tab_id_reuse() {
++    let mut screen = navigation_screen(false);
++    screen.open_tab_with_return("tools", 1).unwrap();
++
++    screen.close_tab_by_id(0).unwrap();
++
++    assert!(!screen.navigation_origins.contains_key(&1));
++    new_tab(&mut screen, 99, 0);
++    let tools_position = screen.tabs.get(&1).unwrap().position;
++    screen.go_to_tab(tools_position + 1, 1).unwrap();
++    screen.return_to_origin(1).unwrap();
++    assert_eq!(screen.get_active_tab(1).unwrap().id, 1);
++}
++
++#[test]
++fn navigation_return_does_not_leave_a_different_tab() {
++    let mut screen = navigation_screen(false);
++    new_tab(&mut screen, 3, 2);
++    screen.go_to_tab(1, 1).unwrap();
++    screen.open_tab_with_return("tools", 1).unwrap();
++    screen.go_to_tab(3, 1).unwrap();
++    screen.return_to_origin(1).unwrap();
++    assert_eq!(screen.get_active_tab(1).unwrap().id, 2);
++}
++
++#[test]
++fn navigation_disconnect_clears_origin_without_tab_history() {
++    let mut screen = navigation_screen(false);
++    screen.open_tab_with_return("tools", 1).unwrap();
++    screen.tab_history.remove(&1);
++    screen.remove_client(1).unwrap();
++    assert!(!screen.navigation_origins.contains_key(&1));
++}
++
++#[test]
++fn navigation_closed_origin_pane_does_not_switch_tab() {
++    let mut screen = navigation_screen(false);
++    screen
++        .get_active_tab_mut(1)
++        .unwrap()
++        .new_pane(
++            PaneId::Terminal(3),
++            None,
++            None,
++            false,
++            true,
++            NewPanePlacement::default(),
++            Some(1),
++            None,
++        )
++        .unwrap();
++    let origin = screen.get_active_pane_id(&1).unwrap();
++    screen.open_tab_with_return("tools", 1).unwrap();
++    screen
++        .tabs
++        .get_mut(&0)
++        .unwrap()
++        .close_pane(origin, false, None);
++    screen.return_to_origin(1).unwrap();
++    assert_eq!(screen.get_active_tab(1).unwrap().id, 1);
++}
++
++#[test]
++fn navigation_restores_origin_pane_after_focus_changes_in_origin_tab() {
++    let mut screen = navigation_screen(false);
++    screen
++        .get_active_tab_mut(1)
++        .unwrap()
++        .new_pane(
++            PaneId::Terminal(3),
++            None,
++            None,
++            false,
++            true,
++            NewPanePlacement::default(),
++            Some(1),
++            None,
++        )
++        .unwrap();
++    let origin = screen.get_active_pane_id(&1).unwrap();
++    screen.open_tab_with_return("tools", 1).unwrap();
++    screen
++        .tabs
++        .get_mut(&0)
++        .unwrap()
++        .focus_pane_with_id(PaneId::Terminal(1), false, false, 1)
++        .unwrap();
++    screen.return_to_origin(1).unwrap();
++    assert_eq!(screen.get_active_pane_id(&1), Some(origin));
++}
++
++#[test]
++fn navigation_unknown_client_does_not_move_another_client() {
++    let mut screen = navigation_screen(false);
++    screen.open_tab_with_return("tools", 999).unwrap();
++    assert_eq!(screen.get_active_tab(1).unwrap().id, 0);
++}
++
++#[test]
++fn navigation_origins_are_per_client_and_removed_on_disconnect() {
++    let mut screen = navigation_screen(false);
++    screen.add_client(2, false).unwrap();
++    screen.open_tab_with_return("tools", 1).unwrap();
++    assert_eq!(screen.get_active_tab(2).unwrap().id, 0);
++    screen.open_tab_with_return("tools", 2).unwrap();
++    screen.return_to_origin(1).unwrap();
++    assert_eq!(screen.get_active_tab(2).unwrap().id, 1);
++    screen.remove_client(2).unwrap();
++    assert!(!screen.navigation_origins.contains_key(&2));
++}
++
++#[test]
++fn navigation_mirrored_tab_switch_moves_both_clients() {
++    let mut screen = navigation_screen(true);
++    screen.add_client(2, false).unwrap();
++    screen.open_tab_with_return("tools", 1).unwrap();
++    assert_eq!(screen.get_active_tab(2).unwrap().id, 1);
++    screen.return_to_origin(1).unwrap();
++    assert_eq!(screen.get_active_tab(2).unwrap().id, 0);
++}
++
++#[test]
++fn navigation_pending_layout_defers_open_and_return_until_layout_applied() {
++    use crate::route::NotificationEnd;
++    let mut mock = MockScreen::new(Size {
++        cols: 121,
++        rows: 20,
++    });
++    let screen_thread = mock.run(Some(TiledPaneLayout::default()), vec![]);
++    let server_events = Arc::new(Mutex::new(vec![]));
++    let server_receiver = mock.server_receiver.take().unwrap();
++    let server_thread = log_actions_in_thread!(
++        server_events,
++        ServerInstruction::KillSession,
++        server_receiver
++    );
++    let layout = TiledPaneLayout::default();
++    mock.to_screen
++        .send(ScreenInstruction::NewTab(
++            None,
++            None,
++            Some(layout.clone()),
++            vec![],
++            Some("tools".into()),
++            (Some(vec![]), Some(vec![])),
++            None,
++            false,
++            false,
++            (1, false),
++            None,
++        ))
++        .unwrap();
++    let (open_tx, mut open_rx) = tokio::sync::oneshot::channel();
++    let (return_tx, mut return_rx) = tokio::sync::oneshot::channel();
++    let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
++    mock.to_screen
++        .send(ScreenInstruction::OpenTabWithReturn(
++            "tools".into(),
++            false,
++            None,
++            1,
++            Some(NotificationEnd::new(open_tx)),
++        ))
++        .unwrap();
++    mock.to_screen
++        .send(ScreenInstruction::ReturnToOrigin(
++            1,
++            Some(NotificationEnd::new(return_tx)),
++        ))
++        .unwrap();
++    mock.to_screen
++        .send(ScreenInstruction::RenameTabWithId(
++            0,
++            b"origin".to_vec(),
++            Some(NotificationEnd::new(barrier_tx)),
++        ))
++        .unwrap();
++    barrier_rx.blocking_recv().unwrap();
++    let open_pending = matches!(
++        open_rx.try_recv(),
++        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
++    );
++    let return_pending = matches!(
++        return_rx.try_recv(),
++        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
++    );
++    mock.to_screen
++        .send(ScreenInstruction::ApplyLayout(
++            layout,
++            vec![],
++            vec![(5, None)],
++            vec![],
++            HashMap::new(),
++            1,
++            false,
++            (1, false),
++            None,
++            None,
++        ))
++        .unwrap();
++    let (done_tx, done_rx) = std::sync::mpsc::channel();
++    std::thread::spawn(move || {
++        let result = (open_rx.blocking_recv(), return_rx.blocking_recv());
++        done_tx.send(result).unwrap();
++    });
++    let completed = done_rx.recv_timeout(std::time::Duration::from_secs(5));
++    let (query_tx, query_rx) = crossbeam::channel::bounded(1);
++    mock.to_screen
++        .send(ScreenInstruction::GetCurrentTabInfo {
++            client_id: 1,
++            response_channel: query_tx,
++        })
++        .unwrap();
++    let current_tab = query_rx.recv_timeout(std::time::Duration::from_secs(5));
++    mock.teardown(vec![server_thread, screen_thread]);
++    assert!(open_pending && return_pending);
++    let (open, returned) = completed.unwrap();
++    assert!(open.is_ok() && returned.is_ok());
++    assert_eq!(current_tab.unwrap().unwrap().name, "origin");
++}
++
+ #[test]
+ fn open_new_tab() {
+     let size = Size {
+diff --git a/zellij-utils/assets/prost_ipc/client_server_contract.rs b/zellij-utils/assets/prost_ipc/client_server_contract.rs
+index a50f86a..30ae885 100644
+--- a/zellij-utils/assets/prost_ipc/client_server_contract.rs
++++ b/zellij-utils/assets/prost_ipc/client_server_contract.rs
+@@ -120,7 +120,7 @@ pub struct RgbColor {
+ #[allow(clippy::derive_partial_eq_without_eq)]
+ #[derive(Clone, PartialEq, ::prost::Message)]
+ pub struct Action {
+-    #[prost(oneof="action::ActionType", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151")]
++    #[prost(oneof="action::ActionType", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154")]
+     pub action_type: ::core::option::Option<action::ActionType>,
+ }
+ /// Nested message and enum types in `Action`.
+@@ -430,6 +430,12 @@ pub mod action {
+         SelectCommandAtScrollPosition(super::SelectCommandAtScrollPositionAction),
+         #[prost(message, tag="151")]
+         CopyLastCommandOutput(super::CopyLastCommandOutputAction),
++        #[prost(message, tag="152")]
++        OpenTabWithReturn(super::OpenTabWithReturnAction),
++        #[prost(message, tag="153")]
++        ReturnToOrigin(super::ReturnToOriginAction),
++        #[prost(message, tag="154")]
++        RestoreFocusFromHeader(super::RestoreFocusFromHeaderAction),
+     }
+ }
+ // Action message definitions (all 92 variants)
+@@ -437,6 +443,22 @@ pub mod action {
+ /// Simple action types (no data)
+ #[allow(clippy::derive_partial_eq_without_eq)]
+ #[derive(Clone, PartialEq, ::prost::Message)]
++pub struct OpenTabWithReturnAction {
++    #[prost(string, tag="1")]
++    pub name: ::prost::alloc::string::String,
++    #[prost(bool, tag="2")]
++    pub from_header: bool,
++}
++#[allow(clippy::derive_partial_eq_without_eq)]
++#[derive(Clone, PartialEq, ::prost::Message)]
++pub struct ReturnToOriginAction {
++}
++#[allow(clippy::derive_partial_eq_without_eq)]
++#[derive(Clone, PartialEq, ::prost::Message)]
++pub struct RestoreFocusFromHeaderAction {
++}
++#[allow(clippy::derive_partial_eq_without_eq)]
++#[derive(Clone, PartialEq, ::prost::Message)]
+ pub struct QuitAction {
+ }
+ #[allow(clippy::derive_partial_eq_without_eq)]
+diff --git a/zellij-utils/src/cli.rs b/zellij-utils/src/cli.rs
+index a05a0e2..68f27d1 100644
+--- a/zellij-utils/src/cli.rs
++++ b/zellij-utils/src/cli.rs
+@@ -1159,6 +1159,20 @@ pub enum CliAction {
+         #[clap(short, long, value_parser)]
+         create: bool,
+     },
++    /// Go to tab with name [name], remembering the current tab and pane for return-to-origin
++    OpenTabWithReturn {
++        /// Name of the existing tab to focus
++        name: String,
++    },
++    /// Open an existing tab, remembering the pane focused before the header was clicked
++    OpenTabWithReturnFromHeader {
++        /// Name of the existing tab to focus
++        name: String,
++    },
++    /// Return to the tab and pane saved by open-tab-with-return
++    ReturnToOrigin,
++    /// Restore focus to the most recent non-header pane on the current tab
++    RestoreFocusFromHeader,
+     /// Renames the focused pane
+     RenameTab {
+         name: String,
+@@ -1659,4 +1673,29 @@ mod tests {
+         let result = CliArgs::try_parse_from(["zellij", "subscribe"]);
+         assert!(result.is_err());
+     }
++
++    #[test]
++    fn action_open_tab_with_return_parses_tab_name() {
++        let cli = CliArgs::try_parse_from(["zellij", "action", "open-tab-with-return", "tools"])
++            .expect("open-tab-with-return should parse");
++        match cli.command {
++            Some(Command::Action(action)) => match *action {
++                CliAction::OpenTabWithReturn { name } => assert_eq!(name, "tools"),
++                other => panic!("Expected OpenTabWithReturn, got {:?}", other),
++            },
++            other => panic!("Expected Action, got {:?}", other),
++        }
++    }
++
++    #[test]
++    fn action_return_to_origin_parses() {
++        let cli = CliArgs::try_parse_from(["zellij", "action", "return-to-origin"])
++            .expect("return-to-origin should parse");
++        match cli.command {
++            Some(Command::Action(action)) => {
++                assert!(matches!(*action, CliAction::ReturnToOrigin));
++            },
++            other => panic!("Expected Action, got {:?}", other),
++        }
++    }
+ }
+diff --git a/zellij-utils/src/client_server_contract/common_types.proto b/zellij-utils/src/client_server_contract/common_types.proto
+index eb18474..eb1a879 100644
+--- a/zellij-utils/src/client_server_contract/common_types.proto
++++ b/zellij-utils/src/client_server_contract/common_types.proto
+@@ -289,12 +289,18 @@ message Action {
+     ScrollToNextPromptAction scroll_to_next_prompt = 149;
+     SelectCommandAtScrollPositionAction select_command_at_scroll_position = 150;
+     CopyLastCommandOutputAction copy_last_command_output = 151;
++    OpenTabWithReturnAction open_tab_with_return = 152;
++    ReturnToOriginAction return_to_origin = 153;
++    RestoreFocusFromHeaderAction restore_focus_from_header = 154;
+   }
+ }
+ 
+ // Action message definitions (all 92 variants)
+ 
+ // Simple action types (no data)
++message OpenTabWithReturnAction { string name = 1; bool from_header = 2; }
++message ReturnToOriginAction {}
++message RestoreFocusFromHeaderAction {}
+ message QuitAction {}
+ message FocusNextPaneAction {}
+ message FocusPreviousPaneAction {}
+diff --git a/zellij-utils/src/input/actions.rs b/zellij-utils/src/input/actions.rs
+index 0e97793..5897f3b 100644
+--- a/zellij-utils/src/input/actions.rs
++++ b/zellij-utils/src/input/actions.rs
+@@ -390,6 +390,12 @@ pub enum Action {
+         name: String,
+         create: bool,
+     },
++    OpenTabWithReturn {
++        name: String,
++        from_header: bool,
++    },
++    ReturnToOrigin,
++    RestoreFocusFromHeader,
+     ToggleTab,
+     TabNameInput {
+         input: Vec<u8>,
+@@ -1472,6 +1478,14 @@ impl Action {
+             CliAction::GoToTabName { name, create } => {
+                 Ok(vec![Action::GoToTabName { name, create }])
+             },
++            CliAction::OpenTabWithReturn { name } => {
++                Ok(vec![Action::OpenTabWithReturn { name, from_header: false }])
++            },
++            CliAction::OpenTabWithReturnFromHeader { name } => {
++                Ok(vec![Action::OpenTabWithReturn { name, from_header: true }])
++            },
++            CliAction::ReturnToOrigin => Ok(vec![Action::ReturnToOrigin]),
++            CliAction::RestoreFocusFromHeader => Ok(vec![Action::RestoreFocusFromHeader]),
+             CliAction::RenameTab { name, tab_id } => match tab_id {
+                 Some(id) => Ok(vec![Action::RenameTabById {
+                     id: id as u64,
+@@ -3267,6 +3281,34 @@ mod tests {
+         assert!(matches!(actions[0], Action::UndoRenameTab));
+     }
+ 
++    #[test]
++    fn test_open_tab_with_return_cli_to_action() {
++        let cli_action = CliAction::OpenTabWithReturn {
++            name: "tools".to_string(),
++        };
++        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
++        let actions = result.expect("OpenTabWithReturn conversion should succeed");
++        assert_eq!(actions.len(), 1);
++        match &actions[0] {
++            Action::OpenTabWithReturn { name, from_header: false } => {
++                assert_eq!(name, "tools");
++            },
++            _ => panic!("Expected OpenTabWithReturn action"),
++        }
++    }
++
++    #[test]
++    fn test_return_to_origin_cli_to_action() {
++        let result = Action::actions_from_cli(
++            CliAction::ReturnToOrigin,
++            Box::new(|| PathBuf::from("/tmp")),
++            None,
++        );
++        let actions = result.expect("ReturnToOrigin conversion should succeed");
++        assert_eq!(actions.len(), 1);
++        assert!(matches!(actions[0], Action::ReturnToOrigin));
++    }
++
+     // 23. ToggleActiveSyncTab
+     #[test]
+     fn test_toggle_active_sync_tab_with_tab_id() {
+diff --git a/zellij-utils/src/input/unit/keybinds_test.rs b/zellij-utils/src/input/unit/keybinds_test.rs
+index b9417ea..73a5e13 100644
+--- a/zellij-utils/src/input/unit/keybinds_test.rs
++++ b/zellij-utils/src/input/unit/keybinds_test.rs
+@@ -5,6 +5,49 @@ use crate::input::config::Config;
+ use insta::assert_snapshot;
+ use strum::IntoEnumIterator;
+ 
++#[test]
++fn navigation_keybindings_parse_in_locked_mode() {
++    let config = Config::from_kdl(
++        r#"keybinds {
++      locked {
++        bind "Alt o" { OpenTabWithReturn "tools"; }
++        bind "Alt r" { ReturnToOrigin; }
++      }
++    }"#,
++        None,
++    )
++    .unwrap();
++    let key = |ch| KeyWithModifier::new(BareKey::Char(ch)).with_alt_modifier();
++    assert_eq!(
++        config
++            .keybinds
++            .get_actions_for_key_in_mode(&InputMode::Locked, &key('o')),
++        Some(&vec![Action::OpenTabWithReturn {
++            name: "tools".into(),
++            from_header: false,
++        }])
++    );
++    assert_eq!(
++        config
++            .keybinds
++            .get_actions_for_key_in_mode(&InputMode::Locked, &key('r')),
++        Some(&vec![Action::ReturnToOrigin])
++    );
++}
++
++#[test]
++fn navigation_rejects_missing_tab_name() {
++    assert!(Config::from_kdl(
++        r#"keybinds {
++      normal {
++        bind "Alt o" { OpenTabWithReturn; }
++      }
++    }"#,
++        None
++    )
++    .is_err());
++}
++
+ #[test]
+ fn can_define_keybindings_in_configfile() {
+     let config_contents = r#"
+diff --git a/zellij-utils/src/ipc/protobuf_conversion.rs b/zellij-utils/src/ipc/protobuf_conversion.rs
+index 1e77172..4a9caf4 100644
+--- a/zellij-utils/src/ipc/protobuf_conversion.rs
++++ b/zellij-utils/src/ipc/protobuf_conversion.rs
+@@ -1235,6 +1235,7 @@ impl From<crate::input::actions::Action>
+             NextSwapLayoutAction,
+             NextSwapLayoutByTabIdAction,
+             NoOpAction,
++            OpenTabWithReturnAction,
+             OverrideLayoutAction,
+             PageScrollDownAction,
+             PageScrollDownByPaneIdAction,
+@@ -1255,6 +1256,8 @@ impl From<crate::input::actions::Action>
+             RenameTerminalPaneAction,
+             ResizeAction,
+             ResizeByPaneIdAction,
++            ReturnToOriginAction,
++            RestoreFocusFromHeaderAction,
+             RunAction,
+             SaveSessionAction,
+             ScrollDownAction,
+@@ -1689,6 +1692,15 @@ impl From<crate::input::actions::Action>
+             crate::input::actions::Action::GoToTabName { name, create } => {
+                 ActionType::GoToTabName(GoToTabNameAction { name, create })
+             },
++            crate::input::actions::Action::OpenTabWithReturn { name, from_header } => {
++                ActionType::OpenTabWithReturn(OpenTabWithReturnAction { name, from_header })
++            },
++            crate::input::actions::Action::RestoreFocusFromHeader => {
++                ActionType::RestoreFocusFromHeader(RestoreFocusFromHeaderAction {})
++            },
++            crate::input::actions::Action::ReturnToOrigin => {
++                ActionType::ReturnToOrigin(ReturnToOriginAction {})
++            },
+             crate::input::actions::Action::ToggleTab => ActionType::ToggleTab(ToggleTabAction {}),
+             crate::input::actions::Action::TabNameInput { input } => {
+                 ActionType::TabNameInput(TabNameInputAction {
+@@ -2607,6 +2619,11 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
+                     create: go_to_tab_name_action.create,
+                 })
+             },
++            ActionType::OpenTabWithReturn(action) => {
++                Ok(crate::input::actions::Action::OpenTabWithReturn { name: action.name, from_header: action.from_header })
++            },
++            ActionType::ReturnToOrigin(_) => Ok(crate::input::actions::Action::ReturnToOrigin),
++            ActionType::RestoreFocusFromHeader(_) => Ok(crate::input::actions::Action::RestoreFocusFromHeader),
+             ActionType::ToggleTab(_) => Ok(crate::input::actions::Action::ToggleTab),
+             ActionType::TabNameInput(tab_name_action) => {
+                 Ok(crate::input::actions::Action::TabNameInput {
+diff --git a/zellij-utils/src/ipc/tests/roundtrip_tests.rs b/zellij-utils/src/ipc/tests/roundtrip_tests.rs
+index f3f6d09..78badc3 100644
+--- a/zellij-utils/src/ipc/tests/roundtrip_tests.rs
++++ b/zellij-utils/src/ipc/tests/roundtrip_tests.rs
+@@ -2353,6 +2353,27 @@ fn test_client_messages() {
+         client_id: Some(100),
+         is_cli_client: true,
+     });
++    test_client_roundtrip!(ClientToServerMsg::Action {
++        action: Action::OpenTabWithReturn {
++            name: "tools".into(),
++            from_header: true,
++        },
++        terminal_id: Some(1),
++        client_id: Some(100),
++        is_cli_client: false,
++    });
++    test_client_roundtrip!(ClientToServerMsg::Action {
++        action: Action::ReturnToOrigin,
++        terminal_id: Some(1),
++        client_id: Some(100),
++        is_cli_client: false,
++    });
++    test_client_roundtrip!(ClientToServerMsg::Action {
++        action: Action::RestoreFocusFromHeader,
++        terminal_id: Some(42),
++        client_id: None,
++        is_cli_client: true,
++    });
+     test_client_roundtrip!(ClientToServerMsg::Action {
+         action: Action::TabNameInput {
+             input: "my cool tab_name".as_bytes().to_vec(),
+diff --git a/zellij-utils/src/kdl/mod.rs b/zellij-utils/src/kdl/mod.rs
+index 427747a..c68932b 100644
+--- a/zellij-utils/src/kdl/mod.rs
++++ b/zellij-utils/src/kdl/mod.rs
+@@ -83,6 +83,7 @@ macro_rules! parse_kdl_action_arguments {
+                 "GoToPreviousTab" => Ok(Action::GoToPreviousTab),
+                 "CloseTab" => Ok(Action::CloseTab),
+                 "ToggleTab" => Ok(Action::ToggleTab),
++                "ReturnToOrigin" => Ok(Action::ReturnToOrigin),
+                 "UndoRenameTab" => Ok(Action::UndoRenameTab),
+                 "Detach" => Ok(Action::Detach),
+                 "SetDarkTheme" => Ok(Action::SetDarkTheme),
+@@ -859,6 +860,13 @@ impl Action {
+                 Some(node)
+             },
+             Action::ToggleTab => Some(KdlNode::new("ToggleTab")),
++            Action::OpenTabWithReturn { name, .. } => {
++                let mut node = KdlNode::new("OpenTabWithReturn");
++                node.push(name.clone());
++                Some(node)
++            },
++            Action::ReturnToOrigin => Some(KdlNode::new("ReturnToOrigin")),
++            Action::RestoreFocusFromHeader => None,
+             Action::TabNameInput { input: bytes } => {
+                 let mut node = KdlNode::new("TabNameInput");
+                 for byte in bytes {
+@@ -1649,6 +1657,27 @@ impl TryFrom<(&KdlNode, &Options)> for Action {
+             },
+             "CloseTab" => parse_kdl_action_arguments!(action_name, action_arguments, kdl_action),
+             "ToggleTab" => parse_kdl_action_arguments!(action_name, action_arguments, kdl_action),
++            "ReturnToOrigin" => {
++                parse_kdl_action_arguments!(action_name, action_arguments, kdl_action)
++            },
++            "OpenTabWithReturn" => match action_arguments.as_slice() {
++                [entry] if entry.name().is_none() => match entry.value().as_string() {
++                    Some(name) if !name.is_empty() => Ok(Action::OpenTabWithReturn {
++                        name: name.to_owned(),
++                        from_header: false,
++                    }),
++                    _ => Err(ConfigError::new_kdl_error(
++                        "OpenTabWithReturn requires a non-empty tab name".into(),
++                        kdl_action.span().offset(),
++                        kdl_action.span().len(),
++                    )),
++                },
++                _ => Err(ConfigError::new_kdl_error(
++                    "OpenTabWithReturn requires one tab name".into(),
++                    kdl_action.span().offset(),
++                    kdl_action.span().len(),
++                )),
++            },
+             "UndoRenameTab" => {
+                 parse_kdl_action_arguments!(action_name, action_arguments, kdl_action)
+             },
+diff --git a/zellij-utils/src/plugin_api/action.rs b/zellij-utils/src/plugin_api/action.rs
+index 0e787ca..9d5d771 100644
+--- a/zellij-utils/src/plugin_api/action.rs
++++ b/zellij-utils/src/plugin_api/action.rs
+@@ -1179,6 +1179,9 @@ impl TryFrom<Action> for ProtobufAction {
+                     chars: chars_to_write,
+                 })),
+             }),
++            Action::OpenTabWithReturn { .. } | Action::ReturnToOrigin | Action::RestoreFocusFromHeader => {
++                Err("Keyboard-only actions are not available through the plugin API")
++            },
+             Action::WriteToPaneId { .. }
+             | Action::WriteCharsToPaneId { .. }
+             | Action::Paste { .. }
