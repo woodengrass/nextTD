@@ -11,7 +11,7 @@ Harness: stock ``native_env`` fixture for the isolated tmp state, tmux
 socket, and tagged sessions, plus ``NativeSession`` for the single-client
 drive. The core candidate comes from the explicit ``TDNEXT_CORE_BINARY``
 executable path and is symlinked into the isolated
-``env['TDNEXT_STATE_DIR']/bin/zellij-core-navigation-v2``; the isolated
+``env['TDNEXT_STATE_DIR']/bin/zellij-core-navigation-v3``; the isolated
 ``bin/zellij`` shadow makes the session under test launch on the candidate
 server while every other path keeps using explicit binaries. When the
 candidate is absent or does not yet expose the core CLI, every test skips
@@ -40,7 +40,7 @@ from native_session import NativeSession, wait_for
 
 CANDIDATE_ENV = "TDNEXT_CORE_BINARY"
 CORE_FLAG = "TDNEXT_CORE_NAVIGATION"
-LINK_NAME = "zellij-core-navigation-v2"
+LINK_NAME = "zellij-core-navigation-v3"
 BARE_HEADER = "tdnext-header:settings"
 SETTINGS_PARTS = ("Settings", "Back", "> General", "Provider:", "Style:")
 

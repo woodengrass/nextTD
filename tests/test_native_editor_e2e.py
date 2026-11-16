@@ -202,7 +202,9 @@ def test_native_vi_selected_in_settings_edits_real_file(
         files = files_pane(session)
         wait_for(lambda: "vi-proof.txt" in files_screen(session, files))
         session.send_key("e")
-        wait_for(lambda: "bytes" in files_screen(session, files))
+        wait_for(
+            lambda: "vi-proof.txt" in (screen := files_screen(session, files)) and "PREVIEW" not in screen
+        )
         session.send_key("G")
         session.send_key("o")
         session.send_key("VI_TYPED_LINE")

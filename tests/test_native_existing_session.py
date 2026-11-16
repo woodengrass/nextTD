@@ -23,7 +23,7 @@ def test_existing_stock_session_survives_new_core_session(
         monitor = wait_for(original.btop_pid)
         local_bin = Path(env["TDNEXT_STATE_DIR"]) / "bin"
         local_bin.mkdir(parents=True, exist_ok=True)
-        (local_bin / "zellij-core-navigation-v2").symlink_to(binary)
+        (local_bin / "zellij-core-navigation-v3").symlink_to(binary)
         newer = NativeSession(tmp_path, env, str(binary))
         try:
             assert original.name != newer.name
