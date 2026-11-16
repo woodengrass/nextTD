@@ -57,7 +57,7 @@ text marker or focus cursor. The user's terminal controls rendering and font.
 ## 3. Typography
 
 One terminal monospace font at the user's configured size. Titles are bold;
-body and metadata have the same cell size. Sidebar labels remain visible.
+body and metadata have the same cell size. Sidebar labels are visible when expanded.
 Compatibility mode uses plain terminal text; the optional, manually selected
 Codicons mode uses single-cell private-use glyphs and requires a compatible
 Nerd Font on the local terminal computer. Never infer font availability. Paths
@@ -67,13 +67,15 @@ and filenames are rendered as plain text.
 
 The base unit is one terminal cell. Compact spacing is 0-1 cells; standard
 horizontal insets are 1-2 cells. The source rail is 22 columns in normal
-layouts; main content flexes. A one-row desktop-owned global header spans the
+layouts and contracts to an icon rail on request; main content flexes. A one-row desktop-owned global header spans the
 entire terminal above both rail and workspace, and the two-row contextual
 footer stays fixed. Native Zellij reserves a second physical row as the pane
 separator so that the header retains one usable content row. The file table and the Settings plugin list each own their
 vertical scroll; the shell itself does not scroll. Detail and
 preview content may scroll independently when present. 80 x 24 is the target;
 at smaller sizes preserve keyboard access and prioritize the file list.
+
+Layout: Desktop rail - preserve navigation while reclaiming workspace width -> fixed-sidenav-shell (https://github.com/changeroa/StyleGallery/blob/main/patterns/viewport-shell/fixed-sidenav-shell.md); scroll owner: destination list; avoid scrolling the entire shell or replacing the active workspace.
 
 ## 5. Primitives and states
 
@@ -86,7 +88,11 @@ at smaller sizes preserve keyboard access and prioritize the file list.
   A short monochrome icon precedes each destination label. Views declare a
   semantic icon key, resolved by a replaceable provider in the selected mode.
   If no enabled provider is selected, the legacy manifest's plain-text icon
-  or `[]` is used; labels always remain visible and icon text is safe text.
+  or `[]` is used; icon text is safe text. The rail can collapse to individual
+  icons and expand again with a visible control or F7 (in native mode, F7 is
+  available while the sidebar pane has focus). Collapsed destinations
+  retain a selection marker, distinct fallbacks and discoverable names; expanding
+  restores all labels without replacing the workspace.
 - **Shell workspace:** the central region is a real interactive terminal,
   bounded by the existing desktop chrome. Its own terminal viewport and
   scrollback own shell output. An exited or unavailable shell is explained in
@@ -245,7 +251,7 @@ supports keyboard and mouse wheel, with horizontal scrolling for long lines.
 File actions do not target a separate table selection while the folder list is
 focused; explain that the user must focus the file list first. Resizing keeps
 focus on a visible Files pane when the previously focused pane is hidden.
-Settings is a separate plugin depending on the desktop host. Opening it retains
+Settings is a separate view compatible with the selected host interface. Opening it retains
 the original mounted fallback view or native Zellij tab; Back / Escape returns
 to that exact view and its contextual footer. Plugin operation shortcuts are
 available only in the Plugins section, never while using General. Native navigation records the
@@ -269,7 +275,7 @@ open a header tab.
 Tonal shifts and the terminal's own text styles distinguish the rail,
 content and dialogs. Settings uses fixed neutral outlines only for interactive
 hit areas and the plugin list, never as focus-driven pane separators. No colored side borders or decorative shadows. Sidebar
-glyphs are monochrome and supplement, rather than replace, text labels.
+glyphs are monochrome and supplement text labels in the expanded rail.
 Components follow Textual's terminal-native primitives.
 
 ## 8. Accessibility constraints and known limitations

@@ -42,10 +42,11 @@ binary installers are used. No root access is needed. With uv already on PATH:
 
 ```sh
 uv sync --locked
+uv run tdnext enable desktop       # required host; views are optional
 uv run tdnext enable files
-uv run tdnext enable settings      # needed for an existing plugin state
+uv run tdnext enable settings
 uv run tdnext enable shell         # explicit opt-in; works without Zellij
-uv run tdnext enable monitor       # installs a missing btop locally
+uv run tdnext enable monitor       # asks before installing a missing btop locally
 uv run tdnext install-zellij       # optional, enables native-pane layout
 uv run tdnext run .
 ```
@@ -56,6 +57,7 @@ If uv is not installed, an optional **project-local** bootstrap is:
 curl -LsSf https://astral.sh/uv/0.9.5/install.sh | \
   env UV_INSTALL_DIR="$PWD/.tools/bin" UV_NO_MODIFY_PATH=1 sh
 .tools/bin/uv sync --locked
+.venv/bin/tdnext enable desktop
 .venv/bin/tdnext enable files
 .venv/bin/tdnext enable settings
 .venv/bin/tdnext enable shell
@@ -70,11 +72,12 @@ pinned to 8.2.8 and the fallback terminal widget to `ghostty-textual==0.1.0`
 The environment lives in `.venv/`; app state, binaries,
 Zellij data, and btop configuration live in `state/`. To isolate multiple
 experiments set `TDNEXT_STATE_DIR` to a different writable directory. A first
-run with no state enables the bundled Files, Settings and Desktop plugins; Shell
-and Monitor are not enabled automatically. Existing state is never migrated to
-enable either Shell or Settings. Run `tdnext enable shell` or
-`tdnext enable settings` explicitly when needed. Disabling either stays effective
-on later launches.
+run with no state enables no plugins and reports that a desktop host is required.
+Enable exactly one host before launching, or enable a view and let the manager
+select the sole compatible host. If several hosts are compatible, explicitly
+enable one first. An enabled host can run with no views. Enabling a plugin also
+enables its declared dependencies, but launch never enables plugins or changes
+their state.
 
 ## Keyboard and file operations
 
@@ -215,11 +218,12 @@ management operations from separate sessions or the CLI: writes are not locked.
 .venv/bin/tdnext enable monitor     # resolve, install if necessary, enable
 .venv/bin/tdnext disable desktop    # cascades to enabled dependants
 .venv/bin/tdnext uninstall desktop  # remove installed/enabled state, disable enabled dependants
-.venv/bin/tdnext enable files       # also re-enables desktop
+.venv/bin/tdnext enable files       # selects the sole compatible host if needed
 ```
 
-Each bundled plugin has a `plugin.toml` with a stable ID, importable entry
-point, dependencies and explicit `capabilities`. A declaration has exactly one
+Each bundled plugin has a `plugin.toml` with `manifest_version = 1`,
+`api_version = 1`, a stable ID, importable entry point, dependencies and explicit
+`capabilities`. A declaration has exactly one
 structural role: `desktop.host`, `desktop.view`, or `icons.provider`. Domain
 capabilities describe what the plugin actually does: `files.browse`,
 `system.monitor`, `shell.interactive`, and `settings.manage`; the host's
@@ -228,9 +232,12 @@ capabilities. Duplicate, malformed, or conflicting roles are rejected.
 Capabilities describe functionality, not permissions: a plugin ID identifies a
 plugin and is not a security credential.
 
-For compatibility, a manifest with no `capabilities` retains the old behavior:
-the ID `desktop` is a host and every other ID is a view. Existing plugin state
-is not rewritten to add the new service. Views may use `placement = "sidebar"`
+Hosts declare `host_interfaces`, and views declare `view_interfaces`; each
+required view interface must be provided by the selected host. Bundled views use
+`tdnext.textual-view.v1`, not a concrete desktop plugin ID. Invalid manifests and
+all entries with a duplicate ID are quarantined and reported by the CLI and
+Settings. Old on-disk manifests must be updated, but existing native session
+snapshots remain readable. Views may use `placement = "sidebar"`
 (the default) or `"header"`; Settings is a header view. A view's optional
 `icon_key` is a semantic name, not a font glyph. Bundled view keys are `files`,
 `monitor`, `shell`, and `settings`. A provider resolves those keys; an unknown
@@ -314,7 +321,8 @@ executable is removed, launch reports the missing dependency.
 
 The manager first checks `state/bin` and then PATH. A btop executable must
 successfully identify itself via `--version`; it is never replaced with htop.
-When missing, `enable monitor` or `install monitor` downloads the following
+When missing, `enable monitor` or `install monitor` asks for explicit consent
+before downloading the following
 official Linux x86_64 musl archive using curl, verifies its pinned SHA-256,
 extracts only the regular executable, and checks that it runs before saving it:
 
