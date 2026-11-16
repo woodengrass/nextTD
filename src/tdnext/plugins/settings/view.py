@@ -8,7 +8,7 @@ from textual.events import Resize
 from textual.widgets import Button, ContentSwitcher, DataTable, Select, Static
 
 from tdnext.api import CloseView, PluginContext
-from tdnext.core.errors import PluginError
+from tdnext.core.errors import InstallationConsentRequired, PluginError
 from tdnext.core.graph import dependants
 from tdnext.core.models import PluginState
 from tdnext.plugins.settings.styles import SETTINGS_CSS
@@ -17,7 +17,7 @@ from .appearance import AppearanceControls
 from .dialogs import ConfirmPluginChange
 from .editor import EditorControls
 from .general_focus import GeneralFocus
-from .operations import Operation, OperationResult, apply_operation
+from .operations import Operation, OperationResult, apply_operation, protected_plugin_ids
 
 Section = Literal["general", "plugins"]
 
@@ -138,12 +138,16 @@ class SettingsView(GeneralFocus):
         row = table.cursor_row
         selected = self.selected_plugin()
         state = self.context.manager.store.read()
-        self.plugin_ids = sorted(self.context.manager.manifests.keys() | state.installed)
+        errors = getattr(self.context.manager.manifests, "errors", {})
+        self.plugin_ids = sorted(self.context.manager.manifests.keys() | state.installed | errors.keys())
         table.clear()
         for plugin_id in self.plugin_ids:
             manifest = self.context.manager.manifests.get(plugin_id)
             if manifest is None:
-                table.add_row(f"{plugin_id} (missing)", "Enabled" if plugin_id in state.enabled else "Installed",
+                status = "Enabled" if plugin_id in state.enabled else (
+                    "Installed" if plugin_id in state.installed else "Invalid"
+                )
+                table.add_row(f"{plugin_id} (invalid)" if plugin_id in errors else f"{plugin_id} (missing)", status,
                               key=plugin_id)
                 continue
             status = "Enabled" if plugin_id in state.enabled else (
@@ -164,10 +168,14 @@ class SettingsView(GeneralFocus):
                 button.disabled = True
             return
         manifest = self.context.manager.manifests.get(target)
-        protected = target in {"desktop", "settings"} or bool(
-            dependants(self.context.manager.manifests, target, state.enabled) & {"desktop", "settings"}
+        protected_ids = protected_plugin_ids(self.context.manager, self.context.session)
+        protected = target in protected_ids or bool(
+            dependants(self.context.manager.manifests, target, state.enabled) & protected_ids
         )
-        detail = manifest.description if manifest is not None else "Plugin manifest is missing; disable or uninstall."
+        errors = getattr(self.context.manager.manifests, "errors", {})
+        detail = manifest.description if manifest is not None else errors.get(
+            target, "Plugin manifest is missing; disable or uninstall."
+        )
         if protected:
             detail = f"Protected (running Desktop / Settings): {detail}"
         self.query_one("#plugin-detail", Static).update(detail)
@@ -220,13 +228,31 @@ class SettingsView(GeneralFocus):
         self.run_operation(operation, target)
 
     @work(thread=True)
-    def run_operation(self, operation: Operation, target: str) -> None:
+    def run_operation(
+        self, operation: Operation, target: str, approved: tuple[tuple[str, str], ...] = ()
+    ) -> None:
         try:
-            result = apply_operation(self.context.manager, operation, target)
+            result = apply_operation(self.context.manager, operation, target, approved, self.context.session)
+        except InstallationConsentRequired as exc:
+            self.app.call_from_thread(self.request_install_consent, operation, target, exc)
         except PluginError as exc:
             self.app.call_from_thread(self.operation_failed, str(exc))
         else:
             self.app.call_from_thread(self.operation_succeeded, result)
+
+    def request_install_consent(self, operation: Operation, target: str, error: InstallationConsentRequired) -> None:
+        self.app.push_screen(
+            ConfirmPluginChange("Install external tools?", str(error), "Install"),
+            partial(self.install_consent_result, operation, target, error.actions),
+        )
+
+    def install_consent_result(
+        self, operation: Operation, target: str, actions: tuple[tuple[str, str], ...], confirmed: bool | None
+    ) -> None:
+        if confirmed:
+            self.run_operation(operation, target, actions)
+        else:
+            self.operation_failed("Installation declined; plugin state was not changed.")
 
     def operation_succeeded(self, result: OperationResult) -> None:
         self.busy = False

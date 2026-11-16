@@ -16,6 +16,8 @@ from tdnext.launcher import enabled_views
 
 def test_public_launch_ignores_and_removes_inherited_legacy_snapshot(tmp_path: Path, monkeypatch) -> None:
     manager = make_manager(tmp_path)
+    manager.enable("files")
+    manager.enable("settings")
     monkeypatch.setattr(launcher, "manager", lambda: manager)
     monkeypatch.setenv(SESSION_ENV, "not-a-valid-session")
     launcher.launch(tmp_path)

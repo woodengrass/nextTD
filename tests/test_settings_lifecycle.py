@@ -35,14 +35,40 @@ def test_manifest_placement_defaults_to_sidebar_and_validates_header(tmp_path: P
         PluginManifest.model_validate({**manifests["files"].model_dump(), "placement": "footer"})
 
 
-def test_fresh_launch_enables_settings_and_passes_views_to_replaceable_host(
+def test_fresh_launch_requires_explicit_host_without_writing_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager = make_manager(tmp_path)
     monkeypatch.setattr(launcher, "manager", lambda: manager)
+    with pytest.raises(PluginError, match="Desktop is disabled"):
+        launcher.launch(tmp_path)
+    assert not manager.store.path.exists()
+    assert not (tmp_path / "views.txt").exists()
+
+
+def test_enabled_host_runs_without_views_and_preserves_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = make_manager(tmp_path)
+    manager.enable("desktop")
+    before = manager.store.path.read_bytes()
+    monkeypatch.setattr(launcher, "manager", lambda: manager)
     launcher.launch(tmp_path)
-    assert manager.store.read().enabled == frozenset({"desktop", "files", "settings"})
-    assert (tmp_path / "views.txt").read_text(encoding="utf-8") == "files,settings"
+    assert (tmp_path / "views.txt").read_text(encoding="utf-8") == ""
+    assert manager.store.path.read_bytes() == before
+
+
+def test_multiple_enabled_hosts_are_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = make_manager(tmp_path)
+    other = manager.manifests["desktop"].model_copy(update={"id": "other-host"})
+    manager.manifests = {**manager.manifests, other.id: other}
+    manager.enable("desktop")
+    manager.store.write(PluginState(
+        installed=frozenset({"desktop", other.id}), enabled=frozenset({"desktop", other.id})
+    ))
+    before = manager.store.path.read_bytes()
+    monkeypatch.setattr(launcher, "manager", lambda: manager)
+    with pytest.raises(PluginError, match="Exactly one desktop host"):
+        launcher.launch(tmp_path)
+    assert manager.store.path.read_bytes() == before
 
 
 def test_existing_disabled_settings_remains_disabled_on_repeated_launch(
