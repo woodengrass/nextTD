@@ -2,7 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from tdnext.core.errors import PluginError
+from tdnext.core.discovery import discover
+from tdnext.core.errors import InstallationConsentRequired, PluginError
 from tdnext.core.graph import dependency_order
 from tdnext.core.manager import PluginManager
 from tdnext.core.models import PluginManifest, PluginState
@@ -16,8 +17,18 @@ def manifest(name: str, dependencies: tuple[str, ...] = (), executables: tuple[s
         version="1",
         description=name,
         entrypoint="tdnext.plugins.files.plugin:FilesPlugin",
+        capabilities=("desktop.view",),
+        view_interfaces=("tdnext.textual-view.v1",),
         requires_plugins=dependencies,
         requires_executables=executables,
+    )
+
+
+def host(name: str) -> PluginManifest:
+    return PluginManifest(
+        id=name, name=name, version="1", description=name,
+        entrypoint="tdnext.plugins.desktop.plugin:DesktopPlugin",
+        capabilities=("desktop.host",), host_interfaces=("tdnext.textual-view.v1",),
     )
 
 
@@ -46,7 +57,7 @@ def test_missing_transitive_dependency_is_reported() -> None:
 
 
 def test_enable_installs_dependencies_and_persists_state(tmp_path: Path) -> None:
-    manifests = {item.id: item for item in (manifest("base"), manifest("app", ("base",)))}
+    manifests = {item.id: item for item in (host("base"), manifest("app", ("base",)))}
     store = StateStore(tmp_path / "state.json")
     manager = PluginManager(manifests, store, tmp_path / "bin")
     manager.enable("app")
@@ -81,23 +92,27 @@ def test_disable_cascades_through_enabled_dependants(tmp_path: Path) -> None:
 
 
 def test_missing_executable_does_not_commit_install(tmp_path: Path) -> None:
-    manifests = {"app": manifest("app", executables=("tdnext-test-missing-executable",))}
+    manifests = {"desktop": host("desktop"), "app": manifest("app", executables=("tdnext-test-missing-executable",))}
     store = StateStore(tmp_path / "state.json")
-    with pytest.raises(PluginError, match="No local installer"):
+    with pytest.raises(PluginError, match="missing executable"):
         PluginManager(manifests, store, tmp_path / "bin").enable("app")
     assert store.read() == PluginState()
 
 
 def test_failed_download_does_not_commit_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    manifests = {"app": manifest("app", executables=("tdnext-test-unavailable",))}
+    manifests = discover((Path(__file__).parents[1] / "src" / "tdnext" / "plugins",))
     store = StateStore(tmp_path / "state.json")
 
-    def fail(name: str, destination: Path) -> Path:
+    def fail(_name: str, _destination: Path, _release: object) -> Path:
         raise PluginError("download failed")
 
-    monkeypatch.setattr("tdnext.core.manager.install_executable", fail)
+    monkeypatch.setattr("tdnext.plugins.monitor.dependencies.install_release", fail)
+    manager = PluginManager(manifests, store, tmp_path / "bin")
+    monkeypatch.setattr(manager, "executable", lambda _name: None)
+    with pytest.raises(InstallationConsentRequired) as consent:
+        manager.install("monitor")
     with pytest.raises(PluginError, match="download failed"):
-        PluginManager(manifests, store, tmp_path / "bin").install("app")
+        manager.install("monitor", approved=consent.value.actions)
     assert store.read() == PluginState()
 
 
@@ -111,18 +126,19 @@ def test_corrupt_state_is_not_silently_reset(tmp_path: Path) -> None:
 def test_enable_with_invalid_entrypoint_does_not_commit_state(tmp_path: Path) -> None:
     manifests = {
         "base": manifest("base"),
+        "desktop": host("desktop"),
         "bad": PluginManifest(
             id="bad",
             name="bad",
             version="1",
             description="bad",
-            entrypoint="builtins:int",
+            entrypoint="builtins:missing_tdnext_plugin",
         ),
     }
     store = StateStore(tmp_path / "state.json")
-    store.write(PluginState(installed=frozenset({"base"}), enabled=frozenset({"base"})))
+    store.write(PluginState(installed=frozenset({"base", "desktop"}), enabled=frozenset({"base", "desktop"})))
     before = store.read()
-    with pytest.raises(PluginError, match="view plugin contract"):
+    with pytest.raises(PluginError, match="Cannot load bad"):
         PluginManager(manifests, store, tmp_path / "bin").enable("bad")
     assert store.read() == before
 
@@ -134,11 +150,11 @@ def test_install_with_invalid_entrypoint_does_not_commit_state(tmp_path: Path) -
             name="bad",
             version="1",
             description="bad",
-            entrypoint="builtins:int",
+            entrypoint="builtins:missing_tdnext_plugin",
         ),
     }
     store = StateStore(tmp_path / "state.json")
-    with pytest.raises(PluginError, match="view plugin contract"):
+    with pytest.raises(PluginError, match="Cannot load bad"):
         PluginManager(manifests, store, tmp_path / "bin").install("bad")
     assert store.read() == PluginState()
 
@@ -166,9 +182,9 @@ def test_wrong_monitor_binary_does_not_commit_install(tmp_path: Path) -> None:
     executable.write_text("#!/bin/sh\nprintf 'htop 1.0\\n'\n", encoding="utf-8")
     executable.chmod(0o755)
     store = StateStore(tmp_path / "state.json")
-    manifests = {"monitor": manifest("monitor", executables=("btop",))}
+    manifests = discover((Path(__file__).parents[1] / "src" / "tdnext" / "plugins",))
     with pytest.raises(PluginError, match="not a working btop"):
-        PluginManager(manifests, store, local_bin).enable("monitor")
+        PluginManager(manifests, store, local_bin).install("monitor")
     assert store.read() == PluginState()
 
 
@@ -235,7 +251,7 @@ def test_uninstall_repeated_operation_is_idempotent(tmp_path: Path) -> None:
 
 
 def test_uninstall_keeps_state_consistent_and_reinstallable(tmp_path: Path) -> None:
-    manifests = {item.id: item for item in (manifest("base"), manifest("app", ("base",)))}
+    manifests = {item.id: item for item in (host("base"), manifest("app", ("base",)))}
     local_bin = tmp_path / "bin"
     local_bin.mkdir()
     shared_binary = local_bin / "shared-tool"

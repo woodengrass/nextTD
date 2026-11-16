@@ -5,7 +5,7 @@ from typing import Annotated
 
 import typer
 
-from .core.errors import PluginError
+from .core.errors import InstallationConsentRequired, PluginError
 from .core.executables import install_executable
 from .core.local_env import bootstrap as _bootstrap_local_path
 from .runtime import manager, state_dir
@@ -26,18 +26,34 @@ def list_plugins() -> None:
     for plugin_id in sorted(state.installed - plugins.manifests.keys()):
         status = "enabled" if plugin_id in state.enabled else "installed"
         typer.echo(f"{plugin_id:12} {status:10} Missing plugin manifest")
+    for error in getattr(plugins.manifests, "errors", {}).values():
+        typer.echo(f"Invalid plugin: {error}", err=True)
 
 
 @cli.command()
 def install(plugin: str) -> None:
     """Install a plugin and its required plugins/executables, without enabling it."""
-    typer.echo(f"Installed: {', '.join(manager().install(plugin))}")
+    plugins = manager()
+    try:
+        result = plugins.install(plugin)
+    except InstallationConsentRequired as exc:
+        if not typer.confirm(f"{exc}. Proceed?", default=False):
+            raise PluginError("Installation declined; plugin state was not changed") from exc
+        result = plugins.install(plugin, approved=exc.actions)
+    typer.echo(f"Installed: {', '.join(result)}")
 
 
 @cli.command()
 def enable(plugin: str) -> None:
     """Install and enable a plugin and all required dependencies."""
-    typer.echo(f"Enabled: {', '.join(manager().enable(plugin))}")
+    plugins = manager()
+    try:
+        result = plugins.enable(plugin)
+    except InstallationConsentRequired as exc:
+        if not typer.confirm(f"{exc}. Proceed?", default=False):
+            raise PluginError("Installation declined; plugin state was not changed") from exc
+        result = plugins.enable(plugin, approved=exc.actions)
+    typer.echo(f"Enabled: {', '.join(result)}")
 
 
 @cli.command()

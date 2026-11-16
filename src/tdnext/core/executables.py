@@ -22,12 +22,6 @@ class Release:
 
 
 RELEASES: Final = {
-    "btop": Release(
-        "https://github.com/aristocratos/btop/releases/download/v1.4.8/"
-        "btop-x86_64-unknown-linux-musl.tar.gz",
-        "af589cf82cc9ea9c29ce050b9239a13bef2d1492256d476156e1054a42ce89ad",
-        "./btop/bin/btop",
-    ),
     "zellij": Release(
         "https://github.com/zellij-org/zellij/releases/download/v0.45.1/"
         "zellij-no-web-x86_64-unknown-linux-musl.tar.gz",
@@ -41,12 +35,15 @@ def install_executable(name: str, local_bin: Path) -> Path:
     """Download one allowlisted binary, never extracting arbitrary archive paths."""
     if name not in RELEASES:
         raise PluginError(f"No local installer for '{name}'; install it yourself and add it to PATH.")
+    return install_release(name, local_bin, RELEASES[name])
+
+
+def install_release(name: str, local_bin: Path, release: Release) -> Path:
     if platform.system() != "Linux" or platform.machine() not in {"x86_64", "amd64"}:
         raise PluginError(f"No bundled {name} release for this platform; install it on PATH.")
     curl = shutil.which("curl")
     if curl is None:
         raise PluginError(f"Cannot install {name}: curl is required for the verified download.")
-    release = RELEASES[name]
     try:
         local_bin.mkdir(parents=True, exist_ok=True)
         with TemporaryDirectory(prefix=f".{name}-", dir=local_bin) as work:

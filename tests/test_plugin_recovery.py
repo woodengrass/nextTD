@@ -6,7 +6,8 @@ from test_settings_ui import make_app
 from textual.widgets import DataTable
 
 from tdnext.core.appearance import Appearance, AppearanceStore
-from tdnext.core.errors import PluginError
+from tdnext.core.errors import InstallationConsentRequired, PluginError
+from tdnext.core.manager import PluginManager
 from tdnext.core.models import PluginState
 from tdnext.core.presentation import snapshot_views
 from tdnext.launcher import enabled_views
@@ -20,6 +21,20 @@ class ProviderInitializationError(RuntimeError):
 class RaisingProvider:
     def __init__(self) -> None:
         raise ProviderInitializationError("provider failed to initialize")
+
+
+class FixtureDependencies:
+    @staticmethod
+    def check(manager: PluginManager) -> str | None:
+        return None if manager.executable("tdnext-fixture-binary") else "Install fixture binary"
+
+    @staticmethod
+    def install(manager: PluginManager) -> Path:
+        manager.local_bin.mkdir(parents=True, exist_ok=True)
+        path = manager.local_bin / "tdnext-fixture-binary"
+        path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        path.chmod(0o755)
+        return path
 
 
 @pytest.mark.parametrize("failure", ["missing", "import", "constructor", "contract"])
@@ -168,41 +183,31 @@ def test_required_executable_is_installed_before_entrypoint_import_and_construct
     manifest = manager.manifests["files"].model_copy(update={
         "id": "requires-binary", "entrypoint": "requires_binary_at_import:RequiredPlugin",
         "requires_plugins": (), "requires_executables": (binary.name,),
+        "dependency_hook": f"{__name__}:FixtureDependencies",
     })
     manager.manifests = {**manager.manifests, manifest.id: manifest}
 
-    def install(name: str, destination: Path) -> Path:
-        destination.mkdir(parents=True, exist_ok=True)
-        path = destination / name
-        path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        path.chmod(0o755)
-        return path
-
-    monkeypatch.setattr("tdnext.core.manager.install_executable", install)
-    manager.enable(manifest.id)
+    with pytest.raises(InstallationConsentRequired) as consent:
+        manager.enable(manifest.id)
+    manager.enable(manifest.id, approved=consent.value.actions)
     assert manifest.id in manager.store.read().enabled
     assert os.access(binary, os.X_OK)
 
 
 def test_failed_constructor_after_executable_install_does_not_commit_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     _app, manager = make_app(tmp_path)
     binary = "tdnext-fixture-binary"
     manifest = manager.manifests["icons"].model_copy(update={
         "entrypoint": f"{__name__}:RaisingProvider", "requires_executables": (binary,),
+        "dependency_hook": f"{__name__}:FixtureDependencies",
     })
     manager.manifests = {**manager.manifests, manifest.id: manifest}
     before = manager.store.read()
 
-    def install(name: str, destination: Path) -> Path:
-        destination.mkdir(parents=True, exist_ok=True)
-        path = destination / name
-        path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        path.chmod(0o755)
-        return path
-
-    monkeypatch.setattr("tdnext.core.manager.install_executable", install)
-    with pytest.raises(PluginError, match="provider failed to initialize"):
+    with pytest.raises(InstallationConsentRequired) as consent:
         manager.enable(manifest.id)
+    with pytest.raises(PluginError, match="provider failed to initialize"):
+        manager.enable(manifest.id, approved=consent.value.actions)
     assert manager.store.read() == before

@@ -10,3 +10,9 @@ class PluginError(Exception):
 
     def __str__(self) -> str:
         return self.detail
+
+
+class InstallationConsentRequired(PluginError):
+    def __init__(self, actions: tuple[tuple[str, str], ...]) -> None:
+        self.actions = actions
+        super().__init__("External installation requires consent: " + "; ".join(text for _, text in actions))

@@ -27,7 +27,9 @@ def text_of(widget: Static) -> str:
 def make_app(tmp_path: Path, *, monitor: bool = False) -> tuple[DesktopApp, PluginManager]:
     roots = (Path(__file__).parents[1] / "src" / "tdnext" / "plugins",)
     manifests = discover(roots)
-    manifests["monitor"] = manifests["monitor"].model_copy(update={"requires_executables": ()})
+    manifests["monitor"] = manifests["monitor"].model_copy(
+        update={"requires_executables": (), "dependency_hook": None}
+    )
     manager = PluginManager(manifests, StateStore(tmp_path / "plugins.json"), tmp_path / "bin")
     installed = frozenset({"desktop", "files", "settings"} | ({"monitor"} if monitor else set()))
     manager.store.write(PluginState(installed=installed, enabled=installed))
@@ -226,11 +228,11 @@ async def test_slow_operation_keeps_back_responsive(tmp_path: Path, monkeypatch:
     started, release = threading.Event(), threading.Event()
     original = manager.enable
 
-    def slow_enable(plugin_id: str) -> tuple[str, ...]:
+    def slow_enable(plugin_id: str, *, approved: tuple[tuple[str, str], ...] = ()) -> tuple[str, ...]:
         started.set()
         if not release.wait(timeout=5):
             raise RuntimeError("test operation timed out")
-        return original(plugin_id)
+        return original(plugin_id, approved=approved)
 
     monkeypatch.setattr(manager, "enable", slow_enable)
     async with app.run_test(size=(80, 24)) as pilot:

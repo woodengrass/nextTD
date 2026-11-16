@@ -191,10 +191,10 @@ async def test_busy_operation_survives_section_switch_and_blocks_more_operations
     started, release = threading.Event(), threading.Event()
     original = manager.enable
 
-    def slow_enable(plugin_id: str) -> tuple[str, ...]:
+    def slow_enable(plugin_id: str, *, approved: tuple[tuple[str, str], ...] = ()) -> tuple[str, ...]:
         started.set()
         assert release.wait(timeout=10), "test operation timed out"
-        return original(plugin_id)
+        return original(plugin_id, approved=approved)
 
     monkeypatch.setattr(manager, "enable", slow_enable)
     async with app.run_test(size=(80, 24)) as pilot:
