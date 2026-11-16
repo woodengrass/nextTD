@@ -30,12 +30,57 @@ def project_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
+def _is_project_checkout(root: Path) -> bool:
+    """Report whether ``root`` is a real project checkout.
+
+    One stray file must never count: require both the packaging marker
+    carrying this project's name and the matching source layout.
+    """
+    pyproject = root / "pyproject.toml"
+    if not pyproject.is_file():
+        return False
+    try:
+        text = pyproject.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if "terminal-desktop-next" not in text:
+        return False
+    return (root / "src" / "tdnext").is_dir()
+
+
+def _installed_state_dir() -> Path:
+    """Resolve the user-writable XDG data location for installed wheels."""
+    configured = os.environ.get("XDG_DATA_HOME", "")
+    if configured.strip():
+        base = Path(configured).expanduser()
+        if base.is_absolute():
+            return base / "tdnext"
+    return Path.home() / ".local" / "share" / "tdnext"
+
+
+def _default_state_dir() -> Path:
+    """Resolve the default state dir: checkout ``state`` or XDG data dir."""
+    root = project_root()
+    if _is_project_checkout(root):
+        return root / "state"
+    return _installed_state_dir()
+
+
 def resolve_state_dir(explicit: Path | None = None) -> Path:
-    """Resolve the absolute state directory honoring ``TDNEXT_STATE_DIR``."""
+    """Resolve the absolute state directory honoring ``TDNEXT_STATE_DIR``.
+
+    Precedence is explicit argument, then the ``TDNEXT_STATE_DIR``
+    environment override, then the checkout ``state`` directory when
+    running from a real project checkout, and finally the user-writable
+    XDG data location for regular installed wheels. Resolution never
+    creates, migrates, or overwrites any directory.
+    """
     if explicit is not None:
         base = explicit
+    elif "TDNEXT_STATE_DIR" in os.environ:
+        base = Path(os.environ["TDNEXT_STATE_DIR"]).expanduser()
     else:
-        base = Path(os.environ.get("TDNEXT_STATE_DIR", str(project_root() / "state"))).expanduser()
+        base = _default_state_dir()
     if not base.is_absolute():
         base = Path.cwd() / base
     return base
