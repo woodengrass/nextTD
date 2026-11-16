@@ -31,12 +31,26 @@ Native CLI (new, works with no session for help):
   The screen resolves the source against currently active tabs and acts only
   when exactly one client matches; this handles a CLI connection ID that is
   not the attached client, without guessing across sessions.
+* `zellij action set-pane-fixed-width --pane-id <ID> --width <COLS>` sets one
+  tiled pane to an explicit fixed width (tag 155). The tab keeps its current
+  topology: the solver re-derives the grid from current positions, so only
+  the boundary next to the target pane moves and no pane is relocated.
+  Refuses floating, stacked, fullscreen, non-fixed, unknown, and
+  below-minimum (`MIN_TERMINAL_WIDTH`) targets with a CLI error, and reverts
+  the constraint when the solver cannot fit the width. Repeating the current
+  width is a no-op. Stock `resize` cannot do this: fixed panes are immune to
+  it (`CantResizeFixedPanes`), so the desktop sidebar toggle uses this
+  command instead of `override-layout`.
 * All appear in `zellij action --help` and per-command `--help`.
 
 `Action::OpenTabWithReturn/ReturnToOrigin` also round-trip through the
-protobuf IPC contract (tags 152/153; restore uses 154) and are routed in `route_action` to the
+protobuf IPC contract (tags 152/153; restore uses 154; fixed width uses 155)
+and are routed in `route_action` to the
 new `ScreenInstruction::OpenTabWithReturn/ReturnToOrigin` with completion
-notification passthrough, like other tab actions.
+notification passthrough, like other tab actions. `SetPaneFixedWidth`
+routes to `ScreenInstruction::SetPaneFixedWidth`, which searches all tabs
+for the pane (like `ResizeWithPaneId`) and reports unknown panes and guard
+failures through the completion channel so the CLI exits nonzero.
 
 ## Semantics (per client, single-attached-client sessions)
 
@@ -167,3 +181,41 @@ Earlier verification of the original core patch:
   the isolated floating-header regression passed, and the combined
   `tests/test_native_core_header_focus.py`, `tests/test_native_core_navigation.py`,
   and `tests/test_native_core_locked.py` run passed all 12 cases.
+
+## Sidebar fixed-width API (v3 artifact)
+
+`SetPaneFixedWidth` (tag 155) extends the same patch for the desktop
+sidebar toggle. Root cause it fixes: the toggle used `override-layout`
+with the stale startup layout, which re-applies a two-child workspace
+subtree and crams user-added panes into the sidebar column (same PIDs,
+wrong tiles); stock `resize --pane-id` is a silent no-op on fixed panes
+(`CantResizeFixedPanes`). The new command mutates only the target pane's
+fixed-width constraint and re-runs the constraint solver over current
+positions, so topology, PIDs, and focus are preserved by construction.
+
+`state/bin/zellij-core-navigation-v3` carries the navigation commands
+plus this command (SHA-256
+`df1753f9b89e2724451b1b9c066efaed80c610c98278634cfc8f2dc73c4d50b4`).
+The navigation protocol version is unchanged (`TDNEXT_CORE_NAVIGATION_VERSION=2`):
+v3 is v2 capabilities plus the width API, and the launcher selects it by
+binary name, not by protocol bump.
+
+Verification (2026-11-16, Rust 1.95, private source and target dirs, no
+existing binary overwritten, isolated disposable sessions only):
+
+* `cargo test --locked --no-default-features -p zellij-server --lib -- set_pane_fixed_width navigation_`
+  passed 33 tests: the new collapse/expand/user-split topology test plus
+  the 32 navigation tests.
+* `RUST_MIN_STACK=16777216 cargo test --locked --no-default-features
+  -p zellij-utils --lib` passed 458 tests. The raised test-thread stack is
+  needed on this machine: the clap parser for the grown action enum
+  overflows the default 2 MiB debug-test stack in
+  `cli::tests::subscribe_multiple_pane_ids` (pre-existing fragility, tipped
+  over by the fifth new CLI variant; release builds and the shipped binary
+  are unaffected).
+* `cargo build --locked --release --no-default-features --bin zellij`;
+  `zellij action --help` lists `set-pane-fixed-width` alongside the
+  navigation commands with no session running.
+* Behavioral proof lives in `tests/test_native_sidebar_width.py`: a
+  disposable session with user-added splits collapses and expands the
+  sidebar repeatedly while pane IDs, PIDs, topology, and focus hold.

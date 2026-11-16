@@ -26,7 +26,9 @@ def test_native_shell_interaction_and_settings_preserve_the_process(
         wait_for(lambda: session.active_tab() == session.tab_id("Shell"))
         def shell_pane():
             panes = json.loads(session.action("list-panes", "--all", "--json"))
-            return next((item for item in panes if "tdnext.pane view shell" in (item.get("pane_command") or "")), None)
+            return next(
+                (item for item in panes if "tdnext.pane view shell" in (item.get("terminal_command") or "")), None
+            )
 
         pane = wait_for(shell_pane)
         pane_id = f"terminal_{pane['id']}"

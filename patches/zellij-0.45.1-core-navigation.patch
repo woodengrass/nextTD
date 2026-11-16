@@ -1330,3 +1330,607 @@ index 0e787ca..9d5d771 100644
              Action::WriteToPaneId { .. }
              | Action::WriteCharsToPaneId { .. }
              | Action::Paste { .. }
+diff --git a/zellij-server/src/panes/tiled_panes/mod.rs b/zellij-server/src/panes/tiled_panes/mod.rs
+index 94c824b..f7e08b0 100644
+--- a/zellij-server/src/panes/tiled_panes/mod.rs
++++ b/zellij-server/src/panes/tiled_panes/mod.rs
+@@ -35,7 +35,7 @@ use zellij_utils::{
+         layout::{Run, RunPluginOrAlias, SplitDirection},
+         options::PaneFrameStyle,
+     },
+-    pane_size::{Offset, PaneGeom, Size, SizeInPixels, Viewport},
++    pane_size::{Dimension, Offset, PaneGeom, Size, SizeInPixels, Viewport},
+ };
+ 
+ use std::{
+@@ -1976,6 +1976,63 @@ impl TiledPanes {
+         Ok(pane_size_changed)
+     }
+ 
++    pub fn set_pane_fixed_width(&mut self, pane_id: PaneId, width: usize) -> Result<()> {
++        let err_context = || format!("failed to set fixed width for pane {:?}", pane_id);
++        let previous_geom = self
++            .get_pane(pane_id)
++            .map(|pane| pane.position_and_size())
++            .with_context(err_context)?;
++        if !previous_geom.cols.is_fixed() {
++            return Err(anyhow!(
++                "pane {:?} is not fixed-width, refusing to convert it",
++                pane_id
++            ))
++            .with_context(err_context);
++        }
++        if previous_geom.cols.as_usize() == width {
++            return Ok(());
++        }
++        let mut next_geom = previous_geom;
++        next_geom.cols = Dimension::fixed(width);
++        match self.panes.get_mut(&pane_id) {
++            Some(pane) if pane.geom_override().is_some() => {
++                pane.set_geom_override(next_geom);
++            },
++            Some(pane) => {
++                pane.set_geom(next_geom);
++            },
++            None => {
++                return Err(anyhow!("pane {:?} not found", pane_id)).with_context(err_context);
++            },
++        }
++        let mut pane_grid = TiledPaneGrid::new(
++            &mut self.panes,
++            &self.panes_to_hide,
++            *self.display_area.borrow(),
++            *self.viewport.borrow(),
++        );
++        if let Err(e) = pane_grid.layout(
++            SplitDirection::Horizontal,
++            self.display_area.borrow().cols,
++        ) {
++            match self.panes.get_mut(&pane_id) {
++                Some(pane) if pane.geom_override().is_some() => {
++                    pane.set_geom_override(previous_geom);
++                },
++                Some(pane) => {
++                    pane.set_geom(previous_geom);
++                },
++                None => {},
++            }
++            return Err(e).with_context(err_context);
++        }
++        for pane in self.panes.values_mut() {
++            resize_pty!(pane, self.os_api, self.senders, self.character_cell_size).non_fatal();
++        }
++        self.reset_boundaries();
++        Ok(())
++    }
++
+     pub fn resize_pane_with_strategies(
+         &mut self,
+         pane_id: PaneId,
+diff --git a/zellij-server/src/route.rs b/zellij-server/src/route.rs
+index df5585d..e533b31 100644
+--- a/zellij-server/src/route.rs
++++ b/zellij-server/src/route.rs
+@@ -2054,6 +2054,15 @@ pub(crate) fn route_action(
+                 ))
+                 .with_context(err_context)?;
+         },
++        Action::SetPaneFixedWidth { pane_id, width } => {
++            senders
++                .send_to_screen(ScreenInstruction::SetPaneFixedWidth(
++                    pane_id.into(),
++                    width,
++                    Some(NotificationEnd::new(completion_tx)),
++                ))
++                .with_context(err_context)?;
++        },
+         Action::MovePaneBackwardsByPaneId { pane_id } => {
+             senders
+                 .send_to_screen(ScreenInstruction::MovePaneBackwardsWithPaneId(
+diff --git a/zellij-server/src/screen.rs b/zellij-server/src/screen.rs
+index 0aaa484..5f87cd1 100644
+--- a/zellij-server/src/screen.rs
++++ b/zellij-server/src/screen.rs
+@@ -945,6 +945,7 @@ pub enum ScreenInstruction {
+     HalfPageScrollUpWithPaneId(PaneId, Option<NotificationEnd>),
+     HalfPageScrollDownWithPaneId(PaneId, Option<NotificationEnd>),
+     ResizeWithPaneId(PaneId, ResizeStrategy, Option<NotificationEnd>),
++    SetPaneFixedWidth(PaneId, usize, Option<NotificationEnd>),
+     MovePaneWithPaneIdCli(PaneId, Option<Direction>, Option<NotificationEnd>),
+     MovePaneBackwardsWithPaneId(PaneId, Option<NotificationEnd>),
+     ClearScreenWithPaneId(PaneId, Option<NotificationEnd>),
+@@ -1328,6 +1329,7 @@ impl From<&ScreenInstruction> for ScreenContext {
+                 ScreenContext::HalfPageScrollDownWithPaneId
+             },
+             ScreenInstruction::ResizeWithPaneId(..) => ScreenContext::ResizeWithPaneId,
++            ScreenInstruction::SetPaneFixedWidth(..) => ScreenContext::ResizeWithPaneId,
+             ScreenInstruction::MovePaneWithPaneIdCli(..) => ScreenContext::MovePaneWithPaneIdCli,
+             ScreenInstruction::MovePaneBackwardsWithPaneId(..) => {
+                 ScreenContext::MovePaneBackwardsWithPaneId
+@@ -12683,6 +12685,35 @@ pub(crate) fn screen_thread_main(
+                 screen.render(None)?;
+                 screen.log_and_report_session_state()?;
+             },
++            ScreenInstruction::SetPaneFixedWidth(pane_id, width, mut completion_tx) => {
++                let all_tabs = screen.get_tabs_mut();
++                let mut found = false;
++                let mut failure: Option<String> = None;
++                for tab in all_tabs.values_mut() {
++                    if tab.has_pane_with_pid(&pane_id) {
++                        found = true;
++                        if let Err(e) = tab.set_pane_fixed_width(pane_id, width) {
++                            failure = Some(format!("{:?}", e));
++                        }
++                        break;
++                    }
++                }
++                if !found {
++                    log::error!("Pane with id {:?} not found", pane_id);
++                    if let Some(ref mut c) = completion_tx {
++                        c.set_exit_status(1);
++                        c.set_error_message(format!("Pane with id {:?} not found", pane_id));
++                    }
++                } else if let Some(e) = failure {
++                    log::error!("Failed to set fixed width: {}", e);
++                    if let Some(ref mut c) = completion_tx {
++                        c.set_exit_status(1);
++                        c.set_error_message(e);
++                    }
++                }
++                screen.render(None)?;
++                screen.log_and_report_session_state()?;
++            },
+             ScreenInstruction::MovePaneWithPaneIdCli(pane_id, direction, mut _completion_tx) => {
+                 let all_tabs = screen.get_tabs_mut();
+                 let mut found = false;
+diff --git a/zellij-server/src/tab/mod.rs b/zellij-server/src/tab/mod.rs
+index 8e5a6d0..345b909 100644
+--- a/zellij-server/src/tab/mod.rs
++++ b/zellij-server/src/tab/mod.rs
+@@ -7976,6 +7976,45 @@ impl Tab {
+     pub fn resize_by_pane_id(&mut self, pane_id: PaneId, strategy: ResizeStrategy) {
+         self.resize_pane_with_id(strategy, pane_id).non_fatal();
+     }
++    pub fn set_pane_fixed_width(&mut self, pane_id: PaneId, width: usize) -> Result<()> {
++        let err_context = || format!("failed to set fixed width for pane {:?}", pane_id);
++        if self.tiled_panes.fullscreen_is_active()
++            || self.floating_panes.fullscreen_is_active()
++        {
++            return Err(anyhow!(
++                "cannot change pane width while fullscreen is active"
++            ))
++            .with_context(err_context);
++        }
++        if self.floating_panes.panes_contain(&pane_id) {
++            return Err(anyhow!(
++                "pane {:?} is floating, fixed width applies to tiled panes",
++                pane_id
++            ))
++            .with_context(err_context);
++        }
++        if !self.tiled_panes.panes_contain(&pane_id) {
++            return Err(anyhow!("pane {:?} not found", pane_id)).with_context(err_context);
++        }
++        if self.pane_is_stack_list_member(&pane_id) {
++            return Err(anyhow!(
++                "pane {:?} is in a stack, fixed width is not supported",
++                pane_id
++            ))
++            .with_context(err_context);
++        }
++        if width < MIN_TERMINAL_WIDTH {
++            return Err(anyhow!(
++                "width {} is below the {} column minimum",
++                width,
++                MIN_TERMINAL_WIDTH
++            ))
++            .with_context(err_context);
++        }
++        self.tiled_panes
++            .set_pane_fixed_width(pane_id, width)
++            .with_context(err_context)
++    }
+     pub fn move_pane_by_pane_id(&mut self, pane_id: PaneId, direction: Option<Direction>) {
+         if !self.has_selectable_panes() {
+             return;
+diff --git a/zellij-server/src/unit/screen_tests.rs b/zellij-server/src/unit/screen_tests.rs
+index 8643afd..723cab0 100644
+--- a/zellij-server/src/unit/screen_tests.rs
++++ b/zellij-server/src/unit/screen_tests.rs
+@@ -16,7 +16,7 @@ use zellij_utils::input::command::{RunCommand, TerminalAction};
+ use zellij_utils::input::config::Config;
+ use zellij_utils::input::layout::{
+     FloatingPaneLayout, Layout, PercentOrFixed, PluginAlias, PluginUserConfiguration, Run,
+-    RunPlugin, RunPluginLocation, RunPluginOrAlias, SplitDirection, TiledPaneLayout,
++    RunPlugin, RunPluginLocation, RunPluginOrAlias, SplitDirection, SplitSize, TiledPaneLayout,
+ };
+ use zellij_utils::input::mouse::MouseEvent;
+ use zellij_utils::input::options::{
+@@ -14296,3 +14296,139 @@ pub fn reported_pixel_dimensions_are_applied_to_existing_ptys() {
+         resizes_after_reply
+     );
+ }
++
++fn sidebar_width_screen() -> Screen {
++    let size = Size {
++        cols: 122,
++        rows: 30,
++    };
++    let client_id = 1;
++    let mut screen = create_new_screen(size, true, true);
++    let command_pane = || TiledPaneLayout {
++        run: Some(Run::Command(RunCommand {
++            command: "sleep".into(),
++            args: vec!["1000".to_owned()],
++            ..Default::default()
++        })),
++        ..Default::default()
++    };
++    let layout = TiledPaneLayout {
++        children_split_direction: SplitDirection::Vertical,
++        children: vec![
++            TiledPaneLayout {
++                split_size: Some(SplitSize::Fixed(22)),
++                ..command_pane()
++            },
++            command_pane(),
++        ],
++        ..Default::default()
++    };
++    screen
++        .new_tab(0, (vec![], vec![]), None, Some(client_id))
++        .expect("TEST");
++    screen
++        .apply_layout(
++            layout,
++            vec![],
++            vec![(1, None), (2, None)],
++            vec![],
++            HashMap::new(),
++            0,
++            true,
++            (client_id, false),
++            None,
++        )
++        .expect("TEST");
++    screen
++}
++
++fn tiled_pane_info(screen: &Screen, client_id: ClientId, pane_id: PaneId) -> (usize, usize, usize, usize) {
++    let tab = screen.get_active_tab(client_id).expect("TEST");
++    let info = tab.get_pane_info(pane_id).expect("TEST");
++    assert!(!info.is_floating, "pane {:?} must stay tiled", pane_id);
++    (info.pane_x, info.pane_y, info.pane_columns, info.pane_rows)
++}
++
++#[test]
++fn set_pane_fixed_width_collapse_expand_preserves_user_splits() {
++    let mut screen = sidebar_width_screen();
++    let client_id = 1;
++    let sidebar = PaneId::Terminal(1);
++    let workspace = PaneId::Terminal(2);
++    let user_pane = PaneId::Terminal(3);
++    {
++        let tab = screen.get_active_tab_mut(client_id).expect("TEST");
++        tab.vertical_split_of_pane_id(user_pane, None, None, workspace, None, None)
++            .expect("TEST");
++    }
++    let before: HashMap<PaneId, (usize, usize, usize, usize)> = [sidebar, workspace, user_pane]
++        .into_iter()
++        .map(|pane_id| (pane_id, tiled_pane_info(&screen, client_id, pane_id)))
++        .collect();
++    assert_eq!(before[&sidebar].2, 22, "sidebar starts expanded");
++    assert_eq!(before[&sidebar].0, 0, "sidebar starts at the left edge");
++    assert!(
++        before[&workspace].0 >= 22 && before[&user_pane].0 >= 22,
++        "workspace panes start right of the sidebar: {:?}",
++        before
++    );
++    let focused_before = screen
++        .get_active_tab(client_id)
++        .expect("TEST")
++        .get_active_pane_id(client_id);
++
++    {
++        let tab = screen.get_active_tab_mut(client_id).expect("TEST");
++        tab.set_pane_fixed_width(sidebar, 10).expect("TEST");
++    }
++    let collapsed: HashMap<PaneId, (usize, usize, usize, usize)> = [sidebar, workspace, user_pane]
++        .into_iter()
++        .map(|pane_id| (pane_id, tiled_pane_info(&screen, client_id, pane_id)))
++        .collect();
++    assert_eq!(collapsed[&sidebar], (0, before[&sidebar].1, 10, before[&sidebar].3));
++    assert_eq!(collapsed[&workspace].0, 10, "workspace follows the collapsed boundary");
++    assert!(
++        collapsed[&user_pane].0 >= 10,
++        "user pane stays in the workspace, not under the sidebar: {:?}",
++        collapsed
++    );
++    for pane_id in [sidebar, workspace, user_pane] {
++        assert_eq!(
++            collapsed[&pane_id].3, before[&pane_id].3,
++            "collapse keeps pane {:?} rows",
++            pane_id
++        );
++    }
++    {
++        let tab = screen.get_active_tab(client_id).expect("TEST");
++        assert_eq!(
++            tab.get_all_pane_ids().len(),
++            3,
++            "collapse adds no panes"
++        );
++        assert_eq!(tab.get_active_pane_id(client_id), focused_before);
++    }
++
++    {
++        let tab = screen.get_active_tab_mut(client_id).expect("TEST");
++        tab.set_pane_fixed_width(sidebar, 22).expect("TEST");
++    }
++    let expanded: HashMap<PaneId, (usize, usize, usize, usize)> = [sidebar, workspace, user_pane]
++        .into_iter()
++        .map(|pane_id| (pane_id, tiled_pane_info(&screen, client_id, pane_id)))
++        .collect();
++    assert_eq!(expanded, before, "expand restores the exact pre-collapse geometry");
++
++    {
++        let tab = screen.get_active_tab_mut(client_id).expect("TEST");
++        assert!(tab.set_pane_fixed_width(sidebar, 22).is_ok(), "repeating the current width is a no-op");
++        assert!(tab.set_pane_fixed_width(PaneId::Terminal(99), 10).is_err());
++        assert!(tab.set_pane_fixed_width(sidebar, 0).is_err());
++        assert!(tab.set_pane_fixed_width(workspace, 10).is_err(), "flexible panes are not converted");
++    }
++    let intact: HashMap<PaneId, (usize, usize, usize, usize)> = [sidebar, workspace, user_pane]
++        .into_iter()
++        .map(|pane_id| (pane_id, tiled_pane_info(&screen, client_id, pane_id)))
++        .collect();
++    assert_eq!(intact, before, "rejected widths leave geometry untouched");
++}
+diff --git a/zellij-utils/assets/prost_ipc/client_server_contract.rs b/zellij-utils/assets/prost_ipc/client_server_contract.rs
+index 30ae885..dbcc8ee 100644
+--- a/zellij-utils/assets/prost_ipc/client_server_contract.rs
++++ b/zellij-utils/assets/prost_ipc/client_server_contract.rs
+@@ -120,7 +120,7 @@ pub struct RgbColor {
+ #[allow(clippy::derive_partial_eq_without_eq)]
+ #[derive(Clone, PartialEq, ::prost::Message)]
+ pub struct Action {
+-    #[prost(oneof="action::ActionType", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154")]
++    #[prost(oneof="action::ActionType", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155")]
+     pub action_type: ::core::option::Option<action::ActionType>,
+ }
+ /// Nested message and enum types in `Action`.
+@@ -436,6 +436,8 @@ pub mod action {
+         ReturnToOrigin(super::ReturnToOriginAction),
+         #[prost(message, tag="154")]
+         RestoreFocusFromHeader(super::RestoreFocusFromHeaderAction),
++        #[prost(message, tag="155")]
++        SetPaneFixedWidth(super::SetPaneFixedWidthAction),
+     }
+ }
+ // Action message definitions (all 92 variants)
+@@ -459,6 +461,14 @@ pub struct RestoreFocusFromHeaderAction {
+ }
+ #[allow(clippy::derive_partial_eq_without_eq)]
+ #[derive(Clone, PartialEq, ::prost::Message)]
++pub struct SetPaneFixedWidthAction {
++    #[prost(message, optional, tag="1")]
++    pub pane_id: ::core::option::Option<PaneId>,
++    #[prost(uint32, tag="2")]
++    pub width: u32,
++}
++#[allow(clippy::derive_partial_eq_without_eq)]
++#[derive(Clone, PartialEq, ::prost::Message)]
+ pub struct QuitAction {
+ }
+ #[allow(clippy::derive_partial_eq_without_eq)]
+diff --git a/zellij-utils/src/cli.rs b/zellij-utils/src/cli.rs
+index 68f27d1..2a4743d 100644
+--- a/zellij-utils/src/cli.rs
++++ b/zellij-utils/src/cli.rs
+@@ -738,6 +738,18 @@ pub enum CliAction {
+         #[clap(short, long, value_parser)]
+         pane_id: Option<String>,
+     },
++    /// Set a tiled pane to an explicit fixed width in columns
++    ///
++    /// Unlike resize, this honors the current tiled topology: only the
++    /// boundary next to the target pane moves, no pane is relocated.
++    SetPaneFixedWidth {
++        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
++        #[clap(short, long, value_parser)]
++        pane_id: String,
++        /// Fixed width in columns (eg. 22)
++        #[clap(short, long, value_parser)]
++        width: usize,
++    },
+     /// Change focus to the next pane
+     FocusNextPane,
+     /// Change focus to the previous pane
+@@ -1688,6 +1700,29 @@ mod tests {
+     }
+ 
+     #[test]
++    fn action_set_pane_fixed_width_parses_pane_id_and_width() {
++        let cli = CliArgs::try_parse_from([
++            "zellij",
++            "action",
++            "set-pane-fixed-width",
++            "--pane-id",
++            "terminal_1",
++            "--width",
++            "10",
++        ])
++        .expect("set-pane-fixed-width should parse");
++        match cli.command {
++            Some(Command::Action(action)) => match *action {
++                CliAction::SetPaneFixedWidth { pane_id, width } => {
++                    assert_eq!(pane_id, "terminal_1");
++                    assert_eq!(width, 10);
++                },
++                other => panic!("Expected SetPaneFixedWidth, got {:?}", other),
++            },
++            other => panic!("Expected Action, got {:?}", other),
++        }
++    }
++
+     fn action_return_to_origin_parses() {
+         let cli = CliArgs::try_parse_from(["zellij", "action", "return-to-origin"])
+             .expect("return-to-origin should parse");
+diff --git a/zellij-utils/src/client_server_contract/common_types.proto b/zellij-utils/src/client_server_contract/common_types.proto
+index eb1a879..ab11b8b 100644
+--- a/zellij-utils/src/client_server_contract/common_types.proto
++++ b/zellij-utils/src/client_server_contract/common_types.proto
+@@ -292,6 +292,7 @@ message Action {
+     OpenTabWithReturnAction open_tab_with_return = 152;
+     ReturnToOriginAction return_to_origin = 153;
+     RestoreFocusFromHeaderAction restore_focus_from_header = 154;
++    SetPaneFixedWidthAction set_pane_fixed_width = 155;
+   }
+ }
+ 
+@@ -301,6 +302,7 @@ message Action {
+ message OpenTabWithReturnAction { string name = 1; bool from_header = 2; }
+ message ReturnToOriginAction {}
+ message RestoreFocusFromHeaderAction {}
++message SetPaneFixedWidthAction { PaneId pane_id = 1; uint32 width = 2; }
+ message QuitAction {}
+ message FocusNextPaneAction {}
+ message FocusPreviousPaneAction {}
+diff --git a/zellij-utils/src/input/actions.rs b/zellij-utils/src/input/actions.rs
+index 5897f3b..2ccd218 100644
+--- a/zellij-utils/src/input/actions.rs
++++ b/zellij-utils/src/input/actions.rs
+@@ -663,6 +663,10 @@ pub enum Action {
+         resize: Resize,
+         direction: Option<Direction>,
+     },
++    SetPaneFixedWidth {
++        pane_id: PaneId,
++        width: usize,
++    },
+     MovePaneByPaneId {
+         pane_id: PaneId,
+         direction: Option<Direction>,
+@@ -893,6 +897,13 @@ impl Action {
+                 },
+                 None => Ok(vec![Action::Resize { resize, direction }]),
+             },
++            CliAction::SetPaneFixedWidth { pane_id, width } => {
++                let pane_id = PaneId::from_str(&pane_id)
++                    .map_err(|_| format!(
++                        "Malformed pane id: {pane_id}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
++                    ))?;
++                Ok(vec![Action::SetPaneFixedWidth { pane_id, width }])
++            },
+             CliAction::FocusNextPane => Ok(vec![Action::FocusNextPane]),
+             CliAction::FocusPreviousPane => Ok(vec![Action::FocusPreviousPane]),
+             CliAction::FocusPaneId { pane_id } => {
+@@ -2756,6 +2767,35 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn test_set_pane_fixed_width() {
++        let cli_action = CliAction::SetPaneFixedWidth {
++            pane_id: "terminal_3".to_string(),
++            width: 10,
++        };
++        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
++        assert!(result.is_ok());
++        let actions = result.unwrap();
++        assert_eq!(actions.len(), 1);
++        match &actions[0] {
++            Action::SetPaneFixedWidth { pane_id, width } => {
++                assert!(matches!(pane_id, PaneId::Terminal(3)));
++                assert_eq!(*width, 10);
++            },
++            _ => panic!("Expected SetPaneFixedWidth action"),
++        }
++    }
++
++    #[test]
++    fn test_set_pane_fixed_width_rejects_malformed_pane_id() {
++        let cli_action = CliAction::SetPaneFixedWidth {
++            pane_id: "terminal_x".to_string(),
++            width: 10,
++        };
++        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
++        assert!(result.is_err());
++    }
++
+     #[test]
+     fn test_resize_without_pane_id() {
+         let cli_action = CliAction::Resize {
+diff --git a/zellij-utils/src/ipc/protobuf_conversion.rs b/zellij-utils/src/ipc/protobuf_conversion.rs
+index 4a9caf4..404f680 100644
+--- a/zellij-utils/src/ipc/protobuf_conversion.rs
++++ b/zellij-utils/src/ipc/protobuf_conversion.rs
+@@ -1281,6 +1281,7 @@ impl From<crate::input::actions::Action>
+             SetLightThemeAction,
+             SetPaneBorderlessAction,
+             SetPaneColorAction,
++            SetPaneFixedWidthAction,
+             SetPaneFrameStyleAction,
+             ShowFloatingPanesAction,
+             SkipConfirmAction,
+@@ -2148,6 +2149,12 @@ impl From<crate::input::actions::Action>
+                     direction: direction.map(|d| direction_to_proto_i32(d)),
+                 }),
+             }),
++            crate::input::actions::Action::SetPaneFixedWidth { pane_id, width } => {
++                ActionType::SetPaneFixedWidth(SetPaneFixedWidthAction {
++                    pane_id: Some(pane_id.into()),
++                    width: width as u32,
++                })
++            },
+             crate::input::actions::Action::MovePaneByPaneId { pane_id, direction } => {
+                 ActionType::MovePaneByPaneId(MovePaneByPaneIdAction {
+                     pane_id: Some(pane_id.into()),
+@@ -3106,6 +3113,15 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
+                     direction,
+                 })
+             },
++            ActionType::SetPaneFixedWidth(a) => {
++                Ok(crate::input::actions::Action::SetPaneFixedWidth {
++                    pane_id: a
++                        .pane_id
++                        .ok_or_else(|| anyhow!("SetPaneFixedWidth missing pane_id"))?
++                        .try_into()?,
++                    width: a.width as usize,
++                })
++            },
+             ActionType::MovePaneBackwardsByPaneId(a) => {
+                 Ok(crate::input::actions::Action::MovePaneBackwardsByPaneId {
+                     pane_id: a
+diff --git a/zellij-utils/src/ipc/tests/roundtrip_tests.rs b/zellij-utils/src/ipc/tests/roundtrip_tests.rs
+index 78badc3..5744240 100644
+--- a/zellij-utils/src/ipc/tests/roundtrip_tests.rs
++++ b/zellij-utils/src/ipc/tests/roundtrip_tests.rs
+@@ -3581,6 +3581,15 @@ fn test_client_messages() {
+         client_id: Some(100),
+         is_cli_client: true,
+     });
++    test_client_roundtrip!(ClientToServerMsg::Action {
++        action: Action::SetPaneFixedWidth {
++            pane_id: PaneId::Terminal(1),
++            width: 10,
++        },
++        terminal_id: Some(1),
++        client_id: Some(100),
++        is_cli_client: true,
++    });
+     test_client_roundtrip!(ClientToServerMsg::Action {
+         action: Action::MovePaneByPaneId {
+             pane_id: PaneId::Terminal(3),
+diff --git a/zellij-utils/src/plugin_api/action.rs b/zellij-utils/src/plugin_api/action.rs
+index 9d5d771..d29601b 100644
+--- a/zellij-utils/src/plugin_api/action.rs
++++ b/zellij-utils/src/plugin_api/action.rs
+@@ -1197,6 +1197,7 @@ impl TryFrom<Action> for ProtobufAction {
+             | Action::HalfPageScrollUpByPaneId { .. }
+             | Action::HalfPageScrollDownByPaneId { .. }
+             | Action::ResizeByPaneId { .. }
++            | Action::SetPaneFixedWidth { .. }
+             | Action::MovePaneByPaneId { .. }
+             | Action::MovePaneBackwardsByPaneId { .. }
+             | Action::ClearScreenByPaneId { .. }

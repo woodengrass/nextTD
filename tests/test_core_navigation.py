@@ -2,7 +2,7 @@
 
 Contract (plugin.py and navigation.py only; Rust and patches untouched):
 
-- New sessions select ``state/bin/zellij-core-navigation-v2`` only when it is
+- New sessions select ``state/bin/zellij-core-navigation-v3`` only when it is
   executable and ``<binary> action --help`` lists all four required native
   navigation commands. Anything else keeps the existing fallback behavior.
 - A capable session sets ``TDNEXT_CORE_NAVIGATION=1``,
@@ -192,7 +192,7 @@ def test_probe_uses_bounded_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     calls: list[dict[str, object]] = []
     _probe_run(monkeypatch, calls, outcome=(FULL_HELP, 0, ""))
     assert desktop_plugin.core_capable_binary() == candidate
-    assert candidate == state / "bin" / "zellij-core-navigation-v2"
+    assert candidate == state / "bin" / desktop_plugin.CORE_BINARY_NAME
     assert calls[0]["command"] == [str(candidate), "action", "--help"]
     assert calls[0]["timeout"] == desktop_plugin.CORE_PROBE_TIMEOUT
 

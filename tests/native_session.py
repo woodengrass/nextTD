@@ -21,7 +21,9 @@ def wait_for(predicate, *, timeout: float = 15):
 
 
 class NativeSession:
-    def __init__(self, root: Path, env: dict[str, str], binary: str, *, expected_tabs: int = 3) -> None:
+    def __init__(
+        self, root: Path, env: dict[str, str], binary: str, *, expected_tabs: int = 3, expected_panes: int | None = None
+    ) -> None:
         self.env = env
         self.binary = binary
         self.tmux_socket = env["TDNEXT_TEST_TMUX_SOCKET"]
@@ -35,7 +37,7 @@ class NativeSession:
         self.startup_diagnostics = "waiting for an attached native pane"
         try:
             # Zellij's session listing can unlink a socket between bind and listen.
-            self.name = wait_for(lambda: attached_session(self.tmux_name, expected_tabs * 4))
+            self.name = wait_for(lambda: attached_session(self.tmux_name, expected_panes or expected_tabs * 4))
             self.target_env = {**env, "ZELLIJ_SESSION_NAME": self.name}
             wait_for(lambda: self.ready(expected_tabs))
         except (AssertionError, OSError, ValueError, subprocess.SubprocessError) as exc:

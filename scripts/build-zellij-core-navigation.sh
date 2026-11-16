@@ -19,7 +19,7 @@
 #   4. Builds `cargo build --locked --release --no-default-features
 #      --bin zellij` inside the exported source.
 #   5. Checks `./zellij action --help` lists all required navigation commands.
-#   6. Atomically installs state/bin/zellij-core-navigation-v2 ONLY if that
+#   6. Atomically installs state/bin/zellij-core-navigation-v3 ONLY if that
 #      destination is absent (never overwrites).
 #
 # Environment:
@@ -39,7 +39,7 @@ set -euo pipefail
 PINNED_HEAD="efd8fd5a89a20c07a111d248ad7fce53848d2c18"
 PATCH_NAME="zellij-0.45.1-core-navigation.patch"
 LICENSE_NAME="LICENSE.zellij-0.45.1"
-DEST_NAME="zellij-core-navigation-v2"
+DEST_NAME="zellij-core-navigation-v3"
 
 usage() {
   echo "usage: $(basename "$0") <path-to-zellij-git-checkout>" >&2
@@ -126,7 +126,7 @@ if [ ! -x "${BUILT_BIN}" ]; then
 fi
 
 ACTION_HELP="$("${BUILT_BIN}" action --help)"
-for required in open-tab-with-return open-tab-with-return-from-header restore-focus-from-header return-to-origin; do
+for required in open-tab-with-return open-tab-with-return-from-header restore-focus-from-header return-to-origin set-pane-fixed-width; do
   if ! [[ "${ACTION_HELP}" =~ (^|[[:space:]])${required}([[:space:]]|$) ]]; then
     echo "error: built binary lacks '${required}' in 'action --help'." >&2
     exit 1

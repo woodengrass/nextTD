@@ -122,8 +122,13 @@ def test_native_shell_keeps_interactive_job_when_settings_opens(
     try:
         session.send_key("M-2")
         wait_for(lambda: session.active_tab() == session.tab_id("Shell"))
-        panes = json.loads(session.action("list-panes", "--all", "--json"))
-        shell = next(item for item in panes if "tdnext.pane view shell" in (item.get("pane_command") or ""))
+        def shell_pane():
+            panes = json.loads(session.action("list-panes", "--all", "--json"))
+            return next(
+                (item for item in panes if "tdnext.pane view shell" in (item.get("terminal_command") or "")), None
+            )
+
+        shell = wait_for(shell_pane)
         pane_id = f"terminal_{shell['id']}"
         session.send_key("printf 'NATIVE_%s\\n' WAIT; read -r answer; printf 'NATIVE_RESULT:%s\\n' \"$answer\"")
         session.send_key("Enter")
