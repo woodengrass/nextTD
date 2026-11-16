@@ -18,6 +18,9 @@ def dependency_order(manifests: Mapping[str, PluginManifest], plugin_id: str) ->
         if current in visiting:
             raise PluginError(f"Plugin dependency cycle: {' -> '.join((*visiting, current))}")
         if current not in manifests:
+            errors = getattr(manifests, "errors", {})
+            if current in errors:
+                raise PluginError(errors[current])
             raise PluginError(f"Required plugin not found: {current}")
         visiting.append(current)
         for dependency in manifests[current].requires_plugins:
@@ -33,11 +36,14 @@ def dependency_order(manifests: Mapping[str, PluginManifest], plugin_id: str) ->
 def dependants(manifests: Mapping[str, PluginManifest], target: str, enabled: frozenset[str]) -> frozenset[str]:
     """Find all enabled plugins that transitively depend on target."""
     affected = {target}
+    enabled_hosts = {name for name in enabled if name in manifests and manifests[name].role == "desktop.host"}
     while True:
         expanded = affected | {
             name for name in enabled
             if name in manifests and affected.intersection(manifests[name].requires_plugins)
         }
+        if expanded & enabled_hosts or (target in enabled and target not in manifests and not enabled_hosts):
+            expanded.update(name for name in enabled if name in manifests and manifests[name].role == "desktop.view")
         if expanded == affected:
             return frozenset(expanded & enabled)
         affected = expanded

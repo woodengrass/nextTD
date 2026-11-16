@@ -1,4 +1,7 @@
 id = "shell"
+manifest_version = 1
+api_version = 1
+view_interfaces = ["tdnext.textual-view.v1"]
 name = "Shell"
 version = "0.1.0"
 description = "Run an interactive shell inside the desktop"
@@ -6,5 +9,5 @@ entrypoint = "tdnext.plugins.shell.plugin:ShellPlugin"
 icon = ">_"
 icon_key = "shell"
 capabilities = ["desktop.view", "shell.interactive"]
-requires_plugins = ["desktop"]
+requires_plugins = []
 requires_executables = []

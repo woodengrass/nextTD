@@ -1,3 +1,5 @@
+from collections.abc import Sequence
+
 from textual.app import ComposeResult
 from textual.containers import Horizontal
 from textual.message import Message
@@ -19,7 +21,7 @@ class HeaderBar(Horizontal):
             super().__init__()
             self.plugin_id = plugin_id
 
-    def __init__(self, views: list[tuple[PluginManifest, ViewPlugin]]) -> None:
+    def __init__(self, views: Sequence[tuple[PluginManifest, ViewPlugin]]) -> None:
         super().__init__()
         self.views = views
 

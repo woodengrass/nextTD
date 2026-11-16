@@ -11,6 +11,7 @@ from .core.errors import PluginError
 from .core.local_env import bootstrap as _bootstrap_local_path
 from .core.session import SESSION_ENV, current_session
 from .launcher import enabled_views
+from .plugins.desktop.contract import textual_views
 from .runtime import manager
 
 cli = typer.Typer(pretty_exceptions_enable=False)
@@ -26,7 +27,7 @@ def view(active: Annotated[str, typer.Argument()], snapshot: str | None = None) 
     plugins = manager()
     session = current_session(snapshot)
     context = PluginContext(Path(os.environ["TDNEXT_DIRECTORY"]), plugins, session)
-    views = enabled_views(plugins, session)
+    views = textual_views(enabled_views(plugins, session))
     # A user shell or external program must not inherit the desktop's session snapshot.
     os.environ.pop(SESSION_ENV, None)
     for manifest, plugin in views:

@@ -23,6 +23,7 @@ class SessionSnapshot(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     views: tuple[SessionView, ...]
+    protected_plugins: frozenset[str] | None = None
 
     def icon_for(self, plugin_id: str) -> str | None:
         return next((view.icon for view in self.views if view.manifest.id == plugin_id), None)

@@ -47,14 +47,19 @@ def test_all_bundled_manifests_declare_meaningful_capabilities(tmp_path: Path) -
 def test_duplicate_discovered_ids_are_rejected(tmp_path: Path) -> None:
     contents = (
         'id = "same"\nname = "Same"\nversion = "1"\ndescription = "Same"\n'
+        "manifest_version = 1\napi_version = 1\n"
+        'view_interfaces = ["tdnext.textual-view.v1"]\n'
         'entrypoint = "tdnext.plugins.files.plugin:FilesPlugin"\n'
+        'capabilities = ["desktop.view", "files.browse"]\n'
     )
     for name in ("first", "second"):
         directory = tmp_path / name
         directory.mkdir()
         (directory / "plugin.toml").write_text(contents, encoding="utf-8")
-    with pytest.raises(PluginError, match="Duplicate plugin id"):
-        discover((tmp_path,))
+    manifests = discover((tmp_path,))
+    assert "same" not in manifests
+    assert "same" in manifests.errors
+    assert "Duplicate plugin id" in manifests.errors["same"]
 
 
 def test_icon_service_is_not_a_view_and_disable_does_not_cascade(tmp_path: Path) -> None:

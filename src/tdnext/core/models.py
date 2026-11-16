@@ -25,6 +25,22 @@ class PluginManifest(BaseModel):
     capabilities: tuple[str, ...] | None = None
     requires_plugins: tuple[str, ...] = ()
     requires_executables: tuple[str, ...] = ()
+    # 舊快照保留預設值；磁碟格式另行檢查。See ../plugin-compatibility-and-consent.adr.md
+    manifest_version: Literal[1] = 1
+    api_version: Literal[1] = 1
+    host_interfaces: tuple[str, ...] = ()
+    view_interfaces: tuple[str, ...] = ()
+    dependency_hook: str | None = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$")
+
+    @field_validator("host_interfaces", "view_interfaces")
+    @classmethod
+    def interfaces_are_unique_names(cls, interfaces: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(interfaces)) != len(interfaces) or any(
+            not re.fullmatch(r"[a-z][a-z0-9_-]*(?:\.[a-z0-9][a-z0-9_-]*)+", interface)
+            for interface in interfaces
+        ):
+            raise ValueError("interfaces must be unique dotted names")
+        return interfaces
 
     @field_validator("icon")
     @classmethod

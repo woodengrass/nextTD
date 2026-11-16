@@ -1,5 +1,6 @@
 """Contract between the desktop host and a trusted view plugin."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
@@ -12,6 +13,15 @@ from .core.models import PluginManifest
 from .core.session import SessionSnapshot
 
 IconMode = Literal["compatibility", "codicons"]
+PLUGIN_API_VERSION = 1
+
+
+class DependencyHook(Protocol):
+    @staticmethod
+    def check(manager: PluginManager) -> str | None: ...
+
+    @staticmethod
+    def install(manager: PluginManager) -> Path: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,4 +62,4 @@ class ActivatableView(Protocol):
 class DesktopHost(Protocol):
     """Own the desktop shell, including its choice of native or fullscreen presentation."""
 
-    def run(self, context: PluginContext, views: list[tuple[PluginManifest, ViewPlugin]]) -> None: ...
+    def run(self, context: PluginContext, views: Sequence[tuple[PluginManifest, object]]) -> None: ...

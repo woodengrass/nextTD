@@ -1,4 +1,8 @@
 id = "monitor"
+manifest_version = 1
+api_version = 1
+view_interfaces = ["tdnext.textual-view.v1"]
+dependency_hook = "tdnext.plugins.monitor.dependencies:MonitorDependencies"
 name = "Monitor"
 version = "0.1.0"
 description = "Launch the real btop system monitor"
@@ -6,5 +10,5 @@ entrypoint = "tdnext.plugins.monitor.plugin:MonitorPlugin"
 icon = "▥"
 icon_key = "monitor"
 capabilities = ["desktop.view", "system.monitor"]
-requires_plugins = ["desktop"]
+requires_plugins = []
 requires_executables = ["btop"]

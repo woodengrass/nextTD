@@ -1,4 +1,6 @@
 id = "icons"
+manifest_version = 1
+api_version = 1
 name = "Codicons"
 version = "0.1.0"
 description = "Optional compatibility text and Nerd Font Codicons service"

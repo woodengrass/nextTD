@@ -1,9 +1,10 @@
 """Resolve optional icon services into an immutable desktop-session snapshot."""
 
-from tdnext.api import IconProvider, ViewPlugin
+from collections.abc import Sequence
+
+from tdnext.api import IconProvider
 
 from .appearance import AppearanceStore
-from .discovery import instantiate
 from .errors import PluginError
 from .graph import dependency_order
 from .icons import safe_icon
@@ -13,7 +14,7 @@ from .session import SessionSnapshot, SessionView
 
 
 def snapshot_views(
-    manager: PluginManager, views: list[tuple[PluginManifest, ViewPlugin]]
+    manager: PluginManager, views: Sequence[tuple[PluginManifest, object]], instances: dict[str, object] | None = None
 ) -> SessionSnapshot:
     appearance = AppearanceStore(manager.store.path.with_name("appearance.json")).read()
     state = manager.store.read()
@@ -26,8 +27,7 @@ def snapshot_views(
                 order = dependency_order(manager.manifests, provider_id)
                 if not set(order) <= state.enabled:
                     raise PluginError(f"Enabled plugin {provider_id} has a disabled dependency")
-                manager.check_dependencies(order)
-                candidate = instantiate(manifest)
+                candidate = manager.check_dependencies(order, existing=instances)[provider_id]
                 if isinstance(candidate, IconProvider) and callable(candidate.resolve):
                     provider = candidate
             except PluginError:

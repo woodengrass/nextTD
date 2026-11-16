@@ -10,17 +10,50 @@ from .errors import PluginError
 from .models import PluginManifest
 
 
-def discover(roots: tuple[Path, ...]) -> dict[str, PluginManifest]:
-    manifests: dict[str, PluginManifest] = {}
+class DiscoveredPlugins(dict[str, PluginManifest]):
+    def __init__(self) -> None:
+        super().__init__()
+        self.errors: dict[str, str] = {}
+
+
+def discover(roots: tuple[Path, ...]) -> DiscoveredPlugins:
+    manifests = DiscoveredPlugins()
+    paths: dict[str, list[Path]] = {}
     for root in roots:
         for path in sorted(root.glob("*/plugin.toml")):
+            identity: str | None = None
             try:
-                manifest = PluginManifest.model_validate(loads(path.read_text(encoding="utf-8")))
-            except (OSError, UnicodeError, TOMLDecodeError, ValidationError) as exc:
-                raise PluginError(f"Invalid plugin manifest {path}: {exc}") from exc
-            if manifest.id in manifests:
-                raise PluginError(f"Duplicate plugin id: {manifest.id} ({path})")
+                data = loads(path.read_text(encoding="utf-8"))
+                raw_identity = data.get("id")
+                if isinstance(raw_identity, str):
+                    identity = raw_identity
+                    paths.setdefault(identity, []).append(path)
+                if not {"manifest_version", "api_version", "capabilities"} <= data.keys():
+                    raise ValueError("manifest_version, api_version and capabilities are required")
+                if type(data["manifest_version"]) is not int or type(data["api_version"]) is not int:
+                    raise ValueError("manifest_version and api_version must be integers")
+                manifest = PluginManifest.model_validate(data)
+                if manifest.role == "desktop.host" and not manifest.host_interfaces:
+                    raise ValueError("host_interfaces must declare supported interfaces")
+                if manifest.role == "desktop.view" and not manifest.view_interfaces:
+                    raise ValueError("view_interfaces must declare required interfaces")
+                if manifest.role != "desktop.host" and manifest.host_interfaces:
+                    raise ValueError("only hosts may declare host_interfaces")
+                if manifest.role != "desktop.view" and manifest.view_interfaces:
+                    raise ValueError("only views may declare view_interfaces")
+            except (OSError, UnicodeError, TOMLDecodeError, ValidationError, ValueError) as exc:
+                key = identity if identity is not None else str(path)
+                manifests.errors[key] = f"Invalid plugin manifest {path}: {exc}"
+                continue
             manifests[manifest.id] = manifest
+    for identity, conflicts in paths.items():
+        if len(conflicts) > 1:
+            manifests.pop(identity, None)
+            manifests.errors[identity] = (
+                f"Duplicate plugin id {identity}: {', '.join(map(str, conflicts))}; remove the conflict"
+            )
+        elif identity in manifests.errors:
+            manifests.pop(identity, None)
     return manifests
 
 

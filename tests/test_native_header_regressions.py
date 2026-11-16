@@ -146,8 +146,9 @@ def test_native_numeric_shortcuts_follow_three_sidebar_views(
     plugin.mkdir(parents=True)
     (plugin / "plugin.toml").write_text(
         'id = "third"\nname = "Third"\nversion = "0.1.0"\ndescription = "Third view"\n'
+        'manifest_version = 1\napi_version = 1\nview_interfaces = ["tdnext.textual-view.v1"]\n'
         'entrypoint = "tdnext.plugins.files.plugin:FilesPlugin"\nrequires_plugins = ["desktop"]\n'
-        'requires_executables = []\n',
+        'capabilities = ["desktop.view", "files.browse"]\nrequires_executables = []\n',
         encoding="utf-8",
     )
     ids = frozenset({"desktop", "files", "monitor", "settings", "third"})

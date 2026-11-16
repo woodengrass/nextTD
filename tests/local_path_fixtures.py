@@ -74,6 +74,9 @@ def probe_view(tmp_path: Path, state: Path) -> None:
     (plugin_dir / "plugin.toml").write_text(
         "id = \"probeview\"\nname = \"Probe\"\nversion = \"0.1.0\"\n"
         "description = \"probe\"\nentrypoint = \"probeview_mod:Probe\"\n"
+        "manifest_version = 1\napi_version = 1\n"
+        "view_interfaces = [\"tdnext.textual-view.v1\"]\n"
+        "capabilities = [\"desktop.view\", \"files.browse\"]\n"
         "requires_executables = [\"btop\"]\n",
         encoding="utf-8",
     )
@@ -103,6 +106,7 @@ def probe_provider(tmp_path: Path, state: Path) -> None:
     (plugin_dir / "plugin.toml").write_text(
         "id = \"probeicons\"\nname = \"ProbeIcons\"\nversion = \"0.1.0\"\n"
         "description = \"probe\"\nentrypoint = \"probeicons_mod:Probe\"\n"
+        "manifest_version = 1\napi_version = 1\n"
         "capabilities = [\"icons.provider\"]\nrequires_executables = [\"btop\"]\n",
         encoding="utf-8",
     )
@@ -118,5 +122,7 @@ def probe_token() -> str:
     manifest = PluginManifest(
         id="probeview", name="Probe", version="0.1.0", description="probe",
         entrypoint="probeview_mod:Probe", requires_executables=("btop",),
+        capabilities=("desktop.view", "files.browse"),
+        view_interfaces=("tdnext.textual-view.v1",),
     )
     return session_token(SessionSnapshot(views=(SessionView(manifest=manifest, icon="[]"),)))

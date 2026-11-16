@@ -60,7 +60,9 @@ def test_configured_desktop_controls_launch_at_any_terminal_size(
 def default_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PluginContext:
     state = tmp_path / "state"
     manifests = discover((Path(__file__).parents[1] / "src" / "tdnext" / "plugins",))
-    manifests["monitor"] = manifests["monitor"].model_copy(update={"requires_executables": ()})
+    manifests["monitor"] = manifests["monitor"].model_copy(
+        update={"requires_executables": (), "dependency_hook": None}
+    )
     store = StateStore(state / "plugins.json")
     ids = frozenset({"desktop", "files", "monitor"})
     store.write(PluginState(installed=ids, enabled=ids))
