@@ -149,7 +149,7 @@ commit, from the project root with Rust 1.95 and native prerequisites on PATH:
 
 ```sh
 ZELLIJ_SRC=/path/to/zellij-checkout
-WORK=$(mktemp -d /tmp/opencode/zellij-core-v3-XXXXXXXX)
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/zellij-core-v3-XXXXXXXX")
 git -C "$ZELLIJ_SRC" archive efd8fd5a89a20c07a111d248ad7fce53848d2c18 | tar -x -C "$WORK"
 git -C "$WORK" apply "$PWD/patches/zellij-0.45.1-core-navigation.patch"
 CARGO_TARGET_DIR="$WORK/target-v3" cargo build --manifest-path "$WORK/Cargo.toml" --locked --release --no-default-features --bin zellij

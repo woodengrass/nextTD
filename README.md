@@ -8,11 +8,10 @@ global Zellij configuration, or existing terminal sessions.
 
 ## Run the prepared candidate
 
-The current checkout already has a local `.venv`, Zellij, btop, and enabled
-plugins. From a UTF-8 terminal:
+With a local `.venv`, Zellij, btop, and enabled plugins, run from the project
+root in a UTF-8 terminal:
 
 ```sh
-cd /home/jason-yang/work/terminal-desktop-next
 .venv/bin/tdnext run .
 ```
 

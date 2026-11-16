@@ -111,32 +111,18 @@ is issued and nothing is recorded),
 
 ## Build (offline, pinned)
 
-Toolchain and vendored crates only; no network, no installs:
+From the project root, with Rust 1.95, the `wasm32-wasip1` target, and the
+locked dependencies available locally:
 
 ```sh
-ROOT=/home/jason-yang/work/terminal-desktop-next/zellij-navigator-broker
-TOOL=/tmp/opencode/zellij-proto/rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin
-env HOME=/tmp/opencode/zj-wasm-proof-9s0NwT/home \
-  CARGO_HOME=/tmp/opencode/zj-wasm-proof-9s0NwT/cargo \
-  CARGO_TARGET_DIR="$ROOT/target" PATH="$TOOL:/usr/bin:/bin" \
-  RUSTFLAGS=--sysroot=/tmp/opencode/zj-wasm-proof-9s0NwT/sysroot \
-  cargo build --manifest-path "$ROOT/Cargo.toml" --offline --locked --target wasm32-wasip1
+cargo build --manifest-path zellij-navigator-broker/Cargo.toml --offline --locked --target wasm32-wasip1
 ```
 
-First build generates `Cargo.lock` (kept for reproducibility); subsequent
-builds use `--locked`. Host-side deterministic tests (host builds also need
-`OPENSSL_NO_PKG_CONFIG=1 OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu
-OPENSSL_INCLUDE_DIR=/usr/include` — the sandbox has OpenSSL headers but no
-`pkg-config` binary, and installs are out of scope):
+The tracked `Cargo.lock` pins the dependency versions. Host-side tests also
+require the native build prerequisites for the current machine:
 
 ```sh
-env HOME=/tmp/opencode/zj-wasm-proof-9s0NwT/home \
-  CARGO_HOME=/tmp/opencode/zj-wasm-proof-9s0NwT/cargo \
-  CARGO_TARGET_DIR="$ROOT/target" PATH="$TOOL:/usr/bin:/bin" \
-  RUSTFLAGS=--sysroot=/tmp/opencode/zj-wasm-proof-9s0NwT/sysroot \
-  OPENSSL_NO_PKG_CONFIG=1 OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu \
-  OPENSSL_INCLUDE_DIR=/usr/include \
-  cargo test --manifest-path "$ROOT/Cargo.toml" --offline
+cargo test --manifest-path zellij-navigator-broker/Cargo.toml --offline --locked
 ```
 
 `zellij-tile` is pinned to exactly `0.45.1`.
