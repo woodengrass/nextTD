@@ -32,7 +32,7 @@ class ShellView(Vertical):
         yield TerminalView(
             send=self.send,
             resize_transport=self.resize_pty,
-            reserved_keys=frozenset({"f6", "alt+o", "ctrl+q"}),
+            reserved_keys=frozenset({"f6", "f7", "alt+o", "ctrl+q"}),
             id="shell-terminal",
         )
         yield Static(id="shell-status", markup=False)

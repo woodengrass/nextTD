@@ -2,12 +2,14 @@
 
 import os
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 import typer
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Vertical
-from textual.events import MouseDown, MouseUp
+from textual.events import MouseDown, MouseUp, Resize
 from textual.widgets import Button, Label, ListItem, ListView, Static
 
 from tdnext.api import PluginContext, ViewPlugin
@@ -19,34 +21,44 @@ from tdnext.launcher import enabled_views
 from tdnext.runtime import manager
 
 from . import navigation
+from .app import DesktopApp
+from .contract import textual_views
 from .header import HeaderBar
-from .sidebar import sidebar_label
+from .sidebar import compact_icon, sidebar_label
 from .tool import ToolPane
 
 cli = typer.Typer(pretty_exceptions_enable=False)
 
 
+@cli.command()
+def empty() -> None:
+    os.environ.pop(SESSION_ENV, None)
+    DesktopApp(PluginContext(Path(os.environ["TDNEXT_DIRECTORY"]), manager()), []).run()
+
+
 class SidebarPane(App[None]):
+    BINDINGS = [Binding("f7", "toggle_sidebar", "Toggle sidebar")]
     CSS = """
     Screen { background: $surface; padding: 1 1; }
-    #rail-title { height: 2; text-style: bold; }
+    #rail-title { width: 100%; min-width: 0; height: 2; min-height: 1; border: none; padding: 0; text-style: bold; }
     #rail-label { height: 2; color: $text-muted; }
     ListView { height: 1fr; background: $surface; }
-    ListItem { height: 1; }
+    ListItem { height: 3; align-vertical: middle; }
     #rail-help { height: 3; color: $text-muted; }
     """
 
     def __init__(
-        self, views: list[tuple[PluginManifest, ViewPlugin]], active: str, session: SessionSnapshot | None = None
+        self, views: Sequence[tuple[PluginManifest, ViewPlugin]], active: str, session: SessionSnapshot | None = None
     ) -> None:
         super().__init__()
         self.views = views
         self.active = active
         self.session = session
+        self.mouse_down = False
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Static("WORKSPACE", id="rail-title")
+            yield Button("WORKSPACE  < F7", id="rail-title")
             yield Static("VIEWS", id="rail-label")
             yield ListView(
                 *(ListItem(Label(
@@ -59,6 +71,57 @@ class SidebarPane(App[None]):
     def on_mount(self) -> None:
         menu = self.query_one(ListView)
         menu.index = next((i for i, (item, _) in enumerate(self.views) if item.id == self.active), 0)
+        menu.focus()
+        for item, (manifest, _) in zip(menu.children, self.views, strict=True):
+            item.tooltip = manifest.name
+        self.update_sidebar(self.size.width > 10)
+
+    def on_resize(self, event: Resize) -> None:
+        if self.screen.is_mounted:
+            self.update_sidebar(event.size.width > 10)
+
+    def update_sidebar(self, expanded: bool) -> None:
+        self.query_one("#rail-label").styles.visibility = "visible" if expanded else "hidden"
+        self.query_one("#rail-help").styles.visibility = "visible" if expanded else "hidden"
+        toggle = self.query_one("#rail-title", Button)
+        toggle.label = "WORKSPACE  < F7" if expanded else "> F7"
+        toggle.tooltip = "Collapse sidebar (F7)" if expanded else "Expand sidebar (F7)"
+        menu = self.query_one(ListView)
+        for index, (item, (manifest, _)) in enumerate(zip(menu.children, self.views, strict=True)):
+            icon = sidebar_label(manifest, self.session) if expanded else compact_icon(manifest, self.session, index)
+            item.query_one(Label).update(f"{'>' if manifest.id == self.active else ' '} {icon}")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "rail-title":
+            self.action_toggle_sidebar()
+
+    def action_toggle_sidebar(self) -> None:
+        width = 10 if self.size.width > 10 else 22
+        try:
+            pane_id = os.environ["ZELLIJ_PANE_ID"]
+            # Fixed-width toggle only: the core moves the boundary next to
+            # the sidebar and never relocates panes. override-layout would
+            # re-apply the stale startup layout and stock resize ignores
+            # fixed panes, so neither is used here.
+            navigation.action(
+                "set-pane-fixed-width",
+                "--pane-id",
+                f"terminal_{pane_id}",
+                "--width",
+                str(width),
+            )
+        except (KeyError, PluginError) as exc:
+            self.notify(f"Cannot resize sidebar (layout unchanged): {exc}", severity="error")
+
+    def on_mouse_down(self, event: MouseDown) -> None:
+        self.mouse_down = event.button == 1
+
+    def on_mouse_up(self, event: MouseUp) -> None:
+        if event.button == 1 and not self.mouse_down:
+            widget, _region = self.screen.get_widget_at(event.screen_x, event.screen_y)
+            if isinstance(widget, Button) and widget.id == "rail-title":
+                widget.press()
+        self.mouse_down = False
 
     def on_list_view_selected(self, _event: ListView.Selected) -> None:
         index = self.query_one(ListView).index
@@ -82,7 +145,7 @@ class FooterPane(App[None]):
     """
 
     def __init__(
-        self, active: tuple[PluginManifest, ViewPlugin], views: list[tuple[PluginManifest, ViewPlugin]]
+        self, active: tuple[PluginManifest, ViewPlugin], views: Sequence[tuple[PluginManifest, ViewPlugin]]
     ) -> None:
         super().__init__()
         self.manifest, plugin = active
@@ -103,7 +166,7 @@ class FooterPane(App[None]):
 
 
 class HeaderPane(App[None]):
-    def __init__(self, views: list[tuple[PluginManifest, ViewPlugin]]) -> None:
+    def __init__(self, views: Sequence[tuple[PluginManifest, ViewPlugin]]) -> None:
         super().__init__()
         self.views = views
         self.mouse_down = False
@@ -140,21 +203,22 @@ class HeaderPane(App[None]):
 @cli.command()
 def sidebar(active: str, snapshot: str | None = None) -> None:
     session = current_session(snapshot)
-    views = [view for view in enabled_views(manager(), session) if view[0].placement == "sidebar"]
+    views = [view for view in textual_views(enabled_views(manager(), session)) if view[0].placement == "sidebar"]
     os.environ.pop(SESSION_ENV, None)
     SidebarPane(views, active, session).run()
 
 
 @cli.command()
 def header(active: str, snapshot: str | None = None) -> None:
-    views = [view for view in enabled_views(manager(), current_session(snapshot)) if view[0].placement == "header"]
+    views = [view for view in textual_views(enabled_views(manager(), current_session(snapshot)))
+             if view[0].placement == "header"]
     os.environ.pop(SESSION_ENV, None)
     HeaderPane(views).run()
 
 
 @cli.command("open-header")
 def open_header_shortcut(snapshot: str | None = None) -> None:
-    views = enabled_views(manager(), current_session(snapshot))
+    views = textual_views(enabled_views(manager(), current_session(snapshot)))
     os.environ.pop(SESSION_ENV, None)
     for manifest, _ in views:
         if manifest.placement == "header":
@@ -166,7 +230,7 @@ def open_header_shortcut(snapshot: str | None = None) -> None:
 def tool(active: str, snapshot: str | None = None) -> None:
     plugins = manager()
     session = current_session(snapshot)
-    views = enabled_views(plugins, session)
+    views = textual_views(enabled_views(plugins, session))
     os.environ.pop(SESSION_ENV, None)
     for manifest, plugin in views:
         if manifest.id == active and manifest.placement == "header":
@@ -178,7 +242,7 @@ def tool(active: str, snapshot: str | None = None) -> None:
 
 @cli.command()
 def footer(active: str, snapshot: str | None = None) -> None:
-    views = enabled_views(manager(), current_session(snapshot))
+    views = textual_views(enabled_views(manager(), current_session(snapshot)))
     os.environ.pop(SESSION_ENV, None)
     for manifest, plugin in views:
         if manifest.id == active:

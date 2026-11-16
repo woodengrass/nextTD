@@ -69,6 +69,10 @@ async def test_real_shell_accepts_interactive_input_and_survives_settings(
         assert app.focused is terminal
         assert view.session is session and session.process.poll() is None
         assert "USER_RESULT:ok" in screen_text(terminal)
+        width = terminal.size.width
+        await pilot.press("f7")
+        assert terminal.size.width > width
+        assert app.focused is terminal and view.session is session and session.process.poll() is None
         await pilot.press("f6")
         assert app.focused is app.query_one("#destinations", ListView)
         footer = app.query_one("#shortcuts", Static).render()

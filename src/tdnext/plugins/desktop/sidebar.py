@@ -9,3 +9,8 @@ from tdnext.core.session import SessionSnapshot
 def sidebar_label(manifest: PluginManifest, session: SessionSnapshot | None = None) -> str:
     icon = (session.icon_for(manifest.id) if session is not None else None) or manifest.icon or "[]"
     return f"{icon}{' ' * max(0, 4 - cell_len(icon))} {manifest.name}"
+
+
+def compact_icon(manifest: PluginManifest, session: SessionSnapshot | None, index: int) -> str:
+    icon = (session.icon_for(manifest.id) if session is not None else None) or manifest.icon or "[]"
+    return f"[{index + 1}]" if icon == "[]" else icon

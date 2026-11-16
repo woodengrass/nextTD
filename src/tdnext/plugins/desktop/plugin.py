@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import NamedTuple
@@ -16,11 +17,12 @@ from tdnext.core.session import SESSION_ENV, SessionSnapshot, session_token
 from tdnext.runtime import state_dir
 
 from .app import DesktopApp
+from .contract import textual_views
 from .navigation import BROKER_ENABLE_ENV, BROKER_HEADER_ENV, CORE_ENABLE_ENV, CORE_VERSION_ENV, tab_name
 
 BROKER_WASM_NAME = "navigator-broker.wasm"
 
-CORE_BINARY_NAME = "zellij-core-navigation-v2"
+CORE_BINARY_NAME = "zellij-core-navigation-v3"
 CORE_REQUIRED_COMMANDS = (
     "open-tab-with-return", "open-tab-with-return-from-header", "restore-focus-from-header", "return-to-origin"
 )
@@ -375,17 +377,24 @@ def broker_host_compatible(zellij: str) -> bool:
     return result.returncode == 0 and result.stdout.strip() == "zellij 0.45.1"
 
 
-def primary_header_id(views: list[tuple[PluginManifest, ViewPlugin]]) -> str | None:
+def primary_header_id(views: Sequence[tuple[PluginManifest, ViewPlugin]]) -> str | None:
     """Return the first header-placed plugin id, or None when absent."""
     return next((manifest.id for manifest, _ in views if manifest.placement == "header"), None)
 
 
 def layout_string(
-    views: list[tuple[PluginManifest, ViewPlugin]],
+    views: Sequence[tuple[PluginManifest, ViewPlugin]],
     session: SessionSnapshot | None = None,
     broker: BrokerSnapshot | None = None,
 ) -> str:
     python = json.dumps(sys.executable)
+    if not views:
+        return (
+            f'layout {{\n    tab name="Desktop" focus=true {{\n'
+            f"        pane command={python} {{\n"
+            '            args "-m" "tdnext.plugins.desktop.panes" "empty"\n'
+            "        }\n    }\n}"
+        )
     snapshot = f' "--snapshot" {json.dumps(session_token(session))}' if session is not None else ""
     header_id = primary_header_id(views)
     if broker is None:
@@ -401,9 +410,7 @@ def layout_string(
         focused = " focus=true" if index == 0 else ""
         module = "tdnext.plugins.desktop.panes" if manifest.placement == "header" else "tdnext.pane"
         command = "tool" if manifest.placement == "header" else "view"
-        is_primary_broker_tab = (
-            broker_wasm is not None and manifest.placement == "header" and manifest.id == header_id
-        )
+        is_primary_broker_tab = broker_wasm is not None and manifest.placement == "header" and manifest.id == header_id
         broker_pane = ""
         if is_primary_broker_tab:
             assert broker_wasm is not None and header_id is not None
@@ -411,12 +418,12 @@ def layout_string(
             active = "true" if broker.active else "false"
             pane_size = 1 if broker.active else 12
             broker_pane = (
-                f'        pane size={pane_size} borderless=true {{\n'
-                f'            plugin location={wasm_location} {{\n'
-                f'                header_id {json.dumps(tab_name(header_id))}\n'
-                f'                active {json.dumps(active)}\n'
-                '            }\n'
-                '        }\n'
+                f"        pane size={pane_size} borderless=true {{\n"
+                f"            plugin location={wasm_location} {{\n"
+                f"                header_id {json.dumps(tab_name(header_id))}\n"
+                f"                active {json.dumps(active)}\n"
+                "            }\n"
+                "        }\n"
             )
         tabs.append(f'''tab name={name}{focused} {{
     pane split_direction="horizontal" {{
@@ -442,7 +449,8 @@ def layout_string(
 
 
 class DesktopPlugin:
-    def run(self, context: PluginContext, views: list[tuple[PluginManifest, ViewPlugin]]) -> None:
+    def run(self, context: PluginContext, views: Sequence[tuple[PluginManifest, object]]) -> None:
+        textual = textual_views(views)
         stock = context.manager.executable("zellij")
         core_binary = core_capable_binary()
         if core_binary is not None:
@@ -468,7 +476,7 @@ class DesktopPlugin:
                 env.pop(BROKER_HEADER_ENV, None)
                 env.pop(CORE_ENABLE_ENV, None)
                 env.pop(CORE_VERSION_ENV, None)
-                header_id = primary_header_id(views)
+                header_id = primary_header_id(textual)
                 if core_active:
                     env[CORE_ENABLE_ENV] = "1"
                     env[CORE_VERSION_ENV] = "2"
@@ -480,9 +488,10 @@ class DesktopPlugin:
                     if startup_broker.active and header_id is not None:
                         env[BROKER_ENABLE_ENV] = "1"
                         env[BROKER_HEADER_ENV] = header_id
-                sidebar_count = sum(manifest.placement == "sidebar" for manifest, _plugin in views)
+                sidebar_count = sum(manifest.placement == "sidebar" for manifest, _plugin in textual)
                 bindings = "\n".join(
-                    f'        bind "Alt {index}" {{ GoToTab {index}; }}' if index <= sidebar_count
+                    f'        bind "Alt {index}" {{ GoToTab {index}; }}'
+                    if index <= sidebar_count
                     else f'        unbind "Alt {index}"'
                     for index in range(1, 10)
                 )
@@ -491,8 +500,8 @@ class DesktopPlugin:
                 elif core_active:
                     header_binding = (
                         '        bind "Alt o" {\n'
-                        f'            OpenTabWithReturn {json.dumps(tab_name(header_id))};\n'
-                        '        }'
+                        f"            OpenTabWithReturn {json.dumps(tab_name(header_id))};\n"
+                        "        }"
                     )
                 else:
                     # The Python Run binding is the initial Alt+o owner: it works
@@ -504,21 +513,34 @@ class DesktopPlugin:
                     header_binding = (
                         '        bind "Alt o" {\n'
                         f'            Run {json.dumps(sys.executable)} "-m" "tdnext.plugins.desktop.shortcut" '
-                        f'{json.dumps(header_id)} {{\n'
-                        '                floating true\n'
-                        '                close_on_exit true\n'
-                        '            }\n'
-                        '        }'
+                        f"{json.dumps(header_id)} {{\n"
+                        "                floating true\n"
+                        "                close_on_exit true\n"
+                        "            }\n"
+                        "        }"
                     )
                 template = Path(__file__).with_name("zellij.kdl").read_text(encoding="utf-8")
                 with TemporaryDirectory(prefix="tdnext-zellij-") as directory:
                     config = Path(directory) / "zellij.kdl"
                     config.write_text(
-                        template.replace("        // TDNEXT_SIDEBAR_BINDINGS", bindings)
-                        .replace("        // TDNEXT_HEADER_BINDING", header_binding), encoding="utf-8"
+                        template.replace("        // TDNEXT_SIDEBAR_BINDINGS", bindings).replace(
+                            "        // TDNEXT_HEADER_BINDING", header_binding
+                        ),
+                        encoding="utf-8",
                     )
-                    command = [zellij, "--config", str(config), "--data-dir", str(data),
-                               "--layout-string", layout_string(views, context.session, startup_broker)]
+                    layout = layout_string(textual, context.session, startup_broker)
+                    if textual:
+                        tabs = layout.removeprefix("layout {\n").removesuffix("\n}").split("\ntab name=")
+                        ordered = [view for view in textual if view[0].placement == "sidebar"] + [
+                            view for view in textual if view[0].placement == "header"
+                        ]
+                        env["TDNEXT_TAB_LAYOUTS"] = json.dumps(
+                            {
+                                manifest.id: "layout {\n" + (tab if index == 0 else "tab name=" + tab) + "\n}"
+                                for index, ((manifest, _), tab) in enumerate(zip(ordered, tabs, strict=True))
+                            }
+                        )
+                    command = [zellij, "--config", str(config), "--data-dir", str(data), "--layout-string", layout]
                     result = subprocess.run(command, env=env, check=False)
             except OSError as exc:
                 print(f"Could not launch Zellij: {exc}. Using fullscreen fallback.", file=sys.stderr)
@@ -526,4 +548,4 @@ class DesktopPlugin:
                 if result.returncode == 0:
                     return
                 print(f"Zellij exited with status {result.returncode}. Using fullscreen fallback.", file=sys.stderr)
-        DesktopApp(context, views).run()
+        DesktopApp(context, textual).run()
