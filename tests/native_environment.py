@@ -31,7 +31,7 @@ def native_env(tmp_path: Path) -> Iterator[tuple[dict[str, str], str]]:
     StateStore(state / "plugins.json").write(PluginState(installed=ids, enabled=ids))
     excluded = {"ZELLIJ", "ZELLIJ_SESSION_NAME", "ZELLIJ_PANE_ID"}
     env = {key: value for key, value in os.environ.items() if key not in excluded}
-    with TemporaryDirectory(prefix="tdn-", dir="/tmp/opencode") as socket:
+    with TemporaryDirectory(prefix="tdn-") as socket:
         env.update({
             "TERM": "xterm-256color", "TDNEXT_STATE_DIR": str(state), "ZELLIJ_SOCKET_DIR": socket,
             "TDNEXT_TEST_TMUX_SOCKET": str(Path(socket) / "tmux.sock"),
