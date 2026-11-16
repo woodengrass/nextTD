@@ -3,11 +3,12 @@
 # project-local executable without touching live sessions.
 #
 # Usage:
-#   scripts/build-zellij-core-navigation.sh <path-to-zellij-git-checkout>
+#   scripts/build-zellij-core-navigation.sh <path-to-zellij-git-checkout> [destination]
 #
 # Inputs:
 #   $1  Existing local Zellij git checkout (pristine or dirty working tree
 #       is accepted; only its committed HEAD is used).
+#   $2  Optional destination; defaults to state/bin/zellij-core-navigation-v3.
 #
 # What it does:
 #   1. Verifies the checkout HEAD is exactly
@@ -19,8 +20,8 @@
 #   4. Builds `cargo build --locked --release --no-default-features
 #      --bin zellij` inside the exported source.
 #   5. Checks `./zellij action --help` lists all required navigation commands.
-#   6. Atomically installs state/bin/zellij-core-navigation-v3 ONLY if that
-#      destination is absent (never overwrites).
+#   6. Atomically installs the requested destination ONLY if absent (never
+#      overwrites).
 #
 # Environment:
 #   PATH and CARGO_HOME are used as inherited from the caller's
@@ -32,8 +33,7 @@
 #   The script does not use sudo, change Git configuration, commit, or operate
 #   on any session.
 #
-# The patch is experimental until verified, and this script never runs
-# automatically: invoke it explicitly when you want a local rebuild.
+# Release wheel builds invoke this script with a private destination.
 set -euo pipefail
 
 PINNED_HEAD="efd8fd5a89a20c07a111d248ad7fce53848d2c18"
@@ -42,7 +42,7 @@ LICENSE_NAME="LICENSE.zellij-0.45.1"
 DEST_NAME="zellij-core-navigation-v3"
 
 usage() {
-  echo "usage: $(basename "$0") <path-to-zellij-git-checkout>" >&2
+  echo "usage: $(basename "$0") <path-to-zellij-git-checkout> [destination]" >&2
   echo "Rebuilds the pinned Zellij core patch to state/bin/${DEST_NAME} (no overwrite)." >&2
 }
 
@@ -50,9 +50,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PATCH_FILE="${PROJECT_ROOT}/patches/${PATCH_NAME}"
 LICENSE_FILE="${PROJECT_ROOT}/patches/${LICENSE_NAME}"
-DEST_FILE="${PROJECT_ROOT}/state/bin/${DEST_NAME}"
+DEST_FILE="${2:-${PROJECT_ROOT}/state/bin/${DEST_NAME}}"
 
-if [ "$#" -ne 1 ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
   usage
   exit 2
 fi

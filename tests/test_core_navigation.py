@@ -3,7 +3,7 @@
 Contract (plugin.py and navigation.py only; Rust and patches untouched):
 
 - New sessions select ``state/bin/zellij-core-navigation-v3`` only when it is
-  executable and ``<binary> action --help`` lists all four required native
+  executable and ``<binary> action --help`` lists all five required native
   navigation commands. Anything else keeps the existing fallback behavior.
 - A capable session sets ``TDNEXT_CORE_NAVIGATION=1``,
   ``TDNEXT_CORE_NAVIGATION_VERSION=2`` and ``TDNEXT_ZELLIJ``
@@ -43,6 +43,7 @@ CORE_COMMANDS = (
     "open-tab-with-return-from-header",
     "restore-focus-from-header",
     "return-to-origin",
+    "set-pane-fixed-width",
 )
 FULL_HELP = "\n".join((*CORE_COMMANDS, "list-tabs", ""))
 

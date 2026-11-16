@@ -24,7 +24,8 @@ BROKER_WASM_NAME = "navigator-broker.wasm"
 
 CORE_BINARY_NAME = "zellij-core-navigation-v3"
 CORE_REQUIRED_COMMANDS = (
-    "open-tab-with-return", "open-tab-with-return-from-header", "restore-focus-from-header", "return-to-origin"
+    "open-tab-with-return", "open-tab-with-return-from-header", "restore-focus-from-header", "return-to-origin",
+    "set-pane-fixed-width",
 )
 CORE_PROBE_TIMEOUT = 5
 
@@ -345,24 +346,21 @@ def core_capable_binary() -> Path | None:
     failure, nonzero exit, partial listing) keeps the existing stock or
     experimental broker route.
     """
-    candidate = core_candidate_path()
-    try:
-        if not (candidate.is_file() and os.access(candidate, os.X_OK)):
-            return None
-    except OSError:
-        return None
-    try:
-        result = subprocess.run(
-            [str(candidate), "action", "--help"],
-            capture_output=True, text=True, check=False, timeout=CORE_PROBE_TIMEOUT,
-        )
-    except (OSError, subprocess.TimeoutExpired, UnicodeError):
-        return None
-    if result.returncode != 0:
-        return None
-    output = f"{result.stdout or ''}\n{result.stderr or ''}"
-    if set(CORE_REQUIRED_COMMANDS).issubset(output.split()):
-        return candidate
+    packaged = Path(__file__).resolve().parents[2] / "_native" / CORE_BINARY_NAME
+    for candidate in (core_candidate_path(), packaged):
+        try:
+            if not (candidate.is_file() and os.access(candidate, os.X_OK)):
+                continue
+            result = subprocess.run(
+                [str(candidate), "action", "--help"],
+                capture_output=True, text=True, check=False, timeout=CORE_PROBE_TIMEOUT,
+            )
+        except (OSError, subprocess.TimeoutExpired, UnicodeError):
+            continue
+        if result.returncode == 0:
+            output = f"{result.stdout or ''}\n{result.stderr or ''}"
+            if set(CORE_REQUIRED_COMMANDS).issubset(output.split()):
+                return candidate
     return None
 
 
