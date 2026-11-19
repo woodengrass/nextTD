@@ -1,0 +1,605 @@
+diff --git a/src/main.rs b/src/main.rs
+index 15ed027..3c4cdee 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -15,6 +15,10 @@ use zellij_utils::{
+ };
+ 
+ fn main() {
++    if std::env::args_os().skip(1).eq(["--tdnext-chrome-version"].into_iter().map(std::ffi::OsString::from)) {
++        println!("1");
++        return;
++    }
+     configure_logger();
+     create_config_and_cache_folders();
+     let opts = CliArgs::parse();
+diff --git a/zellij-server/src/desktop_chrome.rs b/zellij-server/src/desktop_chrome.rs
+new file mode 100644
+index 0000000..bfa458d
+--- /dev/null
++++ b/zellij-server/src/desktop_chrome.rs
+@@ -0,0 +1,160 @@
++use serde::Deserialize;
++use std::path::Path;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::OnceLock;
++use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
++use zellij_utils::pane_size::{Size, Viewport};
++
++static CHROME: OnceLock<Option<DesktopChrome>> = OnceLock::new();
++static COLLAPSED: AtomicBool = AtomicBool::new(false);
++
++#[derive(Debug, Clone, Deserialize)]
++#[serde(rename_all = "lowercase")]
++pub(crate) enum Placement {
++    Sidebar,
++    Header,
++}
++
++#[derive(Debug, Clone, Deserialize)]
++pub(crate) struct ChromeItem {
++    pub id: String,
++    pub name: String,
++    pub icon: String,
++    pub shortcuts: String,
++    pub placement: Placement,
++    pub tab_name: String,
++}
++
++#[derive(Debug, Clone)]
++pub(crate) struct DesktopChrome {
++    pub items: Vec<ChromeItem>,
++}
++
++impl DesktopChrome {
++    pub fn load(path: &Path) -> anyhow::Result<Self> {
++        let file = std::fs::File::open(path)?;
++        let items = serde_json::from_reader(file)?;
++        Ok(Self { items })
++    }
++}
++
++pub(crate) fn current() -> Option<&'static DesktopChrome> {
++    CHROME.get_or_init(|| {
++        std::env::var_os("TDNEXT_CHROME_FILE").and_then(|path| {
++            match DesktopChrome::load(Path::new(&path)) {
++                Ok(chrome) => Some(chrome),
++                Err(error) => {
++                    log::error!("Failed to load desktop chrome: {error:#}");
++                    None
++                },
++            }
++        })
++    }).as_ref()
++}
++
++pub(crate) fn content_viewport(size: Size) -> Viewport {
++    if current().is_none() {
++        return size.into();
++    }
++    let width = if COLLAPSED.load(Ordering::Relaxed) { 10 } else { 22 };
++    let x = width.min(size.cols.saturating_sub(1));
++    let y = usize::from(size.rows >= 3);
++    let bottom = if size.rows >= 5 { 3 } else if size.rows >= 4 { 2 } else { usize::from(size.rows >= 3) };
++    Viewport { x, y, cols: size.cols - x, rows: size.rows - y - bottom }
++}
++
++pub(crate) fn toggle() {
++    COLLAPSED.fetch_xor(true, Ordering::Relaxed);
++}
++
++fn clip(text: &str, width: usize) -> String {
++    let mut used = 0;
++    text.chars().filter(|c| !c.is_control()).take_while(|c| {
++        used += c.width().unwrap_or(0);
++        used <= width
++    }).collect()
++}
++
++fn padded(text: &str, width: usize) -> String {
++    let text = clip(text, width);
++    let padding = width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
++    format!("{text}{}", " ".repeat(padding))
++}
++
++pub(crate) enum Click<'a> {
++    Toggle,
++    Sidebar(&'a str),
++    Header(&'a str),
++    Chrome,
++    Content,
++}
++
++impl DesktopChrome {
++    pub fn render(&self, size: Size, active_tab: &str) -> String {
++        let viewport = content_viewport(size);
++        if size.rows == 0 || size.cols == 0 { return String::new(); }
++        let mut output = String::from("\x1b7\x1b[0m");
++        if viewport.y > 0 {
++            let header = self.items.iter().filter(|item| matches!(item.placement, Placement::Header))
++                .map(|item| format!(" {} {} ", item.icon, item.name)).collect::<String>();
++            let start = size.cols.saturating_sub(UnicodeWidthStr::width(header.as_str()));
++            let title = padded(" TDNEXT", start);
++            output.push_str(&format!("\x1b[1;1H\x1b[48;5;237m\x1b[38;5;255m{}\x1b[0m", padded(&format!("{title}{header}"), size.cols)));
++        }
++        for row in viewport.y..viewport.y + viewport.rows {
++            if viewport.x == 0 { break; }
++            let item = self.items.iter().filter(|item| matches!(item.placement, Placement::Sidebar)).nth(row.saturating_sub(viewport.y + 1));
++            let text = if row == viewport.y {
++                if COLLAPSED.load(Ordering::Relaxed) { " > F7 ".to_owned() } else { " < F7 Desktop".to_owned() }
++            } else if let Some(item) = item {
++                let selected = if item.tab_name == active_tab { ">" } else { " " };
++                let name = if item.name.is_empty() { &item.id } else { &item.name };
++                if COLLAPSED.load(Ordering::Relaxed) { format!("{selected} {}", item.icon) } else { format!("{selected} {} {name}", item.icon) }
++            } else { String::new() };
++            output.push_str(&format!("\x1b[{};1H\x1b[48;5;236m\x1b[38;5;255m{}\x1b[38;5;245m│\x1b[0m", row + 1, padded(&text, viewport.x - 1)));
++        }
++        let bottom = size.rows.saturating_sub(viewport.y + viewport.rows);
++        if bottom > 0 {
++            let separator = usize::from(bottom > 2);
++            if separator > 0 {
++                output.push_str(&format!("\x1b[{};1H\x1b[48;5;237m\x1b[38;5;245m{}\x1b[0m", viewport.y + viewport.rows + 1, "─".repeat(size.cols)));
++            }
++            let tool = self.items.iter().find(|item| item.tab_name == active_tab)
++                .map(|item| format!("Tool ({}): {}", item.name, item.shortcuts))
++                .unwrap_or_else(|| "No views enabled".to_owned());
++            output.push_str(&format!("\x1b[{};1H\x1b[48;5;237m\x1b[38;5;255m{}\x1b[0m", viewport.y + viewport.rows + separator + 1, padded(&tool, size.cols)));
++            if bottom > 1 {
++                let mut hints = String::from("Global: Ctrl+q quit Ctrl+p panes");
++                if self.items.iter().any(|item| matches!(item.placement, Placement::Header)) { hints.push_str(" Alt+o header"); }
++                let count = self.items.iter().filter(|item| matches!(item.placement, Placement::Sidebar)).count().min(9);
++                if count == 1 { hints.push_str(" Alt+1 view"); }
++                else if count > 1 { hints.push_str(&format!(" Alt+1..{count} views")); }
++                output.push_str(&format!("\x1b[{};1H\x1b[48;5;237m\x1b[38;5;255m{}\x1b[0m", size.rows, padded(&hints, size.cols)));
++            }
++        }
++        output.push_str("\x1b8");
++        output
++    }
++
++    pub fn click(&self, size: Size, row: usize, col: usize) -> Click<'_> {
++        let viewport = content_viewport(size);
++        if viewport.y > 0 && row == 0 {
++            let header_width: usize = self.items.iter().filter(|item| matches!(item.placement, Placement::Header))
++                .map(|item| UnicodeWidthStr::width(format!(" {} {} ", item.icon, item.name).as_str())).sum();
++            let mut start = size.cols.saturating_sub(header_width);
++            for item in self.items.iter().filter(|item| matches!(item.placement, Placement::Header)) {
++                let label = format!(" {} {} ", item.icon, item.name);
++                let end = start + UnicodeWidthStr::width(clip(&label, size.cols).as_str());
++                if col >= start && col < end { return Click::Header(&item.tab_name); }
++                start = end;
++            }
++            return Click::Chrome;
++        }
++        if col < viewport.x && row >= viewport.y && row < viewport.y + viewport.rows {
++            if row == viewport.y { return Click::Toggle; }
++            return self.items.iter().filter(|item| matches!(item.placement, Placement::Sidebar))
++                .nth(row - viewport.y - 1).map(|item| Click::Sidebar(item.tab_name.as_str())).unwrap_or(Click::Chrome);
++        }
++        if row >= viewport.y + viewport.rows { Click::Chrome } else { Click::Content }
++    }
++}
+diff --git a/zellij-server/src/lib.rs b/zellij-server/src/lib.rs
+index 925e14a..18c056b 100644
+--- a/zellij-server/src/lib.rs
++++ b/zellij-server/src/lib.rs
+@@ -12,6 +12,7 @@ pub mod panes;
+ pub mod tab;
+ 
+ pub mod background_jobs;
++mod desktop_chrome;
+ mod global_async_runtime;
+ mod logging_pipe;
+ mod mobile_web;
+diff --git a/zellij-server/src/os_input_output_unix.rs b/zellij-server/src/os_input_output_unix.rs
+index bfebd7b..47de00a 100644
+--- a/zellij-server/src/os_input_output_unix.rs
++++ b/zellij-server/src/os_input_output_unix.rs
+@@ -224,6 +224,7 @@ fn handle_openpty(
+         command
+             .args(&cmd.args)
+             .env("ZELLIJ_PANE_ID", &format!("{}", terminal_id))
++            .env_remove("TDNEXT_CHROME_FILE")
+             .pre_exec(move || -> io::Result<()> {
+                 if libc::login_tty(pid_secondary) != 0 {
+                     panic!("failed to set controlling terminal");
+diff --git a/zellij-server/src/panes/floating_panes/mod.rs b/zellij-server/src/panes/floating_panes/mod.rs
+index bf6b98c..99ca486 100644
+--- a/zellij-server/src/panes/floating_panes/mod.rs
++++ b/zellij-server/src/panes/floating_panes/mod.rs
+@@ -65,6 +65,18 @@ pub struct FloatingPanes {
+ #[allow(clippy::borrowed_box)]
+ #[allow(clippy::too_many_arguments)]
+ impl FloatingPanes {
++    pub(crate) fn constrain_desktop_viewport(&mut self, viewport: Viewport) {
++        for (pane_id, pane) in &mut self.panes {
++            let mut geom = pane.position_and_size();
++            geom.cols.set_inner(geom.cols.as_usize().min(viewport.cols));
++            geom.rows.set_inner(geom.rows.as_usize().min(viewport.rows));
++            geom.x = geom.x.clamp(viewport.x, viewport.x + viewport.cols - geom.cols.as_usize());
++            geom.y = geom.y.clamp(viewport.y, viewport.y + viewport.rows - geom.rows.as_usize());
++            if pane.geom_override().is_some() { pane.set_geom_override(geom); } else { pane.set_geom(geom); }
++            self.desired_pane_positions.insert(*pane_id, geom);
++        }
++    }
++
+     pub fn new(
+         display_area: Rc<RefCell<Size>>,
+         viewport: Rc<RefCell<Viewport>>,
+@@ -366,6 +378,12 @@ impl FloatingPanes {
+             viewport.cols,
+             viewport.rows,
+         );
++        if floating_pane_layout.x.is_some() || floating_pane_layout.width.is_some() {
++            position.x += viewport.x;
++        }
++        if floating_pane_layout.y.is_some() || floating_pane_layout.height.is_some() {
++            position.y += viewport.y;
++        }
+         if let Some(is_pinned) = &floating_pane_layout.pinned {
+             position.is_pinned = *is_pinned;
+         }
+@@ -378,15 +396,15 @@ impl FloatingPanes {
+         if position.rows.as_usize() > viewport.rows {
+             position.rows = Dimension::fixed(viewport.rows);
+         }
+-        if position.x + position.cols.as_usize() > viewport.cols {
++        if position.x + position.cols.as_usize() > viewport.x + viewport.cols {
+             position.x = position
+                 .x
+-                .saturating_sub((position.x + position.cols.as_usize()) - viewport.cols);
++                .saturating_sub((position.x + position.cols.as_usize()) - (viewport.x + viewport.cols));
+         }
+-        if position.y + position.rows.as_usize() > viewport.rows {
++        if position.y + position.rows.as_usize() > viewport.y + viewport.rows {
+             position.y = position
+                 .y
+-                .saturating_sub((position.y + position.rows.as_usize()) - viewport.rows);
++                .saturating_sub((position.y + position.rows.as_usize()) - (viewport.y + viewport.rows));
+         }
+         Ok(position)
+     }
+diff --git a/zellij-server/src/panes/tiled_panes/mod.rs b/zellij-server/src/panes/tiled_panes/mod.rs
+index f7e08b0..f2e9e6a 100644
+--- a/zellij-server/src/panes/tiled_panes/mod.rs
++++ b/zellij-server/src/panes/tiled_panes/mod.rs
+@@ -1482,7 +1482,7 @@ impl TiledPanes {
+                 match pane_grid.layout(SplitDirection::Horizontal, cols) {
+                     Ok(_) => {
+                         let column_difference = cols as isize - display_area.cols as isize;
+-                        viewport.cols = (viewport.cols as isize + column_difference) as usize;
++                        viewport.cols = viewport.cols.saturating_add_signed(column_difference);
+                         display_area.cols = cols;
+                         true
+                     },
+@@ -1501,7 +1501,7 @@ impl TiledPanes {
+                 match pane_grid.layout(SplitDirection::Vertical, rows) {
+                     Ok(_) => {
+                         let row_difference = rows as isize - display_area.rows as isize;
+-                        viewport.rows = (viewport.rows as isize + row_difference) as usize;
++                        viewport.rows = viewport.rows.saturating_add_signed(row_difference);
+                         display_area.rows = rows;
+                         true
+                     },
+@@ -3116,7 +3116,7 @@ impl TiledPanes {
+                 .insert(client_id, to_pane_id, &mut self.panes);
+         }
+     }
+-    fn reset_boundaries(&mut self) {
++    pub(crate) fn reset_boundaries(&mut self) {
+         self.client_id_to_boundaries.clear();
+     }
+     pub fn get_plugin_pane_id(&self, run_plugin_or_alias: &RunPluginOrAlias) -> Option<PaneId> {
+diff --git a/zellij-server/src/panes/tiled_panes/pane_resizer.rs b/zellij-server/src/panes/tiled_panes/pane_resizer.rs
+index 8453fa7..9b15efe 100644
+--- a/zellij-server/src/panes/tiled_panes/pane_resizer.rs
++++ b/zellij-server/src/panes/tiled_panes/pane_resizer.rs
+@@ -42,13 +42,18 @@ impl<'a> PaneResizer<'a> {
+         }
+     }
+ 
++    #[cfg(test)]
+     pub fn layout(&mut self, direction: SplitDirection, space: usize) -> Result<()> {
++        self.layout_with_origin(direction, space, 0)
++    }
++
++    pub fn layout_with_origin(&mut self, direction: SplitDirection, space: usize, origin: usize) -> Result<()> {
+         self.solver.reset();
+         let grid = self
+             .solve(direction, space)
+             .map_err(|err| anyhow!("{}", err))?;
+         let spans = self
+-            .discretize_spans(grid, space)
++            .discretize_spans(grid, space, origin)
+             .map_err(|err| anyhow!("{}", err))?;
+ 
+         if self.is_layout_valid(&spans) {
+@@ -76,7 +81,7 @@ impl<'a> PaneResizer<'a> {
+         Ok(grid)
+     }
+ 
+-    fn discretize_spans(&mut self, mut grid: Grid, space: usize) -> Result<Vec<Span>, String> {
++    fn discretize_spans(&mut self, mut grid: Grid, space: usize, origin: usize) -> Result<Vec<Span>, String> {
+         let mut rounded_sizes: HashMap<_, _> = grid
+             .iter()
+             .flatten()
+@@ -112,7 +117,7 @@ impl<'a> PaneResizer<'a> {
+ 
+         // Update span positions based on their rounded sizes
+         for spans in &mut grid {
+-            let mut offset = 0;
++            let mut offset = origin;
+             for span in spans {
+                 span.pos = offset;
+                 let sz = rounded_sizes[&span.size_var];
+diff --git a/zellij-server/src/panes/tiled_panes/tiled_pane_grid.rs b/zellij-server/src/panes/tiled_panes/tiled_pane_grid.rs
+index 985e2c4..7048ca7 100644
+--- a/zellij-server/src/panes/tiled_panes/tiled_pane_grid.rs
++++ b/zellij-server/src/panes/tiled_panes/tiled_pane_grid.rs
+@@ -51,8 +51,17 @@ impl<'a> TiledPaneGrid<'a> {
+     }
+ 
+     pub fn layout(&mut self, direction: SplitDirection, space: usize) -> Result<()> {
++        let size = match direction {
++            SplitDirection::Horizontal => Size { cols: space, ..self.display_area },
++            SplitDirection::Vertical => Size { rows: space, ..self.display_area },
++        };
++        let viewport = crate::desktop_chrome::content_viewport(size);
++        let (space, origin) = match direction {
++            SplitDirection::Horizontal => (viewport.cols, viewport.x),
++            SplitDirection::Vertical => (viewport.rows, viewport.y),
++        };
+         let mut pane_resizer = PaneResizer::new(self.panes.clone());
+-        pane_resizer.layout(direction, space)
++        pane_resizer.layout_with_origin(direction, space, origin)
+     }
+     pub fn get_pane_geom(&self, pane_id: &PaneId) -> Option<PaneGeom> {
+         let panes = self.panes.borrow();
+@@ -384,13 +393,12 @@ impl<'a> TiledPaneGrid<'a> {
+             }
+ 
+             // Update grid
+-            let mut pane_resizer = PaneResizer::new(self.panes.clone());
+             if direction.is_horizontal() {
+-                pane_resizer
++                self
+                     .layout(SplitDirection::Horizontal, self.display_area.cols)
+                     .with_context(err_context)?;
+             } else {
+-                pane_resizer
++                self
+                     .layout(SplitDirection::Vertical, self.display_area.rows)
+                     .with_context(err_context)?;
+             }
+@@ -1340,17 +1348,15 @@ impl<'a> TiledPaneGrid<'a> {
+                     SplitDirection::Horizontal => self.display_area.cols,
+                 };
+                 self.panes.borrow_mut().remove(&id);
+-                let mut pane_resizer = PaneResizer::new(self.panes.clone());
+-                let _ = pane_resizer.layout(direction, side_length);
++                let _ = self.layout(direction, side_length);
+                 return true;
+             }
+         } else {
+             // best effort resize - we just remove the pane and relayout everything
+             // this might happen if we are closing a fixed pane
+             self.panes.borrow_mut().remove(&id);
+-            let mut pane_resizer = PaneResizer::new(self.panes.clone());
+-            let _ = pane_resizer.layout(SplitDirection::Horizontal, self.display_area.cols);
+-            let _ = pane_resizer.layout(SplitDirection::Vertical, self.display_area.rows);
++            let _ = self.layout(SplitDirection::Horizontal, self.display_area.cols);
++            let _ = self.layout(SplitDirection::Vertical, self.display_area.rows);
+             return true;
+         }
+         false
+diff --git a/zellij-server/src/route.rs b/zellij-server/src/route.rs
+index e533b31..e2d6358 100644
+--- a/zellij-server/src/route.rs
++++ b/zellij-server/src/route.rs
+@@ -2370,6 +2370,23 @@ pub(crate) fn route_thread_main(
+                                 .unwrap()
+                                 .set_last_active_client(client_id);
+ 
++                            if crate::desktop_chrome::current().is_some()
++                                && key.bare_key == BareKey::F(7)
++                                && key.key_modifiers.is_empty()
++                            {
++                                let enabled = session_data.read().unwrap().as_ref().is_some_and(|s| {
++                                    !s.key_passthrough_clients.contains_key(&client_id)
++                                        && s.get_client_keybinds_and_mode(&client_id)
++                                            .is_some_and(|(_, mode, _)| *mode != InputMode::Locked)
++                                });
++                                if enabled {
++                                    if let Some(senders) = &senders {
++                                        senders.send_to_screen(ScreenInstruction::ToggleDesktopChrome)?;
++                                    }
++                                    return Ok(false);
++                                }
++                            }
++
+                             // The read guard ends as a temporary in this expression so
+                             // `route_action` runs without holding `session_data.read()` —
+                             // see the doc comment on `route_action` for why this matters.
+diff --git a/zellij-server/src/screen.rs b/zellij-server/src/screen.rs
+index 5f87cd1..ce1dcd5 100644
+--- a/zellij-server/src/screen.rs
++++ b/zellij-server/src/screen.rs
+@@ -624,6 +624,7 @@ pub enum ScreenInstruction {
+     ),
+     ChangeModeForAllClients(InputMode, Option<InputMode>, Option<NotificationEnd>),
+     MouseEvent(MouseEvent, ClientId, Option<NotificationEnd>),
++    ToggleDesktopChrome,
+     Copy(ClientId, Option<NotificationEnd>),
+     AddClient(
+         ClientId,
+@@ -1142,6 +1143,7 @@ impl From<&ScreenInstruction> for ScreenContext {
+             ScreenInstruction::ScrollUpAt(..) => ScreenContext::ScrollUpAt,
+             ScreenInstruction::ScrollDownAt(..) => ScreenContext::ScrollDownAt,
+             ScreenInstruction::MouseEvent(..) => ScreenContext::MouseEvent,
++            ScreenInstruction::ToggleDesktopChrome => ScreenContext::MouseEvent,
+             ScreenInstruction::Copy(..) => ScreenContext::Copy,
+             ScreenInstruction::ToggleTab(..) => ScreenContext::ToggleTab,
+             ScreenInstruction::AddClient(..) => ScreenContext::AddClient,
+@@ -2169,6 +2171,10 @@ impl Screen {
+                     self.recompute_tab_size(new_tab_index)
+                         .with_context(err_context)?;
+ 
++                    if let Some(tab) = self.tabs.get_mut(&new_tab_index) {
++                        tab.adjust_desktop_chrome()?;
++                    }
++
+                     self.log_and_report_session_state()
+                         .with_context(err_context)?;
+                     for (affected_client_id, old_pane_id) in old_focused_panes {
+@@ -4370,6 +4376,14 @@ impl Screen {
+                 .senders
+                 .send_to_plugin(PluginInstruction::PaneRenderReport(pane_render_report));
+ 
++            if let Some(chrome) = crate::desktop_chrome::current() {
++                for (client_id, tab_id) in &self.active_tab_ids {
++                    if let Some(tab) = self.tabs.get(tab_id) {
++                        let size = self.size_for_client(Some(*client_id));
++                        output.add_post_vte_instruction_to_client(*client_id, &chrome.render(size, &tab.name));
++                    }
++                }
++            }
+             non_watcher_output_was_dirty = output.is_dirty();
+ 
+             let mut bell_state_changed = false;
+@@ -7430,7 +7444,36 @@ impl Screen {
+             }
+         }
+     }
++    fn toggle_desktop_chrome(&mut self) -> Result<()> {
++        crate::desktop_chrome::toggle();
++        let active_tabs: HashSet<_> = self.active_tab_ids.values().copied().collect();
++        for tab_id in active_tabs {
++            if let Some(tab) = self.tabs.get_mut(&tab_id) {
++                tab.adjust_desktop_chrome()?;
++            }
++        }
++        self.render(None)
++    }
++
+     pub fn handle_mouse_event(&mut self, event: MouseEvent, client_id: ClientId) {
++        if let (Some(chrome), Ok(row)) = (crate::desktop_chrome::current(), usize::try_from(event.position.line())) {
++            let size = self.size_for_client(Some(client_id));
++            match chrome.click(size, row, event.position.column()) {
++                crate::desktop_chrome::Click::Content => {},
++                click => {
++                    if event.event_type == MouseEventType::Press && event.left {
++                        let result = match click {
++                            crate::desktop_chrome::Click::Toggle => self.toggle_desktop_chrome(),
++                            crate::desktop_chrome::Click::Sidebar(name) => self.go_to_tab_name(name.to_owned(), client_id).map(|_| ()),
++                            crate::desktop_chrome::Click::Header(name) => self.open_tab_with_return(name, client_id),
++                            crate::desktop_chrome::Click::Chrome | crate::desktop_chrome::Click::Content => Ok(()),
++                        };
++                        result.non_fatal();
++                    }
++                    return;
++                },
++            }
++        }
+         let is_bare_motion = event.event_type == MouseEventType::Motion
+             && !event.left
+             && !event.right
+@@ -10378,6 +10421,9 @@ pub(crate) fn screen_thread_main(
+             ) => {
+                 screen.handle_mouse_event(event, client_id);
+             },
++            ScreenInstruction::ToggleDesktopChrome => {
++                screen.toggle_desktop_chrome()?;
++            },
+             ScreenInstruction::Copy(
+                 client_id,
+                 _completion_tx, // the action ends here, dropping this will release anything
+diff --git a/zellij-server/src/tab/layout_applier.rs b/zellij-server/src/tab/layout_applier.rs
+index 44e100a..94606a4 100644
+--- a/zellij-server/src/tab/layout_applier.rs
++++ b/zellij-server/src/tab/layout_applier.rs
+@@ -1048,7 +1048,7 @@ impl<'a> LayoutApplier<'a> {
+         {
+             // reset viewport before reapplying offset
+             let mut viewport = viewport.borrow_mut();
+-            *viewport = (*display_area.borrow()).into();
++            *viewport = crate::desktop_chrome::content_viewport(*display_area.borrow());
+         }
+         let boundary_geoms = tiled_panes.non_selectable_pane_geoms_inside_viewport();
+         {
+@@ -1129,9 +1129,15 @@ impl<'a> LayoutApplier<'a> {
+             (display_area.cols, display_area.rows)
+         };
+ 
++        let viewport = crate::desktop_chrome::content_viewport(Size {
++            cols: display_area_cols,
++            rows: display_area_rows,
++        });
+         let mut free_space = PaneGeom::default();
+-        free_space.cols.set_inner(display_area_cols);
+-        free_space.rows.set_inner(display_area_rows);
++        free_space.x = viewport.x;
++        free_space.y = viewport.y;
++        free_space.cols.set_inner(viewport.cols);
++        free_space.rows.set_inner(viewport.rows);
+         free_space
+     }
+ }
+diff --git a/zellij-server/src/tab/mod.rs b/zellij-server/src/tab/mod.rs
+index 345b909..c6845f1 100644
+--- a/zellij-server/src/tab/mod.rs
++++ b/zellij-server/src/tab/mod.rs
+@@ -904,7 +904,7 @@ impl Tab {
+             connected_clients.insert(client_id);
+         }
+         let initial_size = display_area;
+-        let viewport: Viewport = display_area.into();
++        let viewport: Viewport = crate::desktop_chrome::content_viewport(display_area);
+         let viewport = Rc::new(RefCell::new(viewport));
+         let display_area = Rc::new(RefCell::new(display_area));
+         let connected_clients = Rc::new(RefCell::new(connected_clients));
+@@ -5088,6 +5088,45 @@ impl Tab {
+         }
+         Ok(())
+     }
++    pub fn adjust_desktop_chrome(&mut self) -> Result<()> {
++        if crate::desktop_chrome::current().is_none() { return Ok(()); }
++        let old = *self.viewport.borrow();
++        let new = crate::desktop_chrome::content_viewport(self.size);
++        if old.x == new.x || new.cols == 0 { return Ok(()); }
++        let expanding = new.x > old.x;
++        let delta = old.x.abs_diff(new.x);
++        for pane in self.tiled_panes.panes.values_mut() {
++            let mut geom = pane.position_and_size();
++            if geom.x == old.x {
++                let cols = if expanding { geom.cols.as_usize().saturating_sub(delta) } else { geom.cols.as_usize() + delta };
++                geom.cols.set_inner(cols);
++                if geom.cols.is_percent() {
++                    let cols = f64::from(u32::try_from(cols)?);
++                    let total = f64::from(u32::try_from(new.cols)?);
++                    geom.cols.set_percent(cols * 100.0 / total);
++                }
++                geom.x = new.x;
++            } else {
++                geom.x = if expanding { geom.x + delta } else { geom.x.saturating_sub(delta) };
++                if geom.cols.is_percent() {
++                    let cols = f64::from(u32::try_from(geom.cols.as_usize())?);
++                    let total = f64::from(u32::try_from(new.cols)?);
++                    geom.cols.set_percent(cols * 100.0 / total);
++                }
++            }
++            if pane.geom_override().is_some() { pane.set_geom_override(geom); } else { pane.set_geom(geom); }
++        }
++        *self.viewport.borrow_mut() = new;
++        self.floating_panes.constrain_desktop_viewport(new);
++        self.tiled_panes.resize_pty_all_panes()?;
++        self.floating_panes.resize_pty_all_panes(&mut self.os_api)?;
++        self.tiled_panes.reset_boundaries();
++        self.set_should_clear_display_before_rendering();
++        self.set_force_render();
++        self.senders.send_to_pty_writer(PtyWriteInstruction::ApplyCachedResizes)?;
++        Ok(())
++    }
++
+     pub fn resize_whole_tab(&mut self, new_screen_size: Size) -> Result<()> {
+         let err_context = || format!("failed to resize whole tab (id {})", self.id);
+         self.size = new_screen_size;

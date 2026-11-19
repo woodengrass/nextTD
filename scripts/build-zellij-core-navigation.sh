@@ -8,7 +8,7 @@
 # Inputs:
 #   $1  Existing local Zellij git checkout (pristine or dirty working tree
 #       is accepted; only its committed HEAD is used).
-#   $2  Optional destination; defaults to state/bin/zellij-core-navigation-v3.
+#   $2  Optional destination; defaults to state/bin/tdnext.
 #
 # What it does:
 #   1. Verifies the checkout HEAD is exactly
@@ -16,10 +16,10 @@
 #   2. Exports that committed HEAD with `git archive` to a private mktemp
 #      directory (working-tree changes are never copied; the checkout is
 #      never modified).
-#   3. Applies patches/zellij-0.45.1-core-navigation.patch with `git apply`.
+#   3. Applies the navigation patch followed by the native chrome patch.
 #   4. Builds `cargo build --locked --release --no-default-features
 #      --bin zellij` inside the exported source.
-#   5. Checks `./zellij action --help` lists all required navigation commands.
+#   5. Checks navigation commands and the native chrome version probe.
 #   6. Atomically installs the requested destination ONLY if absent (never
 #      overwrites).
 #
@@ -38,8 +38,9 @@ set -euo pipefail
 
 PINNED_HEAD="efd8fd5a89a20c07a111d248ad7fce53848d2c18"
 PATCH_NAME="zellij-0.45.1-core-navigation.patch"
+CHROME_PATCH_NAME="zellij-0.45.1-native-chrome.patch"
 LICENSE_NAME="LICENSE.zellij-0.45.1"
-DEST_NAME="zellij-core-navigation-v3"
+DEST_NAME="tdnext"
 
 usage() {
   echo "usage: $(basename "$0") <path-to-zellij-git-checkout> [destination]" >&2
@@ -49,6 +50,7 @@ usage() {
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PATCH_FILE="${PROJECT_ROOT}/patches/${PATCH_NAME}"
+CHROME_PATCH_FILE="${PROJECT_ROOT}/patches/${CHROME_PATCH_NAME}"
 LICENSE_FILE="${PROJECT_ROOT}/patches/${LICENSE_NAME}"
 DEST_FILE="${2:-${PROJECT_ROOT}/state/bin/${DEST_NAME}}"
 
@@ -67,6 +69,11 @@ fi
 
 if [ ! -f "${PATCH_FILE}" ]; then
   echo "error: patch not found: ${PATCH_FILE}" >&2
+  exit 1
+fi
+
+if [ ! -f "${CHROME_PATCH_FILE}" ]; then
+  echo "error: patch not found: ${CHROME_PATCH_FILE}" >&2
   exit 1
 fi
 
@@ -112,6 +119,7 @@ trap 'rm -rf "${WORK_DIR}"' EXIT INT TERM
 git -C "${ZELLIJ_SRC}" archive HEAD | tar -x -C "${WORK_DIR}"
 
 (cd "${WORK_DIR}" && git apply --check "${PATCH_FILE}" && git apply "${PATCH_FILE}")
+(cd "${WORK_DIR}" && git apply --check "${CHROME_PATCH_FILE}" && git apply "${CHROME_PATCH_FILE}")
 
 TARGET_DIR="${CARGO_TARGET_DIR:-${WORK_DIR}/target}"
 if [[ "${TARGET_DIR}" != /* ]]; then
@@ -132,6 +140,11 @@ for required in open-tab-with-return open-tab-with-return-from-header restore-fo
     exit 1
   fi
 done
+
+if [ "$("${BUILT_BIN}" --tdnext-chrome-version)" != "1" ]; then
+  echo "error: built binary lacks native chrome version 1." >&2
+  exit 1
+fi
 
 if [ -e "${DEST_FILE}" ]; then
   echo "error: destination appeared during build, refusing to overwrite: ${DEST_FILE}" >&2
