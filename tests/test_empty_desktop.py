@@ -60,8 +60,11 @@ def test_empty_native_session_displays_desktop(tmp_path: Path, native_env: tuple
     StateStore(Path(env["TDNEXT_STATE_DIR"]) / "plugins.json").write(PluginState(installed=ids, enabled=ids))
     session = NativeSession(tmp_path, env, binary, expected_tabs=1, expected_panes=1)
     try:
-        screen = wait_for(lambda: (text if "No views enabled" in (text := session.action("dump-screen")) else ""))
-        assert "TERMINAL DESKTOP" in screen
+        # Stage 3 draws chrome itself: header/footer labels live in the
+        # terminal capture, not in the content pane dump. The native
+        # core header titles the desktop TDNEXT.
+        screen = wait_for(lambda: (text if "No views enabled" in (text := session.terminal_text()) else ""))
+        assert "TDNEXT" in screen
         assert "Ctrl+q" in screen
         session.send_key("F6")
         assert "No views enabled" in session.action("dump-screen")

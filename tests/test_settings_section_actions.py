@@ -1,4 +1,6 @@
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -6,8 +8,16 @@ from test_settings_ui import make_app, text_of
 from textual.containers import VerticalScroll
 from textual.widgets import Button, ContentSwitcher, DataTable, Static
 
+from tdnext.core.manager import PluginManager
 from tdnext.core.models import PluginState
+from tdnext.core.removal import RemovalRequest
+from tdnext.plugins.settings.operations import OperationResult
 from tdnext.plugins.settings.view import SettingsView
+
+
+@contextmanager
+def allow_removal(request: RemovalRequest) -> Iterator[tuple[str, ...]]:
+    yield ()
 
 
 @pytest.mark.anyio
@@ -39,10 +49,22 @@ async def test_plugin_shortcut_operates_on_selected_row(
         installed=state.installed | ({"monitor"} if initial != "available" else set()),
         enabled=state.enabled | ({"monitor"} if initial == "enabled" else set()),
     ))
+    if key == "u":
+        manager.removal_guard = allow_removal
+        manager.enable("monitor")
+        manager.disable("monitor")
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press("alt+o")
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
+        if key == "u":
+            # Run the real manager uninstall locally: spawning the production
+            # helper here would sweep live /proc by name and could signal this
+            # test runner itself once it claims the tdnext process name.
+            def uninstall_locally(managed: PluginManager, plugin_id: str) -> OperationResult:
+                return OperationResult("uninstall", plugin_id, tuple(sorted(managed.uninstall(plugin_id))))
+
+            view.uninstall_runner = uninstall_locally
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("monitor"))
         await pilot.pause()
         await pilot.press(key)
@@ -158,8 +180,9 @@ async def test_running_components_remain_protected_in_plugins(tmp_path: Path, ta
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index(target))
         await pilot.pause()
         assert view.query_one("#plugin-disable", Button).disabled
-        assert view.query_one("#plugin-uninstall", Button).disabled
-        await pilot.press("d", "u")
+        assert not view.query_one("#plugin-install", Button).disabled
+        await pilot.press("d")
+        await pilot.pause()
         assert manager.store.read() == before
 
 
@@ -167,6 +190,7 @@ async def test_running_components_remain_protected_in_plugins(tmp_path: Path, ta
 @pytest.mark.parametrize("operation", ["disable", "uninstall"])
 async def test_missing_installed_plugin_can_be_removed_from_plugins(tmp_path: Path, operation: str) -> None:
     app, manager = make_app(tmp_path)
+    manager.removal_guard = allow_removal
     manager.enable("icons")
     manager.manifests = {key: value for key, value in manager.manifests.items() if key != "icons"}
     async with app.run_test(size=(80, 24)) as pilot:
@@ -174,8 +198,13 @@ async def test_missing_installed_plugin_can_be_removed_from_plugins(tmp_path: Pa
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("icons"))
+        if operation == "uninstall":
+            def uninstall_locally(managed: PluginManager, plugin_id: str) -> OperationResult:
+                return OperationResult("uninstall", plugin_id, tuple(sorted(managed.uninstall(plugin_id))))
+
+            view.uninstall_runner = uninstall_locally
         await pilot.pause()
-        await pilot.click(f"#plugin-{operation}")
+        await pilot.click(f"#plugin-{'install' if operation == 'uninstall' else operation}")
         if operation == "uninstall":
             await pilot.click("#confirm-plugin-change")
         await app.workers.wait_for_complete()

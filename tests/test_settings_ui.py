@@ -1,4 +1,6 @@
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -9,11 +11,13 @@ from tdnext.api import PluginContext, ViewPlugin
 from tdnext.core.discovery import discover
 from tdnext.core.manager import PluginManager
 from tdnext.core.models import PluginManifest, PluginState
+from tdnext.core.removal import RemovalRequest
 from tdnext.core.state import StateStore
 from tdnext.plugins.desktop.app import DesktopApp
 from tdnext.plugins.files.plugin import FilesPlugin
 from tdnext.plugins.files.view import FilesView
 from tdnext.plugins.monitor.plugin import MonitorPlugin
+from tdnext.plugins.settings.operations import OperationResult
 from tdnext.plugins.settings.plugin import SettingsPlugin
 from tdnext.plugins.settings.view import SettingsView
 
@@ -24,6 +28,11 @@ def text_of(widget: Static) -> str:
     return content.plain
 
 
+@contextmanager
+def allow_removal(request: RemovalRequest) -> Iterator[tuple[str, ...]]:
+    yield ()
+
+
 def make_app(tmp_path: Path, *, monitor: bool = False) -> tuple[DesktopApp, PluginManager]:
     roots = (Path(__file__).parents[1] / "src" / "tdnext" / "plugins",)
     manifests = discover(roots)
@@ -31,13 +40,32 @@ def make_app(tmp_path: Path, *, monitor: bool = False) -> tuple[DesktopApp, Plug
         update={"requires_executables": (), "dependency_hook": None}
     )
     manager = PluginManager(manifests, StateStore(tmp_path / "plugins.json"), tmp_path / "bin")
-    installed = frozenset({"desktop", "files", "settings"} | ({"monitor"} if monitor else set()))
-    manager.store.write(PluginState(installed=installed, enabled=installed))
+    manager.enable("files")
+    manager.enable("settings")
+    if monitor:
+        manager.enable("monitor")
     views: list[tuple[PluginManifest, ViewPlugin]] = [(manifests["files"], FilesPlugin())]
     if monitor:
         views.append((manifests["monitor"], MonitorPlugin()))
     views.append((manifests["settings"], SettingsPlugin()))
     return DesktopApp(PluginContext(tmp_path, manager), views), manager
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("plugin_id", ["desktop", "settings"])
+async def test_running_plugin_can_be_selected_for_uninstall(tmp_path: Path, plugin_id: str) -> None:
+    app, _manager = make_app(tmp_path)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press("alt+o")
+        await pilot.click("#section-plugins")
+        view = app.query_one(SettingsView)
+        view.query_one(DataTable).move_cursor(row=view.plugin_ids.index(plugin_id))
+        await pilot.pause()
+        button = view.query_one("#plugin-install", Button)
+        assert not button.disabled
+        await pilot.click(button)
+        assert app.screen.query_one("#confirm-plugin-change", Button)
+        await pilot.click("#cancel")
 
 
 @pytest.mark.anyio
@@ -140,14 +168,23 @@ async def test_plugin_management_actions_update_real_state(
     installed = baseline.installed | ({"monitor"} if initial != "available" else set())
     enabled = baseline.enabled | ({"monitor"} if initial == "enabled" else set())
     manager.store.write(PluginState(installed=frozenset(installed), enabled=frozenset(enabled)))
+    if operation == "uninstall":
+        manager.removal_guard = allow_removal
+        manager.enable("monitor")
+        manager.disable("monitor")
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press("alt+o")
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         table = view.query_one(DataTable)
         table.move_cursor(row=view.plugin_ids.index("monitor"))
+        if operation == "uninstall":
+            def uninstall_locally(managed: PluginManager, plugin_id: str) -> OperationResult:
+                return OperationResult("uninstall", plugin_id, tuple(sorted(managed.uninstall(plugin_id))))
+
+            view.uninstall_runner = uninstall_locally
         await pilot.pause()
-        await pilot.click(f"#plugin-{operation}")
+        await pilot.click(f"#plugin-{'install' if operation == 'uninstall' else operation}")
         if operation == "uninstall":
             await pilot.click("#confirm-plugin-change")
         await app.workers.wait_for_complete()
@@ -208,15 +245,14 @@ async def test_disable_confirms_and_reports_dependent_cascade(tmp_path: Path) ->
 @pytest.mark.anyio
 async def test_escape_cancels_uninstall_confirmation_without_leaving_settings(tmp_path: Path) -> None:
     app, manager = make_app(tmp_path)
-    state = manager.store.read()
-    manager.store.write(PluginState(installed=state.installed | {"monitor"}, enabled=state.enabled))
+    manager.install("monitor")
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press("alt+o")
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("monitor"))
         await pilot.pause()
-        await pilot.click("#plugin-uninstall")
+        await pilot.click("#plugin-install")
         await pilot.press("escape")
         assert app.query_one(ContentSwitcher).current == "view-settings"
         assert "monitor" in manager.store.read().installed

@@ -15,7 +15,7 @@ class ToolPane(App[None]):
         super().__init__()
         self.plugin_id = plugin_id
         self.plugin = plugin
-        self.context = context
+        self.context = PluginContext(context.directory, context.manager, context.session, plugin_id)
         self.view: Widget | None = None
 
     def compose(self) -> ComposeResult:
@@ -31,6 +31,6 @@ class ToolPane(App[None]):
 
     def action_close_view(self) -> None:
         try:
-            back_from_header(self.plugin_id)
+            back_from_header()
         except PluginError as exc:
             self.notify(str(exc), severity="error")

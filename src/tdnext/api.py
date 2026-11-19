@@ -1,16 +1,18 @@
 """Contract between the desktop host and a trusted view plugin."""
 
 from collections.abc import Sequence
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
 
+from textual.containers import Vertical
 from textual.message import Message
 from textual.widget import Widget
 
+from .context import PluginContext as PluginContext
 from .core.manager import PluginManager
 from .core.models import PluginManifest
-from .core.session import SessionSnapshot
+from .terminal_contract import TERMINAL_VIEW_INTERFACE as TERMINAL_VIEW_INTERFACE
+from .terminal_contract import TerminalViewPlugin as TerminalViewPlugin
 
 IconMode = Literal["compatibility", "codicons"]
 PLUGIN_API_VERSION = 1
@@ -24,15 +26,28 @@ class DependencyHook(Protocol):
     def install(manager: PluginManager) -> Path: ...
 
 
-@dataclass(frozen=True, slots=True)
-class PluginContext:
-    directory: Path
-    manager: PluginManager
-    session: SessionSnapshot | None = None
-
-
 class CloseView(Message):
     pass
+
+
+class SettingsControls(Vertical):
+    """Optional plugin-owned controls hosted in Settings General."""
+
+    class Feedback(Message):
+        def __init__(self, text: str) -> None:
+            super().__init__()
+            self.text = text
+
+    def refresh_settings(self) -> None:
+        """Refresh persisted values when the settings view is activated."""
+
+    def refresh_if_idle(self) -> None:
+        """Refresh persisted values without interrupting an active edit."""
+
+
+@runtime_checkable
+class SettingsContributor(Protocol):
+    def make_settings_controls(self, context: PluginContext) -> SettingsControls: ...
 
 
 @runtime_checkable

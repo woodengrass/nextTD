@@ -29,7 +29,7 @@ class CustomBuildHook(BuildHookInterface):
                 check=True,
             )
             subprocess.run(["git", "-C", source, "checkout", "--detach", PINNED_ZELLIJ], check=True)
-        binary = work / "zellij-core-navigation-v3"
+        binary = work / "tdnext"
         root = Path(self.root)
         openssl_lib = subprocess.check_output(["pkg-config", "--variable=libdir", "openssl"], text=True).strip()
         openssl_include = subprocess.check_output(["pkg-config", "--variable=includedir", "openssl"], text=True).strip()
@@ -56,7 +56,7 @@ class CustomBuildHook(BuildHookInterface):
             parts = name.removeprefix("GLIBC_").split(".")
             if not all(part.isdigit() for part in parts) or tuple(map(int, parts)) > baseline:
                 raise RuntimeError(f"Zellij requires {name}, incompatible with manylinux_{glibc}")
-        build_data["force_include"][str(binary)] = "tdnext/_native/zellij-core-navigation-v3"
+        build_data["force_include"][str(binary)] = "tdnext/_native/tdnext"
         build_data["force_include"][str(root / "patches/LICENSE.zellij-0.45.1")] = (
             "tdnext/_native/LICENSE.zellij-0.45.1"
         )

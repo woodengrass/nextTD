@@ -5,9 +5,25 @@ import time
 import uuid
 from pathlib import Path
 
-from native_processes import attached_session, monitor_pid, terminate_tagged
+from native_processes import attached_session, monitor_pid, tagged_processes, terminate_tagged
 
 CLIENT_HEADER = ("CLIENT_ID", "ZELLIJ_PANE_ID", "RUNNING_COMMAND")
+
+# Stage-3 topology: the native core draws the outer chrome (sidebar,
+# header, footer) itself, so chrome has no PTYs. One content PTY runs per
+# tab and the host keeps rendering the old labels inside it. These markers
+# identify the dead chrome-PTY commands and helper processes; the
+# settings pane (``tdnext.pane view settings``) is tab content, not chrome.
+CHROME_PANE_MARKERS = ("panes header", "panes sidebar", "panes footer")
+CHROME_PROCESS_MARKERS = (
+    b"panes header", b"panes sidebar", b"panes footer",
+    b"tdnext.plugins.desktop.shortcut", b"open-header",
+)
+
+# Chrome occupies the top rows (header) and bottom rows (footer) of the
+# terminal capture; the host keeps rendering the old labels there.
+CHROME_HEADER_ROWS = 2
+CHROME_FOOTER_ROWS = 2
 
 
 def wait_for(predicate, *, timeout: float = 15):
@@ -22,7 +38,8 @@ def wait_for(predicate, *, timeout: float = 15):
 
 class NativeSession:
     def __init__(
-        self, root: Path, env: dict[str, str], binary: str, *, expected_tabs: int = 3, expected_panes: int | None = None
+        self, root: Path, env: dict[str, str], binary: str, *, expected_tabs: int = 3,
+        expected_panes: int | None = None, cols: int = 120, rows: int = 36,
     ) -> None:
         self.env = env
         self.binary = binary
@@ -30,14 +47,15 @@ class NativeSession:
         self.tmux_name = f"tdnext-{uuid.uuid4().hex}"
         subprocess.run(
             ["tmux", "-S", self.tmux_socket, "-f", "/dev/null", "new-session", "-d", "-s", self.tmux_name,
-             "-x", "120", "-y", "36", "-e", f"TDNEXT_TEST_SESSION={self.tmux_name}",
+             "-x", str(cols), "-y", str(rows), "-e", f"TDNEXT_TEST_SESSION={self.tmux_name}",
              sys.executable, "-m", "tdnext", "run", str(root)],
             env=env, capture_output=True, check=True, timeout=5,
         )
         self.startup_diagnostics = "waiting for an attached native pane"
         try:
-            # Zellij's session listing can unlink a socket between bind and listen.
-            self.name = wait_for(lambda: attached_session(self.tmux_name, expected_panes or expected_tabs * 4))
+            # Stage 3 runs one content PTY per tab; the outer chrome has no
+            # PTYs, so the startup pane count equals the tab count.
+            self.name = wait_for(lambda: attached_session(self.tmux_name, expected_panes or expected_tabs))
             self.target_env = {**env, "ZELLIJ_SESSION_NAME": self.name}
             wait_for(lambda: self.ready(expected_tabs))
         except (AssertionError, OSError, ValueError, subprocess.SubprocessError) as exc:
@@ -93,6 +111,13 @@ class NativeSession:
             ["tmux", "-S", self.tmux_socket, "send-keys", "-t", self.tmux_name, key],
             env=self.env, capture_output=True, check=True, timeout=5,
         )
+
+    def terminal_text(self) -> str:
+        """Full visible terminal text, including core-drawn chrome rows."""
+        return subprocess.run(
+            ["tmux", "-S", self.tmux_socket, "capture-pane", "-p", "-t", self.tmux_name],
+            env=self.env, capture_output=True, text=True, check=True, timeout=5,
+        ).stdout
 
     def click_header(self, x: int = 110) -> None:
         data = f"\x1b[<0;{x};1M\x1b[<0;{x};1m".encode()
@@ -186,7 +211,10 @@ class NativeSession:
                 last_state = "No panes returned"
                 return False
             panes = json.loads(output)
-            tool = next((pane for pane in panes if "panes tool settings" in (pane.get("pane_command") or "")), None)
+            tool = next(
+                (pane for pane in panes if "tdnext.pane view settings" in (pane.get("pane_command") or "")),
+                None,
+            )
             if tool is None:
                 last_state = f"Settings tool pane missing: {output}"
                 return False
@@ -206,7 +234,7 @@ class NativeSession:
     def back_to(self, name: str) -> None:
         target = self.tab_id(name)
         panes = json.loads(self.action("list-panes", "--all", "--json"))
-        tool = next(pane for pane in panes if "panes tool settings" in (pane.get("pane_command") or ""))
+        tool = next(pane for pane in panes if "tdnext.pane view settings" in (pane.get("pane_command") or ""))
         pane_id = f"terminal_{tool['id']}"
         self.send_key("Escape")
 
@@ -246,3 +274,106 @@ class NativeSession:
                 terminate_tagged(self.tmux_name)
         if result.returncode:
             raise AssertionError(f"Cannot stop Zellij session {self.name}: {result.stderr!r}")
+
+
+def tiled_panes(session: NativeSession) -> list[dict]:
+    """Non-floating terminal panes across all tabs (content plus user panes)."""
+    panes = json.loads(session.action("list-panes", "--all", "--json"))
+    return [pane for pane in panes if not pane.get("is_plugin") and not pane.get("is_floating")]
+
+
+def assert_no_chrome_ptys(session: NativeSession) -> None:
+    """No pane may run a dead chrome command (header/sidebar/footer helpers)."""
+    panes = json.loads(session.action("list-panes", "--all", "--json"))
+    chrome = [
+        pane.get("pane_command") for pane in panes
+        if any(marker in (pane.get("pane_command") or "") for marker in CHROME_PANE_MARKERS)
+    ]
+    assert not chrome, f"chrome PTYs still running: {chrome!r}"
+
+
+def assert_no_chrome_processes(tmux_name: str) -> None:
+    """No tagged process may be a chrome helper (shortcut/open-header/panes)."""
+    found = []
+    for _pid, environ, command in tagged_processes(tmux_name):
+        if f"TDNEXT_TEST_SESSION={tmux_name}".encode() not in environ:
+            continue
+        text = b" ".join(command)
+        if any(marker in text for marker in CHROME_PROCESS_MARKERS):
+            found.append(text.decode("utf-8", "replace"))
+    assert not found, f"chrome helper processes still running: {found!r}"
+
+
+def assert_one_content_pty_per_tab(session: NativeSession) -> None:
+    """Every tab owns exactly one content PTY and no chrome PTY exists."""
+    assert_no_chrome_ptys(session)
+    tab_count = len(session.tabs())
+    assert len(tiled_panes(session)) == tab_count, (
+        f"expected one content PTY per tab: {len(tiled_panes(session))} panes for {tab_count} tabs"
+    )
+
+
+def chrome_header_text(session: NativeSession) -> str:
+    """Top terminal rows where the core draws the header with old labels."""
+    return "\n".join(session.terminal_text().splitlines()[:CHROME_HEADER_ROWS])
+
+
+def chrome_footer_text(session: NativeSession) -> str:
+    """Bottom terminal rows where the core draws the footer with old labels."""
+    return "\n".join(session.terminal_text().splitlines()[-CHROME_FOOTER_ROWS:])
+
+
+class StockSession(NativeSession):
+    """A general Zellij session started directly, bypassing the TDNext launcher.
+
+    The dedicated ``tdnext`` binary is mandatory for desktop startup, so a
+    stock session can no longer be produced through ``tdnext run``. Tests that
+    need a genuine stock session (coexistence, unbound-toggle behavior) start
+    one explicitly here: the stock server runs attached inside its own tmux
+    window under the shared test socket dir, and the usual action helpers
+    work unchanged through ``binary`` + ``ZELLIJ_SESSION_NAME``.
+    """
+
+    def __init__(self, env: dict[str, str], binary: str) -> None:
+        self.env = env
+        self.binary = binary
+        self.tmux_socket = env["TDNEXT_TEST_TMUX_SOCKET"]
+        self.tmux_name = f"tdnext-stock-{uuid.uuid4().hex}"
+        subprocess.run(
+            ["tmux", "-S", self.tmux_socket, "-f", "/dev/null", "new-session", "-d", "-s", self.tmux_name,
+             "-x", "120", "-y", "36", "-e", f"TDNEXT_TEST_SESSION={self.tmux_name}",
+             binary, "--session", f"stock-{uuid.uuid4().hex}"],
+            env=env, capture_output=True, check=True, timeout=5,
+        )
+        self.startup_diagnostics = "waiting for stock session attach"
+        try:
+            self.name = wait_for(lambda: attached_session(self.tmux_name, 1))
+            self.target_env = {**env, "ZELLIJ_SESSION_NAME": self.name}
+            wait_for(self._responsive)
+        except (AssertionError, OSError, ValueError, subprocess.SubprocessError) as exc:
+            try:
+                screen = subprocess.run(
+                    ["tmux", "-S", self.tmux_socket, "capture-pane", "-p", "-S", "-1000", "-t", self.tmux_name],
+                    env=env, capture_output=True, text=True, check=False, timeout=5,
+                )
+                terminal = f"stdout={screen.stdout!r}, stderr={screen.stderr!r}"
+            except (OSError, subprocess.SubprocessError) as diagnostic_error:
+                terminal = f"capture failed: {diagnostic_error}"
+            try:
+                self.stop_tmux()
+            finally:
+                terminate_tagged(self.tmux_name)
+            raise AssertionError(
+                f"Stock session did not attach: {self.startup_diagnostics}; "
+                f"terminal={terminal}"
+            ) from exc
+
+    def _responsive(self) -> bool:
+        result = subprocess.run(
+            [self.binary, "action", "list-panes"], capture_output=True, text=True,
+            env=self.target_env, check=False, timeout=5,
+        )
+        self.startup_diagnostics = (
+            f"panes: exit={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}"
+        )
+        return result.returncode == 0

@@ -3,16 +3,14 @@
 from typing import Final, Literal, assert_never
 
 from textual.app import ComposeResult
-from textual.containers import Vertical
 from textual.events import DescendantFocus, Resize
-from textual.message import Message
 from textual.widgets import Select, Static
 
-from tdnext.api import PluginContext
+from tdnext.api import PluginContext, SettingsControls
 from tdnext.core.errors import PluginError
-from tdnext.plugins.files.editor_preferences import EditorChoice, EditorPreferences, EditorPreferencesStore
+from tdnext.settings_ui import AppearanceField
 
-from .appearance import AppearanceField
+from .editor_preferences import EditorChoice, EditorPreferences, EditorPreferencesStore
 
 EDITOR_OPTIONS: Final[list[tuple[str, EditorChoice]]] = [
     ("Environment", "environment"), ("Neovim (nvim)", "nvim"), ("Vi (vi)", "vi"),
@@ -43,19 +41,15 @@ class EditorSelect(Select[EditorValue]):
             self.call_after_refresh(frame.scroll_visible, animate=False, immediate=True)
 
 
-class EditorControls(Vertical):
+class EditorControls(SettingsControls):
     DEFAULT_CSS = """
     EditorControls { height: auto; }
+    EditorControls #editor-title { height: 1; text-style: bold; }
     EditorControls #editor-help { height: auto; color: $text-muted; margin-top: 1; }
     EditorControls #editor-choice-frame.editor-expanded { height: auto; }
     EditorControls #editor-choice.-expanded { height: auto; }
     EditorControls #editor-choice > SelectOverlay { overlay: none; }
     """
-
-    class Feedback(Message):
-        def __init__(self, text: str) -> None:
-            super().__init__()
-            self.text = text
 
     def __init__(self, context: PluginContext) -> None:
         super().__init__()
@@ -69,6 +63,7 @@ class EditorControls(Vertical):
             return exc
 
     def compose(self) -> ComposeResult:
+        yield Static("File editor", id="editor-title")
         match self.preferences:
             case EditorPreferences(editor=editor):
                 options, value, disabled = EDITOR_OPTIONS, editor, False
@@ -84,7 +79,7 @@ class EditorControls(Vertical):
             )
         yield Static(EDITOR_HELP, id="editor-help", markup=False)
 
-    def refresh_preference(self) -> None:
+    def refresh_settings(self) -> None:
         previous = self.preferences
         self.preferences = self.read_preference()
         self.sync_selector()
@@ -111,7 +106,7 @@ class EditorControls(Vertical):
                 pass
             case unreachable:
                 assert_never(unreachable)
-        self.refresh_preference()
+        self.refresh_settings()
 
     def sync_selector(self) -> None:
         selector = self.query_one("#editor-choice", EditorSelect)

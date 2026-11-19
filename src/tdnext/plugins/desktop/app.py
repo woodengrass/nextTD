@@ -84,7 +84,9 @@ class DesktopApp(App[None]):
                     with ContentSwitcher(initial=f"view-{self.active_view}"):
                         for manifest, plugin in self.views:
                             yield Container(
-                                plugin.make_view(self.context), id=f"view-{manifest.id}", classes="plugin-view"
+                                plugin.make_view(PluginContext(
+                                    self.context.directory, self.context.manager, self.context.session, manifest.id
+                                )), id=f"view-{manifest.id}", classes="plugin-view"
                             )
         yield Static(id="shortcuts", markup=False)
 

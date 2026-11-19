@@ -9,8 +9,8 @@ from textual.widgets._select import SelectOverlay
 
 from tdnext.core.errors import PluginError
 from tdnext.plugins.desktop.tool import ToolPane
+from tdnext.plugins.files.editor_controls import EditorControls
 from tdnext.plugins.files.editor_preferences import EditorChoice, EditorPreferences, EditorPreferencesStore
-from tdnext.plugins.settings.editor import EditorControls
 from tdnext.plugins.settings.plugin import SettingsPlugin
 
 

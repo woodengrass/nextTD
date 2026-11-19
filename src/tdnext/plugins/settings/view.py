@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from functools import partial
 from typing import Literal
 
@@ -7,15 +8,16 @@ from textual.containers import Horizontal, HorizontalScroll, Vertical, VerticalS
 from textual.events import Resize
 from textual.widgets import Button, ContentSwitcher, DataTable, Select, Static
 
-from tdnext.api import CloseView, PluginContext
+from tdnext.api import CloseView, PluginContext, SettingsContributor, SettingsControls
+from tdnext.core.discovery import instantiate
 from tdnext.core.errors import InstallationConsentRequired, PluginError
 from tdnext.core.graph import dependants
+from tdnext.core.manager import PluginManager
 from tdnext.core.models import PluginState
 from tdnext.plugins.settings.styles import SETTINGS_CSS
 
 from .appearance import AppearanceControls
 from .dialogs import ConfirmPluginChange
-from .editor import EditorControls
 from .general_focus import GeneralFocus
 from .operations import Operation, OperationResult, apply_operation, protected_plugin_ids
 
@@ -35,11 +37,30 @@ class SettingsView(GeneralFocus):
     def __init__(self, context: PluginContext) -> None:
         super().__init__()
         self.context = context
+        self.uninstall_runner: Callable[[PluginManager, str], OperationResult] | None = None
         self.plugin_ids = sorted(context.manager.manifests)
         self.busy = False
         self.section: Section = "general"
-        self.appearance_feedback = "Icons: restart. Editor: next file open."
+        self.appearance_feedback = "Icon appearance changes apply after restarting the desktop."
         self.plugin_feedback = "Changes apply after restarting the desktop."
+        self.contributors: list[SettingsControls] = []
+        if context.session is None:
+            enabled = context.manager.store.read().enabled
+            manifests = [manifest for plugin_id, manifest in context.manager.manifests.items() if plugin_id in enabled]
+        else:
+            manifests = list(context.session.participants)
+        errors = []
+        for manifest in manifests:
+            if manifest.settings_contributor is False:
+                continue
+            try:
+                plugin = instantiate(manifest)
+                if isinstance(plugin, SettingsContributor):
+                    self.contributors.append(plugin.make_settings_controls(context))
+            except Exception as exc:  # noqa: BLE001 - isolate errors at the plugin extension boundary
+                errors.append(f"Cannot load settings for {manifest.id}: {exc}")
+        if errors:
+            self.appearance_feedback = "\n".join(errors)
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="settings-heading"):
@@ -56,9 +77,7 @@ class SettingsView(GeneralFocus):
                     yield Static(
                         "Compatibility uses plain text. Codicons requires a compatible Nerd Font.", id="general-help"
                     )
-                with Vertical(id="editor-group", classes="settings-group"):
-                    yield Static("File editor", id="editor-title")
-                    yield EditorControls(self.context)
+                yield from self.contributors
             with Vertical(id="settings-plugins", classes="settings-page"):
                 yield Static(
                     "Manage trusted local plugins.\ni Install  e Enable  d Disable   u Uninstall",
@@ -70,7 +89,6 @@ class SettingsView(GeneralFocus):
                     yield Button("Install", id="plugin-install")
                     yield Button("Enable", id="plugin-enable")
                     yield Button("Disable", id="plugin-disable")
-                    yield Button("Uninstall", id="plugin-uninstall")
         with VerticalScroll(id="settings-feedback-scroll"):
             yield Static("Changes apply after restarting the desktop.", id="plugin-feedback", markup=False)
 
@@ -115,7 +133,7 @@ class SettingsView(GeneralFocus):
         if self.section == "general":
             self.show_feedback(event.text)
 
-    def on_editor_controls_feedback(self, event: EditorControls.Feedback) -> None:
+    def on_settings_controls_feedback(self, event: SettingsControls.Feedback) -> None:
         self.appearance_feedback = event.text
         if self.section == "general":
             self.show_feedback(event.text)
@@ -168,7 +186,7 @@ class SettingsView(GeneralFocus):
                 button.disabled = True
             return
         manifest = self.context.manager.manifests.get(target)
-        protected_ids = protected_plugin_ids(self.context.manager, self.context.session)
+        protected_ids = protected_plugin_ids(self.context.manager, self.context.session, self.context.view_id)
         protected = target in protected_ids or bool(
             dependants(self.context.manager.manifests, target, state.enabled) & protected_ids
         )
@@ -177,27 +195,35 @@ class SettingsView(GeneralFocus):
             target, "Plugin manifest is missing; disable or uninstall."
         )
         if protected:
-            detail = f"Protected (running Desktop / Settings): {detail}"
+            detail = f"Cannot disable while running: {detail}"
         self.query_one("#plugin-detail", Static).update(detail)
-        self.query_one("#plugin-install", Button).disabled = self.busy or manifest is None or target in state.installed
+        install = self.query_one("#plugin-install", Button)
+        installed = target in state.installed
+        install.label = "Uninstall" if installed else "Install"
+        install.disabled = self.busy or (not installed and manifest is None)
+        install.set_class(installed, "uninstall")
         self.query_one("#plugin-enable", Button).disabled = self.busy or manifest is None or target in state.enabled
         self.query_one("#plugin-disable", Button).disabled = self.busy or target not in state.enabled or protected
-        self.query_one("#plugin-uninstall", Button).disabled = self.busy or target not in state.installed or protected
 
     def on_data_table_row_highlighted(self, _event: DataTable.RowHighlighted) -> None:
         self.refresh_selection(self.context.manager.store.read())
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        event.stop()
         actions: dict[str, Operation] = {
-            "plugin-install": "install", "plugin-enable": "enable",
-            "plugin-disable": "disable", "plugin-uninstall": "uninstall",
+            "plugin-enable": "enable", "plugin-disable": "disable",
         }
         sections: dict[str, Section] = {"section-general": "general", "section-plugins": "plugins"}
+        if event.button.id not in {*actions, *sections, "settings-back", "plugin-install"}:
+            return
+        event.stop()
         if event.button.id == "settings-back":
             self.action_back()
         elif event.button.id in sections:
             self.set_section(sections[event.button.id])
+        elif event.button.id == "plugin-install":
+            target = self.selected_plugin()
+            operation: Operation = "uninstall" if target in self.context.manager.store.read().installed else "install"
+            self.request_operation(operation)
         elif event.button.id in actions:
             self.request_operation(actions[event.button.id])
 
@@ -205,12 +231,20 @@ class SettingsView(GeneralFocus):
         if self.section != "plugins":
             return
         target = self.selected_plugin()
-        if target is None or self.query_one(f"#plugin-{operation}", Button).disabled:
+        button_id = "plugin-install" if operation in ("install", "uninstall") else f"plugin-{operation}"
+        installed = target in self.context.manager.store.read().installed
+        if target is None or self.query_one(f"#{button_id}", Button).disabled or (
+            operation == "install" and installed or operation == "uninstall" and not installed
+        ):
             return
         affected = dependants(self.context.manager.manifests, target, self.context.manager.store.read().enabled)
         others = sorted(affected - {target})
         if operation == "uninstall" or (operation == "disable" and others):
             details = f"{target}: " + (f"also disables {', '.join(others)}." if others else "remove installed state.")
+            if operation == "uninstall":
+                details += (
+                    " Uninstalling requires ending all TDNext sessions and their processes; unsaved work will be lost."
+                )
             self.app.push_screen(
                 ConfirmPluginChange(f"{operation.title()} {target}?", details, operation.title()),
                 partial(self.confirm_operation, operation, target),
@@ -232,7 +266,10 @@ class SettingsView(GeneralFocus):
         self, operation: Operation, target: str, approved: tuple[tuple[str, str], ...] = ()
     ) -> None:
         try:
-            result = apply_operation(self.context.manager, operation, target, approved, self.context.session)
+            result = apply_operation(
+                self.context.manager, operation, target, approved, self.context.session, view_id=self.context.view_id,
+                uninstall_runner=self.uninstall_runner,
+            )
         except InstallationConsentRequired as exc:
             self.app.call_from_thread(self.request_install_consent, operation, target, exc)
         except PluginError as exc:

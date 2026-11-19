@@ -50,7 +50,9 @@ def fake_btop(state: Path) -> Path:
 
 def probe_view(tmp_path: Path, state: Path) -> None:
     """Write a view probe that uses bare ``btop`` at import/init/runtime."""
-    (tmp_path / "probeview_mod.py").write_text(
+    plugin_dir = state / "plugins" / "probeview"
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    code = (
         "import os\n"
         "import subprocess\n"
         "from pathlib import Path\n"
@@ -66,11 +68,12 @@ def probe_view(tmp_path: Path, state: Path) -> None:
         "        return super().make_view(context)\n"
         "    def run_pane(self, context):\n"
         "        subprocess.run(['btop', '--version'], check=True, capture_output=True)\n"
-        "        print('PANE_VIEW_RUNTIME_OK', flush=True)\n",
-        encoding="utf-8",
+        "        print('PANE_VIEW_RUNTIME_OK', flush=True)\n"
     )
-    plugin_dir = state / "plugins" / "probeview"
-    plugin_dir.mkdir(parents=True, exist_ok=True)
+    # Owned copy beside plugin.toml is the managed-install source of truth;
+    # tmp_path copy keeps session snapshot manifests importable via PYTHONPATH.
+    (plugin_dir / "probeview_mod.py").write_text(code, encoding="utf-8")
+    (tmp_path / "probeview_mod.py").write_text(code, encoding="utf-8")
     (plugin_dir / "plugin.toml").write_text(
         "id = \"probeview\"\nname = \"Probe\"\nversion = \"0.1.0\"\n"
         "description = \"probe\"\nentrypoint = \"probeview_mod:Probe\"\n"
@@ -84,7 +87,9 @@ def probe_view(tmp_path: Path, state: Path) -> None:
 
 def probe_provider(tmp_path: Path, state: Path) -> None:
     """Write a provider probe that uses bare ``btop`` at import/init/resolve."""
-    (tmp_path / "probeicons_mod.py").write_text(
+    plugin_dir = state / "plugins" / "probeicons"
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    code = (
         "import os\n"
         "import subprocess\n"
         "from pathlib import Path\n"
@@ -98,11 +103,10 @@ def probe_provider(tmp_path: Path, state: Path) -> None:
         "        subprocess.run(['btop', '--version'], check=True, capture_output=True)\n"
         "        if os.environ.get('TDNEXT_TEST_RESOLVE_MARKER'):\n"
         "            Path(os.environ['TDNEXT_TEST_RESOLVE_MARKER']).write_text('resolved')\n"
-        "        return '[]'\n",
-        encoding="utf-8",
+        "        return '[]'\n"
     )
-    plugin_dir = state / "plugins" / "probeicons"
-    plugin_dir.mkdir(parents=True, exist_ok=True)
+    (plugin_dir / "probeicons_mod.py").write_text(code, encoding="utf-8")
+    (tmp_path / "probeicons_mod.py").write_text(code, encoding="utf-8")
     (plugin_dir / "plugin.toml").write_text(
         "id = \"probeicons\"\nname = \"ProbeIcons\"\nversion = \"0.1.0\"\n"
         "description = \"probe\"\nentrypoint = \"probeicons_mod:Probe\"\n"
@@ -117,12 +121,11 @@ def run_child(args: list[str], env: dict[str, str], timeout: int = 60) -> subpro
     return subprocess.run(args, capture_output=True, text=True, env=env, check=False, timeout=timeout)
 
 
-def probe_token() -> str:
-    """Build a session token embedding the view probe manifest."""
-    manifest = PluginManifest(
-        id="probeview", name="Probe", version="0.1.0", description="probe",
-        entrypoint="probeview_mod:Probe", requires_executables=("btop",),
-        capabilities=("desktop.view", "files.browse"),
-        view_interfaces=("tdnext.textual-view.v1",),
-    )
-    return session_token(SessionSnapshot(views=(SessionView(manifest=manifest, icon="[]"),)))
+def probe_token(manifest: PluginManifest) -> str:
+    """Build a session token embedding the installed probe manifest."""
+    return session_token(SessionSnapshot(
+        views=(SessionView(manifest=manifest, icon="[]"),),
+        protected_plugins=frozenset(),
+        view_dependencies={"probeview": frozenset({"probeview"})},
+        participants=(manifest,),
+    ))

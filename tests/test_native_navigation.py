@@ -1,8 +1,22 @@
+import fcntl
 import json
+import os
+import pty
+import struct
+import subprocess
+import sys
+import termios
 from pathlib import Path
 
 from native_environment import native_env as native_env
-from native_session import NativeSession, wait_for
+from native_session import (
+    NativeSession,
+    assert_no_chrome_processes,
+    assert_no_chrome_ptys,
+    chrome_header_text,
+    wait_for,
+)
+from test_fallback_footer_pty import read_until
 
 
 def test_native_settings_returns_to_exact_tab_without_restarting_btop(
@@ -19,6 +33,8 @@ def test_native_settings_returns_to_exact_tab_without_restarting_btop(
         session.open_settings()
         session.back_to("Monitor")
         assert session.btop_pid() == pid
+        assert_no_chrome_ptys(session)
+        assert_no_chrome_processes(session.tmux_name)
     finally:
         session.close()
 
@@ -45,10 +61,8 @@ def test_native_header_responds_to_mouse(tmp_path: Path, native_env: tuple[dict[
     env, binary = native_env
     session = NativeSession(tmp_path, env, binary)
     try:
-        panes = json.loads(session.action("list-panes", "--all", "--json"))
-        header = next(pane for pane in panes if "panes header files" in (pane.get("pane_command") or ""))
-        pane_id = f"terminal_{header['id']}"
-        wait_for(lambda: "Settings" in session.action("dump-screen", "--pane-id", pane_id))
+        wait_for(lambda: "Settings" in chrome_header_text(session))
+        assert_no_chrome_ptys(session)
         session.click_header()
         target = session.tab_id("tdnext-header:settings")
         wait_for(lambda: session.active_tab() == target)
@@ -61,13 +75,12 @@ def test_native_header_clicks_only_activate_actions(tmp_path: Path, native_env: 
     env, binary = native_env
     session = NativeSession(tmp_path, env, binary)
     try:
-        panes = json.loads(session.action("list-panes", "--all", "--json"))
-        header = next(pane for pane in panes if "panes header files" in (pane.get("pane_command") or ""))
-        pane_id = f"terminal_{header['id']}"
-        wait_for(lambda: "Settings" in session.action("dump-screen", "--pane-id", pane_id))
-        files = next(pane for pane in panes if "tdnext.pane view files" in (pane.get("pane_command") or ""))
+        wait_for(lambda: "Settings" in chrome_header_text(session))
+        files = next(pane for pane in json.loads(
+            session.action("list-panes", "--all", "--json")
+        ) if "tdnext.pane view files" in (pane.get("pane_command") or ""))
         session.header_mouse(5, release=False)
-        wait_for(lambda: pane_id in session.action("list-clients"))
+        wait_for(lambda: f"terminal_{files['id']}" in session.action("list-clients"))
         session.header_mouse(5, release=True)
         wait_for(lambda: f"terminal_{files['id']}" in session.action("list-clients"))
         assert session.active_tab() == session.tab_id("Files")
@@ -76,3 +89,39 @@ def test_native_header_clicks_only_activate_actions(tmp_path: Path, native_env: 
         session.back_to("Files")
     finally:
         session.close()
+
+
+def test_native_small_session_lifecycle(tmp_path: Path, native_env: tuple[dict[str, str], str]) -> None:
+    """An 80x24 terminal keeps the direct-mode fallback lifecycle without a nested Zellij session."""
+    env, binary = native_env
+    before = subprocess.run(
+        [binary, "list-sessions", "--no-formatting"],
+        capture_output=True, text=True, env=env, check=False, timeout=5,
+    ).stdout
+    before_sessions = {line.split()[0] for line in before.splitlines() if line.strip()}
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+    process = subprocess.Popen(
+        [sys.executable, "-m", "tdnext", "run", str(tmp_path)],
+        stdin=slave, stdout=slave, stderr=slave, env=env,
+    )
+    os.close(slave)
+    try:
+        read_until(master, "WORKSPACE", "Tool (Files):", "Global:", "Ctrl+q")
+        os.write(master, b"\x1bo")
+        read_until(master, "Tool (Settings):", "Esc Back")
+        os.write(master, b"\x1b")
+        read_until(master, "Tool (Files):")
+        os.write(master, b"\x11")
+        assert process.wait(timeout=10) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        os.close(master)
+    after = subprocess.run(
+        [binary, "list-sessions", "--no-formatting"],
+        capture_output=True, text=True, env=env, check=False, timeout=5,
+    ).stdout
+    after_sessions = {line.split()[0] for line in after.splitlines() if line.strip()}
+    assert after_sessions == before_sessions

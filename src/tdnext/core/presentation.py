@@ -45,4 +45,16 @@ def snapshot_views(
                 # A trusted extension can fail on an individual key; navigation must survive it.
                 icon = manifest.icon or "[]"
         snapshot.append(SessionView(manifest=manifest, icon=icon))
-    return SessionSnapshot(views=tuple(snapshot))
+    hosts = [
+        manager.manifests[name] for name in sorted(state.enabled)
+        if name in manager.manifests and manager.manifests[name].role == "desktop.host"
+    ]
+    protected = frozenset(dependency_order(manager.manifests, hosts[0].id)) if len(hosts) == 1 else frozenset()
+    return SessionSnapshot(
+        views=tuple(snapshot),
+        protected_plugins=protected,
+        view_dependencies={
+            manifest.id: frozenset(dependency_order(manager.manifests, manifest.id)) for manifest, _ in views
+        },
+        participants=tuple(manager.manifests[name] for name in sorted(state.enabled) if name in manager.manifests),
+    )

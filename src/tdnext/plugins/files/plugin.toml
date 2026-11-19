@@ -1,13 +1,15 @@
 id = "files"
 manifest_version = 1
 api_version = 1
-view_interfaces = ["tdnext.textual-view.v1"]
+view_interfaces = ["tdnext.textual-view.v1", "tdnext.terminal-view.v1"]
 name = "Files"
 version = "0.1.0"
 description = "Browse and manage local files"
 entrypoint = "tdnext.plugins.files.plugin:FilesPlugin"
 icon = "▤"
 icon_key = "files"
+shortcuts = "Enter open   Backspace up   ? help   v preview   b folders   g path   n folder   r rename   y/x/p copy/move   d delete"
+settings_contributor = true
 capabilities = ["desktop.view", "files.browse"]
 requires_plugins = []
 requires_executables = []

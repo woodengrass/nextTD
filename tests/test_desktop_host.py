@@ -1,6 +1,9 @@
+import json
 import os
 import shutil
 import subprocess
+from dataclasses import replace
+from importlib import import_module
 from pathlib import Path
 
 import pytest
@@ -10,10 +13,11 @@ from tdnext import launcher, pane
 from tdnext.api import PluginContext, ViewPlugin
 from tdnext.core.discovery import discover
 from tdnext.core.manager import PluginManager
-from tdnext.core.models import PluginManifest, PluginState
+from tdnext.core.models import PluginManifest
+from tdnext.core.session import SessionSnapshot, SessionView
 from tdnext.core.state import StateStore
 from tdnext.plugins.desktop import panes as desktop_panes
-from tdnext.plugins.desktop.app import DesktopApp
+from tdnext.plugins.desktop import plugin as desktop_plugin
 from tdnext.plugins.desktop.plugin import DesktopPlugin
 from tdnext.plugins.files.plugin import FilesPlugin
 from tdnext.plugins.monitor.plugin import MonitorPlugin
@@ -34,10 +38,12 @@ def test_configured_desktop_controls_launch_at_any_terminal_size(
     workspace.mkdir()
     state = tmp_path / "state"
     manifests = discover((Path(__file__).parents[1] / "src" / "tdnext" / "plugins",))
-    manifests["desktop"] = manifests["desktop"].model_copy(update={"entrypoint": f"{__name__}:SubstituteDesktop"})
+    manifests["desktop"] = manifests["desktop"].model_copy(
+        update={"entrypoint": f"{__name__}:SubstituteDesktop", "source_dir": None}
+    )
     store = StateStore(state / "plugins.json")
-    store.write(PluginState(installed=frozenset({"desktop", "files"}), enabled=frozenset({"desktop", "files"})))
     plugins = PluginManager(manifests, store, state / "bin")
+    plugins.enable("files")
     monkeypatch.setattr(launcher, "manager", lambda: plugins)
     monkeypatch.setattr(plugins, "executable", lambda name: "/fake/zellij" if name == "zellij" else None)
     monkeypatch.setattr(shutil, "get_terminal_size", lambda fallback: os.terminal_size(size))
@@ -64,49 +70,97 @@ def default_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PluginCo
         update={"requires_executables": (), "dependency_hook": None}
     )
     store = StateStore(state / "plugins.json")
-    ids = frozenset({"desktop", "files", "monitor"})
-    store.write(PluginState(installed=ids, enabled=ids))
     plugins = PluginManager(manifests, store, state / "bin")
+    plugins.enable("files")
+    plugins.enable("monitor")
     monkeypatch.setenv("TDNEXT_STATE_DIR", str(state))
     return PluginContext(tmp_path, plugins)
 
 
-def test_bundled_host_builds_native_layout_with_view_rail_and_footer(
+def test_bundled_host_passes_shared_chrome_and_single_pane_tabs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     context = default_context(tmp_path, monkeypatch)
     views: list[tuple[PluginManifest, ViewPlugin]] = [
+        (context.manager.manifests["settings"], FilesPlugin()),
         (context.manager.manifests["files"], FilesPlugin()),
         (context.manager.manifests["monitor"], MonitorPlugin()),
     ]
-    launched: list[tuple[list[str], dict[str, str]]] = []
+    session = SessionSnapshot(
+        views=tuple(SessionView(manifest=manifest, icon="X") for manifest, _ in views),
+        protected_plugins=frozenset(), view_dependencies={}, participants=tuple(manifest for manifest, _ in views),
+    )
+    context = replace(context, session=session)
+    launched: list[tuple[list[str], dict[str, str], str, list[dict[str, str]]]] = []
     fallback: list[bool] = []
 
     def run_zellij(
         command: list[str], *, env: dict[str, str], check: bool
     ) -> subprocess.CompletedProcess[str]:
         assert check is False
-        launched.append((command, env))
+        assert "--layout-string" not in command
+        layout_path = Path(command[command.index("--new-session-with-layout") + 1])
+        assert layout_path.name == "layout.kdl"
+        chrome_path = Path(env["TDNEXT_CHROME_FILE"])
+        assert chrome_path.parent == Path(command[command.index("--config-dir") + 1])
+        chrome = json.loads(chrome_path.read_text(encoding="utf-8"))
+        launched.append((command, env, layout_path.read_text(encoding="utf-8"), chrome))
         return subprocess.CompletedProcess(command, 0)
 
-    monkeypatch.setattr(context.manager, "executable", lambda name: "/fake/zellij")
+    monkeypatch.setattr(desktop_plugin, "core_capable_binary", lambda: Path("/fake/tdnext"))
     monkeypatch.setattr(shutil, "get_terminal_size", lambda fallback: os.terminal_size((120, 36)))
     monkeypatch.setattr(subprocess, "run", run_zellij)
-    monkeypatch.setattr(DesktopApp, "run", lambda self: fallback.append(True))
+    monkeypatch.setattr(
+        import_module("tdnext.plugins.desktop.app").DesktopApp, "run", lambda self: fallback.append(True)
+    )
     monkeypatch.delenv("ZELLIJ", raising=False)
 
     DesktopPlugin().run(context, views)
 
     assert fallback == []
     assert len(launched) == 1
-    command, env = launched[0]
-    layout = command[command.index("--layout-string") + 1]
-    assert 'args "-m" "tdnext.plugins.desktop.panes" "sidebar" "monitor"' in layout
+    command, env, layout, chrome = launched[0]
+    assert command[0] == "/fake/tdnext"
+    assert 'args "-m" "tdnext.pane" "view" "files"' in layout
     assert 'args "-m" "tdnext.pane" "view" "monitor"' in layout
-    assert 'args "-m" "tdnext.plugins.desktop.panes" "footer" "monitor"' in layout
+    assert 'args "-m" "tdnext.pane" "view" "settings"' in layout
+    assert layout.count("pane ") == 3
+    assert layout.count('"--snapshot"') == 3
+    assert chrome == [
+        {"id": manifest.id, "name": manifest.name, "icon": "X", "shortcuts": plugin.shortcuts,
+         "placement": manifest.placement,
+         "tab_name": f"tdnext-header:{manifest.id}" if manifest.placement == "header" else manifest.name}
+        for manifest, plugin in [*views[1:], views[0]]
+    ]
     assert Path(command[command.index("--config") + 1]).name == "zellij.kdl"
     assert env["TDNEXT_DIRECTORY"] == str(tmp_path)
-    assert env["TDNEXT_ZELLIJ"] == "/fake/zellij"
+    assert env["TDNEXT_ZELLIJ"] == "/fake/tdnext"
+
+
+def test_empty_native_desktop_uses_empty_chrome_without_textual_panes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = default_context(tmp_path, monkeypatch)
+    captured: list[tuple[str, str]] = []
+
+    def run_zellij(command: list[str], *, env: dict[str, str], check: bool) -> subprocess.CompletedProcess[str]:
+        assert check is False
+        layout = Path(command[command.index("--new-session-with-layout") + 1]).read_text(encoding="utf-8")
+        chrome = Path(env["TDNEXT_CHROME_FILE"]).read_text(encoding="utf-8")
+        captured.append((layout, chrome))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(desktop_plugin, "core_capable_binary", lambda: Path("/fake/tdnext"))
+    monkeypatch.setattr(shutil, "get_terminal_size", lambda fallback: os.terminal_size((120, 36)))
+    monkeypatch.setattr(subprocess, "run", run_zellij)
+    monkeypatch.delenv("ZELLIJ", raising=False)
+
+    DesktopPlugin().run(context, [])
+
+    layout, chrome = captured[0]
+    assert json.loads(chrome) == []
+    assert "tdnext.plugins.desktop.panes" not in layout
+    assert "signal.pause()" in layout
 
 
 @pytest.mark.parametrize("failure", ["exit", "oserror"])
@@ -122,10 +176,13 @@ def test_bundled_host_falls_back_when_native_launch_fails(
             raise OSError("cannot start")
         return subprocess.CompletedProcess(command, 1)
 
-    monkeypatch.setattr(context.manager, "executable", lambda name: "/fake/zellij")
+    monkeypatch.setattr(desktop_plugin, "core_capable_binary", lambda: Path("/fake/tdnext"))
     monkeypatch.setattr(shutil, "get_terminal_size", lambda fallback: os.terminal_size((120, 36)))
     monkeypatch.setattr(subprocess, "run", run_zellij)
-    monkeypatch.setattr(DesktopApp, "run", lambda self: fallback.append(self.context.directory))
+    monkeypatch.setattr(
+        import_module("tdnext.plugins.desktop.app").DesktopApp, "run",
+        lambda self: fallback.append(self.context.directory),
+    )
     monkeypatch.delenv("ZELLIJ", raising=False)
 
     DesktopPlugin().run(context, views)
@@ -133,7 +190,7 @@ def test_bundled_host_falls_back_when_native_launch_fails(
     assert fallback == [tmp_path]
 
 
-@pytest.mark.parametrize("condition", ["narrow", "short", "nested", "missing"])
+@pytest.mark.parametrize("condition", ["narrow", "short", "nested"])
 def test_bundled_host_uses_fullscreen_when_native_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, condition: str
 ) -> None:
@@ -148,10 +205,13 @@ def test_bundled_host_uses_fullscreen_when_native_is_unavailable(
         launched.append(command)
         return subprocess.CompletedProcess(command, 0)
 
-    monkeypatch.setattr(context.manager, "executable", lambda name: None if condition == "missing" else "/fake/zellij")
+    monkeypatch.setattr(desktop_plugin, "core_capable_binary", lambda: Path("/fake/tdnext"))
     monkeypatch.setattr(shutil, "get_terminal_size", lambda fallback: os.terminal_size(size))
     monkeypatch.setattr(subprocess, "run", run_zellij)
-    monkeypatch.setattr(DesktopApp, "run", lambda self: fallback.append(self.context.directory))
+    monkeypatch.setattr(
+        import_module("tdnext.plugins.desktop.app").DesktopApp, "run",
+        lambda self: fallback.append(self.context.directory),
+    )
     monkeypatch.delenv("ZELLIJ", raising=False)
     if condition == "nested":
         monkeypatch.setenv("ZELLIJ", "1")
@@ -160,6 +220,28 @@ def test_bundled_host_uses_fullscreen_when_native_is_unavailable(
 
     assert fallback == [tmp_path]
     assert launched == []
+
+
+def test_bundled_host_refuses_start_when_core_missing_or_unusable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tdnext.core.errors import PluginError
+
+    context = default_context(tmp_path, monkeypatch)
+    views: list[tuple[PluginManifest, ViewPlugin]] = [(context.manager.manifests["files"], FilesPlugin())]
+    fallback: list[Path] = []
+    monkeypatch.setattr(desktop_plugin, "core_capable_binary", lambda: None)
+    monkeypatch.setattr(shutil, "get_terminal_size", lambda fallback: os.terminal_size((120, 36)))
+    monkeypatch.setattr(
+        import_module("tdnext.plugins.desktop.app").DesktopApp, "run",
+        lambda self: fallback.append(self.context.directory),
+    )
+    monkeypatch.delenv("ZELLIJ", raising=False)
+
+    with pytest.raises(PluginError, match="tdnext executable missing or unusable"):
+        DesktopPlugin().run(context, views)
+
+    assert fallback == []
 
 
 def test_native_view_command_executes_real_monitor_plugin(

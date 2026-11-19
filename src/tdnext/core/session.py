@@ -23,7 +23,9 @@ class SessionSnapshot(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     views: tuple[SessionView, ...]
-    protected_plugins: frozenset[str] | None = None
+    protected_plugins: frozenset[str]
+    view_dependencies: dict[str, frozenset[str]]
+    participants: tuple[PluginManifest, ...]
 
     def icon_for(self, plugin_id: str) -> str | None:
         return next((view.icon for view in self.views if view.manifest.id == plugin_id), None)
@@ -44,6 +46,15 @@ def current_session(token: str | None = None) -> SessionSnapshot | None:
     if raw is None:
         return None
     try:
-        return SessionSnapshot.model_validate_json(raw)
+        snapshot = SessionSnapshot.model_validate_json(raw)
     except ValidationError as exc:
         raise PluginError(f"Invalid desktop session snapshot: {exc}") from exc
+    # source_dir is excluded from the wire format, so a code-less manifest
+    # would silently fall back to the source tree for an uninstalled plugin.
+    for manifest in (*snapshot.participants, *(view.manifest for view in snapshot.views)):
+        if manifest.code is None:
+            raise PluginError(
+                f"Invalid desktop session snapshot: plugin {manifest.id} has no managed code; "
+                f"run tdnext install {manifest.id}"
+            )
+    return snapshot

@@ -1,4 +1,6 @@
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -7,8 +9,14 @@ from tdnext import launcher
 from tdnext.core.discovery import discover
 from tdnext.core.manager import PluginManager
 from tdnext.core.models import PluginState
+from tdnext.core.removal import RemovalRequest
 from tdnext.core.state import StateStore
 from tdnext.plugins.shell.launch import exec_shell
+
+
+@contextmanager
+def allow_removal(request: RemovalRequest) -> Iterator[tuple[str, ...]]:
+    yield ()
 
 
 def test_shell_executes_the_configured_shell_in_the_requested_directory(
@@ -33,7 +41,7 @@ def test_shell_lifecycle_is_independent_and_depends_on_desktop(tmp_path: Path) -
     root = Path(__file__).parents[1] / "src" / "tdnext" / "plugins"
     manifests = discover((root,))
     store = StateStore(tmp_path / "plugins.json")
-    plugins = PluginManager(manifests, store, tmp_path / "bin")
+    plugins = PluginManager(manifests, store, tmp_path / "bin", removal_guard=allow_removal)
     assert store.read() == PluginState()
     assert plugins.enable("shell") == ("desktop", "shell")
     assert [manifest.id for manifest, _ in launcher.enabled_views(plugins)] == ["shell"]

@@ -95,6 +95,19 @@ def _bootstrap_tmp_bin(
     bootstrap(state)
 
 
+def _install_real_plugins(manager: PluginManager) -> None:
+    """Replace make_app's source-only installed state with real managed copies.
+
+    make_app marks the discovered desktop/files/settings plugins installed
+    without staging managed code; any check_dependencies/enabled_views call
+    would then fail with "has no managed code". Installing them stages the
+    owned copies offline (no executables, hooks, or downloads involved) so
+    the tests exercise real discovered plugin loading.
+    """
+    for plugin_id in ("desktop", "files", "settings"):
+        manager.install(plugin_id)
+
+
 def _enable_with_consent(manager: PluginManager, plugin_id: str) -> None:
     """Mirror the CLI consent flow for the probe's plugin-owned installer."""
     try:
@@ -110,6 +123,7 @@ def test_local_binary_is_available_to_import_constructor_and_runtime(
     if not BTOP.is_file():
         pytest.skip("requires the existing project-local btop binary")
     app, manager = make_app(tmp_path)
+    _install_real_plugins(manager)
     name = f"tdnext_btop_probe_{role}"
     module = tmp_path / f"{name}.py"
     (tmp_path / f"{name}_deps.py").write_text(PROBE_DEPS_TEMPLATE, encoding="utf-8")
@@ -126,7 +140,7 @@ def test_local_binary_is_available_to_import_constructor_and_runtime(
         manifest = manager.manifests["files"].model_copy(update={
             "id": "probe", "entrypoint": f"{name}:Probe", "requires_plugins": (),
             "requires_executables": ("btop",),
-            "dependency_hook": hook,
+            "dependency_hook": hook, "source_dir": None, "code": None,
         })
     else:
         body = (
@@ -138,7 +152,7 @@ def test_local_binary_is_available_to_import_constructor_and_runtime(
         )
         manifest = manager.manifests["icons"].model_copy(update={
             "id": "probe", "entrypoint": f"{name}:Probe", "requires_executables": ("btop",),
-            "dependency_hook": hook,
+            "dependency_hook": hook, "source_dir": None, "code": None,
         })
     module.write_text(PROBE_HEADER + body, encoding="utf-8")
     manager.manifests = {**manager.manifests, manifest.id: manifest}
@@ -147,13 +161,15 @@ def test_local_binary_is_available_to_import_constructor_and_runtime(
     assert os.environ["PATH"] == str(manager.local_bin)
     _enable_with_consent(manager, "probe")
     assert os.environ["PATH"] == str(manager.local_bin)
+    instances: dict[str, object] = {}
+    views = enabled_views(manager, instances=instances)
     if role == "view":
-        plugin = next(plugin for item, plugin in enabled_views(manager) if item.id == "probe")
+        plugin = next(plugin for item, plugin in views if item.id == "probe")
         assert isinstance(plugin, ViewPlugin)
         assert plugin.make_view(app.context) is not None
     else:
         AppearanceStore(manager.store.path.with_name("appearance.json")).write(Appearance(provider_id="probe"))
-        assert snapshot_views(manager, app.views).icon_for("files") == "[]"
+        assert snapshot_views(manager, views, instances).icon_for("files") == "[]"
     assert os.environ["PATH"] == str(manager.local_bin)
     assert restored_env()["PATH"] == ""
 
@@ -164,10 +180,11 @@ def test_plugin_constructor_does_not_change_other_threads_path(
     if not BTOP.is_file():
         pytest.skip("requires the existing project-local btop binary")
     _app, manager = make_app(tmp_path)
+    _install_real_plugins(manager)
     install_btop("btop", manager.local_bin)
     manifest = manager.manifests["files"].model_copy(update={
         "id": "probe", "entrypoint": f"{__name__}:BlockingView", "requires_plugins": (),
-        "requires_executables": ("btop",),
+        "requires_executables": ("btop",), "source_dir": None, "code": None,
     })
     manager.manifests = {**manager.manifests, manifest.id: manifest}
     _bootstrap_tmp_bin(monkeypatch, request, tmp_path)
@@ -195,6 +212,7 @@ def test_local_binary_is_available_when_a_view_runs_after_construction(
     if not BTOP.is_file():
         pytest.skip("requires the existing project-local btop binary")
     app, manager = make_app(tmp_path)
+    _install_real_plugins(manager)
     install_btop("btop", manager.local_bin)
     name = "tdnext_runtime_btop_probe"
     module = tmp_path / f"{name}.py"
@@ -209,7 +227,7 @@ def test_local_binary_is_available_when_a_view_runs_after_construction(
     )
     manifest = manager.manifests["files"].model_copy(update={
         "id": "probe", "entrypoint": f"{name}:Probe", "requires_plugins": (),
-        "requires_executables": ("btop",),
+        "requires_executables": ("btop",), "source_dir": None, "code": None,
     })
     manager.manifests = {**manager.manifests, manifest.id: manifest}
     monkeypatch.syspath_prepend(str(tmp_path))

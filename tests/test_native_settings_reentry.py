@@ -3,11 +3,16 @@ from pathlib import Path
 
 import pytest
 from native_environment import native_env as native_env
-from native_session import NativeSession, wait_for
+from native_session import (
+    NativeSession,
+    assert_no_chrome_ptys,
+    chrome_footer_text,
+    chrome_header_text,
+    wait_for,
+)
 
 from tdnext.core.appearance import Appearance, AppearanceStore
-from tdnext.core.models import PluginState
-from tdnext.core.state import StateStore
+from tdnext.runtime import manager_for
 
 
 @pytest.mark.parametrize("route", ["header", "native-tab"])
@@ -16,9 +21,7 @@ def test_native_settings_refreshes_on_reentry_after_another_session_changes_appe
 ) -> None:
     env, binary = native_env
     state_dir = Path(env["TDNEXT_STATE_DIR"])
-    plugins = StateStore(state_dir / "plugins.json")
-    state = plugins.read()
-    plugins.write(PluginState(installed=state.installed | {"icons"}, enabled=state.enabled | {"icons"}))
+    manager_for(state_dir).enable("icons")
     appearance = AppearanceStore(state_dir / "appearance.json")
     first = NativeSession(tmp_path, env, binary)
     try:
@@ -29,7 +32,7 @@ def test_native_settings_refreshes_on_reentry_after_another_session_changes_appe
             first.back_to("Files")
             second.open_settings()
             panes = json.loads(second.action("list-panes", "--all", "--json"))
-            tool = next(item for item in panes if "panes tool settings" in (item.get("pane_command") or ""))
+            tool = next(item for item in panes if "tdnext.pane view settings" in (item.get("pane_command") or ""))
             pane_id = f"terminal_{tool['id']}"
             second.send_key("Enter")
             wait_for(lambda: (screen := second.action("dump-screen", "--pane-id", pane_id)).count("None (text)") >= 2
@@ -51,15 +54,18 @@ def test_native_settings_refreshes_on_reentry_after_another_session_changes_appe
                 first.action("go-to-tab-by-id", str(first.tab_id("tdnext-header:settings")))
                 first.wait_for_settings()
             panes = json.loads(first.action("list-panes", "--all", "--json"))
-            tool = next(item for item in panes if "panes tool settings" in (item.get("pane_command") or ""))
+            tool = next(item for item in panes if "tdnext.pane view settings" in (item.get("pane_command") or ""))
             first_pane = f"terminal_{tool['id']}"
             screen = wait_for(lambda: (text if "Provider: Codicons" in (text := first.action(
                 "dump-screen", "--pane-id", first_pane
             )) and "Style: Codicons" in text else ""), timeout=3)
             assert "Provider: Codicons" in screen and "Style: Codicons" in screen
             assert first.btop_pid() == monitor
-            sidebar = next(item for item in panes if "panes sidebar files" in (item.get("pane_command") or ""))
-            assert "▤" in first.action("dump-screen", "--pane-id", f"terminal_{sidebar['id']}")
+            assert "Settings" in chrome_header_text(first)
+            # Settings is its own tab in stage 3, so the footer tool
+            # section names Settings while it is focused.
+            assert "Tool (Settings):" in chrome_footer_text(first)
+            assert_no_chrome_ptys(first)
         finally:
             second.close()
     finally:

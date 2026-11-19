@@ -1,4 +1,5 @@
-from dataclasses import replace
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
 
@@ -13,11 +14,13 @@ from tdnext.core.discovery import discover
 from tdnext.core.errors import InstallationConsentRequired, PluginError
 from tdnext.core.manager import PluginManager
 from tdnext.core.models import PluginManifest, PluginState
+from tdnext.core.plugin_code import InstalledCode
+from tdnext.core.removal import RemovalRequest
 from tdnext.core.session import SessionSnapshot, SessionView, current_session, session_token
 from tdnext.core.state import StateStore
 from tdnext.plugins.desktop.app import DesktopApp
 from tdnext.plugins.monitor import dependencies as monitor_dependencies
-from tdnext.plugins.settings.operations import apply_operation
+from tdnext.plugins.settings.operations import OperationResult, apply_operation
 from tdnext.plugins.settings.plugin import SettingsPlugin
 from tdnext.plugins.settings.view import SettingsView
 
@@ -52,17 +55,29 @@ def make_manager(tmp_path: Path) -> PluginManager:
     return PluginManager(discover((BUILTINS,)), StateStore(tmp_path / "plugins.json"), tmp_path / "bin")
 
 
+@contextmanager
+def allow_removal(request: RemovalRequest) -> Iterator[tuple[str, ...]]:
+    yield ()
+
+
+def break_downloads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace curl with a failing script: installs run their staged copy's
+    real installer, so a guard that fails the test must sit at the download
+    itself rather than on the live source module the copy was staged from."""
+    curl = tmp_path / "failing-bin" / "curl"
+    curl.parent.mkdir()
+    curl.write_text("#!/bin/sh\necho mocked curl failure >&2\nexit 1\n", encoding="utf-8")
+    curl.chmod(0o755)
+    monkeypatch.setenv("PATH", str(curl.parent))
+
+
 def test_cli_consent_identifies_verified_download_and_denial_has_no_effect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager = make_manager(tmp_path)
     monkeypatch.setattr(cli, "manager", lambda: manager)
     monkeypatch.setattr(manager, "executable", lambda _name: None)
-
-    def forbidden(*_args: object) -> Path:
-        pytest.fail("installer ran without consent")
-
-    monkeypatch.setattr("tdnext.plugins.monitor.dependencies.install_release", forbidden)
+    break_downloads(tmp_path, monkeypatch)
     result = CliRunner().invoke(cli.cli, ["install", "monitor"], input="n\n")
     assert "https://github.com/aristocratos/btop/releases/download/v1.4.8/" in result.output
     assert str(tmp_path / "bin" / "btop") in result.output
@@ -77,10 +92,7 @@ def test_consent_for_one_destination_does_not_approve_another(
 ) -> None:
     manager = make_manager(tmp_path)
     monkeypatch.setattr(manager, "executable", lambda _name: None)
-    def forbidden(*_args: object) -> Path:
-        pytest.fail("installer ran with stale consent")
-
-    monkeypatch.setattr("tdnext.plugins.monitor.dependencies.install_release", forbidden)
+    break_downloads(tmp_path, monkeypatch)
     with pytest.raises(InstallationConsentRequired) as original:
         manager.install("monitor")
     manager.local_bin = tmp_path / "other-bin"
@@ -90,21 +102,54 @@ def test_consent_for_one_destination_does_not_approve_another(
     assert not manager.store.path.exists()
 
 
+class FixtureRelease:
+    """Test-local release hook: the staged managed copy of a real plugin is a
+    file copy, so release fields can only be varied on a synthetic double whose
+    hook is imported live from this module."""
+
+    url = "https://example.com/fixture-tool.tar.gz"
+    sha256 = "aaa"
+    member = "tool"
+
+    @staticmethod
+    def check(manager: PluginManager) -> str | None:
+        if (manager.local_bin / "installed").exists():
+            return None
+        release = FixtureRelease
+        return (
+            f"Download fixture tool from {release.url}; SHA-256 {release.sha256}; "
+            f"extract {release.member}; install to {manager.local_bin / 'installed'}"
+        )
+
+    @staticmethod
+    def install(manager: PluginManager) -> Path:
+        manager.local_bin.mkdir(parents=True, exist_ok=True)
+        marker = manager.local_bin / "installed"
+        marker.write_text("installed", encoding="utf-8")
+        return marker
+
+
 @pytest.mark.parametrize("field", ["url", "sha256", "member"])
 def test_changed_release_requires_new_consent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str) -> None:
     manager = make_manager(tmp_path)
-    monkeypatch.setattr(manager, "executable", lambda _name: None)
+    manifests = dict(manager.manifests)
+    manifests["icons"] = manifests["icons"].model_copy(update={
+        "dependency_hook": f"{__name__}:FixtureRelease", "source_dir": None,
+    })
+    manifests["files"] = manifests["files"].model_copy(update={
+        "requires_plugins": ("icons",), "source_dir": None,
+    })
+    manager.manifests = manifests
     with pytest.raises(InstallationConsentRequired) as original:
-        manager.install("monitor")
-    release = monitor_dependencies.BTOP_RELEASE
-    monkeypatch.setattr(monitor_dependencies, "BTOP_RELEASE", replace(release, **{field: "changed"}))
+        manager.install("files")
 
     def forbidden(*_args: object) -> Path:
         pytest.fail("installer ran with consent for a different release")
 
-    monkeypatch.setattr(monitor_dependencies, "install_release", forbidden)
+    monkeypatch.setattr(FixtureRelease, field, "changed")
+    monkeypatch.setattr(FixtureRelease, "install", forbidden)
     with pytest.raises(InstallationConsentRequired):
-        manager.install("monitor", approved=original.value.actions)
+        manager.install("files", approved=original.value.actions)
     assert not manager.local_bin.exists()
     assert not manager.store.path.exists()
 
@@ -114,15 +159,11 @@ async def test_settings_displays_install_details_and_denial_preserves_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager = make_manager(tmp_path)
-    enabled = frozenset({"desktop", "settings"})
-    manager.store.write(PluginState(installed=enabled, enabled=enabled))
+    manager.enable("desktop")
+    manager.install("settings")
     before = manager.store.path.read_bytes()
     monkeypatch.setattr(manager, "executable", lambda _name: None)
-
-    def forbidden(*_args: object) -> Path:
-        pytest.fail("installer ran without consent")
-
-    monkeypatch.setattr(monitor_dependencies, "install_release", forbidden)
+    break_downloads(tmp_path, monkeypatch)
     app = DesktopApp(PluginContext(tmp_path, manager), [(manager.manifests["settings"], SettingsPlugin())])
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press("alt+o")
@@ -151,7 +192,10 @@ async def test_settings_protects_running_host_after_external_disable(tmp_path: P
     manager.store.write(PluginState(
         installed=frozenset({"other", "icons", "settings"}), enabled=frozenset({"settings"})
     ))
-    session = SessionSnapshot(views=(), protected_plugins=frozenset({"other", "icons"}))
+    session = SessionSnapshot(
+        views=(), protected_plugins=frozenset({"other", "icons"}), view_dependencies={},
+        participants=(),
+    )
     context = PluginContext(tmp_path, manager, session)
     app = DesktopApp(context, [(manager.manifests["settings"], SettingsPlugin())])
     async with app.run_test(size=(80, 24)) as pilot:
@@ -160,7 +204,7 @@ async def test_settings_protects_running_host_after_external_disable(tmp_path: P
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index(target))
         view.refresh_selection(manager.store.read())
-        assert view.query_one("#plugin-uninstall", Button).disabled
+        assert not view.query_one("#plugin-install", Button).disabled
 
 
 @pytest.mark.parametrize("target", ["other", "icons"])
@@ -171,6 +215,12 @@ def test_launch_snapshot_protects_running_host_after_external_disable(
     manager.manifests = {**manager.manifests, "other": manager.manifests["desktop"].model_copy(update={
         "id": "other", "entrypoint": f"{__name__}:RecordingHost", "requires_plugins": ("icons",),
     })}
+    manager.manifests = {
+        plugin_id: manifest.model_copy(update={"source_dir": None, "code": InstalledCode(
+            package="snapshot_stub", path=Path(__file__), generation="a" * 32, is_package=False,
+        )})
+        for plugin_id, manifest in manager.manifests.items()
+    }
     enabled = frozenset({"other", "icons", "settings"})
     manager.store.write(PluginState(installed=enabled, enabled=enabled))
     monkeypatch.setattr(launcher, "manager", lambda: manager)
@@ -179,8 +229,18 @@ def test_launch_snapshot_protects_running_host_after_external_disable(
     restored = current_session(session_token(snapshot))
     manager.disable("icons")
     before = manager.store.read()
-    with pytest.raises(PluginError, match="cannot be disabled"):
-        apply_operation(manager, "uninstall", target, session=restored)
+    called: list[str] = []
+
+    def uninstall_locally(managed: PluginManager, plugin_id: str) -> OperationResult:
+        called.append(plugin_id)
+        return OperationResult("uninstall", plugin_id, ())
+
+    result = apply_operation(
+        manager, "uninstall", target, session=restored, view_id="settings",
+        uninstall_runner=uninstall_locally,
+    )
+    assert result == OperationResult("uninstall", target, ())
+    assert called == [target]
     assert manager.store.read() == before
 
 
@@ -211,7 +271,10 @@ def test_host_dependency_cascades_to_views_and_their_dependants(
         "shell": manager.manifests["shell"].model_copy(update={"requires_plugins": ("files",)}),
     }
     enabled = frozenset({"icons", "other", "files", "shell"})
-    manager.store.write(PluginState(installed=enabled, enabled=enabled))
+    manager.enable("other")
+    manager.enable("shell")
+    assert manager.store.read().enabled == enabled
+    manager.removal_guard = allow_removal
     affected = getattr(manager, operation)("icons")
     assert affected == enabled
     assert manager.store.read().enabled == frozenset()
@@ -227,8 +290,22 @@ def test_settings_protects_alternative_host_dependency(
     )}
     enabled = frozenset({"icons", "other", "settings"})
     manager.store.write(PluginState(installed=enabled, enabled=enabled))
-    with pytest.raises(PluginError, match="cannot be disabled"):
-        apply_operation(manager, operation, "icons")
+    if operation == "disable":
+        with pytest.raises(PluginError, match="cannot be disabled"):
+            apply_operation(manager, operation, "icons", view_id="settings")
+        assert manager.store.read().enabled == enabled
+        return
+    called: list[str] = []
+
+    def uninstall_locally(managed: PluginManager, plugin_id: str) -> OperationResult:
+        called.append(plugin_id)
+        return OperationResult("uninstall", plugin_id, ())
+
+    result = apply_operation(
+        manager, operation, "icons", view_id="settings", uninstall_runner=uninstall_locally
+    )
+    assert result == OperationResult("uninstall", "icons", ())
+    assert called == ["icons"]
     assert manager.store.read().enabled == enabled
 
 
@@ -236,9 +313,12 @@ def test_missing_manual_dependency_blocks_all_installations(tmp_path: Path) -> N
     manager = make_manager(tmp_path)
     manager.manifests = {
         **manager.manifests,
-        "icons": manager.manifests["icons"].model_copy(update={"dependency_hook": f"{__name__}:FixtureInstaller"}),
+        "icons": manager.manifests["icons"].model_copy(update={
+            "dependency_hook": f"{__name__}:FixtureInstaller", "source_dir": None,
+        }),
         "files": manager.manifests["files"].model_copy(update={
             "requires_plugins": ("icons",), "requires_executables": ("tdnext-missing-invariant-tool",),
+            "source_dir": None,
         }),
     }
     with pytest.raises(PluginError, match="tdnext-missing-invariant-tool"):
@@ -252,9 +332,11 @@ def test_partial_consent_never_starts_installation(tmp_path: Path) -> None:
     hook = f"{__name__}:FixtureInstaller"
     manager.manifests = {
         **manager.manifests,
-        "icons": manager.manifests["icons"].model_copy(update={"dependency_hook": hook}),
+        "icons": manager.manifests["icons"].model_copy(update={
+            "dependency_hook": hook, "source_dir": None,
+        }),
         "files": manager.manifests["files"].model_copy(update={
-            "requires_plugins": ("icons",), "dependency_hook": hook,
+            "requires_plugins": ("icons",), "dependency_hook": hook, "source_dir": None,
         }),
     }
     with pytest.raises(InstallationConsentRequired) as error:
@@ -292,6 +374,12 @@ def test_view_without_declared_interface_still_requires_a_host(tmp_path: Path) -
 
 def test_snapshot_views_do_not_depend_on_current_host_or_state(tmp_path: Path) -> None:
     manager = make_manager(tmp_path)
-    snapshot = SessionSnapshot(views=(SessionView(manifest=manager.manifests["files"], icon="[]"),))
+    files = manager.manifests["files"].model_copy(update={"source_dir": None})
+    snapshot = SessionSnapshot(
+        views=(SessionView(manifest=files, icon="[]"),),
+        protected_plugins=frozenset(),
+        view_dependencies={},
+        participants=(files,),
+    )
     manager.manifests = {}
     assert [manifest.id for manifest, _ in launcher.enabled_views(manager, snapshot)] == ["files"]

@@ -1,5 +1,6 @@
 import json
 import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from rich.color import Color, ColorType
 from rich.console import Console
 from rich.style import Style
 from rich.text import Text
+from test_native_header_regressions import files_pane
 
 
 @pytest.fixture
@@ -18,7 +20,8 @@ def native_desktop(tmp_path: Path, native_env: tuple[dict[str, str], str]) -> It
     env, binary = native_env
     session = NativeSession(tmp_path, env, binary)
     try:
-        wait_for(lambda: "Files" in session.action("dump-screen", "--pane-id", "terminal_2"))
+        pane = files_pane(session)
+        wait_for(lambda: "Files" in session.action("dump-screen", "--pane-id", pane))
         yield session
     finally:
         session.close()
@@ -43,25 +46,37 @@ def divider_color(session: NativeSession, row: int, column: int, glyph: str) -> 
     return cell_style(session, row, column, glyph).color
 
 
+def divider_positions(session: NativeSession) -> tuple[int, int, int]:
+    pane = next(pane for pane in json.loads(session.action("list-panes", "--all", "--json"))
+                if "tdnext.pane view files" in (pane.get("pane_command") or ""))
+    lines = session.terminal_text().splitlines()
+    horizontal = next(row for row, line in enumerate(lines) if line.startswith("────────"))
+    return pane["pane_y"] + 1, pane["pane_x"] - 1, horizontal
+
+
 def test_native_divider_color_stays_neutral_across_focus_modes_and_group(native_desktop: NativeSession) -> None:
     session = native_desktop
-    samples = {"files focused": divider_color(session, 8, 21, "│")}
-    samples["unfocused"] = divider_color(session, 1, 10, "─")
+    row, column, horizontal = divider_positions(session)
+    files = files_pane(session)
+    samples = {"files focused": divider_color(session, row, column, "│")}
+    samples["horizontal"] = divider_color(session, horizontal, 10, "─")
 
-    # Moving left in Pane mode proves the mode change was consumed before capture.
+    other = session.action("new-pane", "--direction", "right", "--", sys.executable, "-c", "input()").strip()
+    wait_for(lambda: other in session.action("list-clients"))
+
     session.send_key("C-p")
     session.send_key("h")
-    wait_for(lambda: "terminal_1" in session.action("list-clients"))
-    samples["pane mode"] = divider_color(session, 8, 21, "│")
+    wait_for(lambda: files in session.action("list-clients"))
+    samples["pane mode"] = divider_color(session, row, column, "│")
 
     session.send_key("M-p")
     wait_for(lambda: next((pane["index_in_pane_group"] for pane in json.loads(
         session.action("list-panes", "--all", "--json")
-    ) if pane["id"] == 1 and not pane["is_plugin"] and pane["index_in_pane_group"]), None))
-    samples["group focused"] = divider_color(session, 1, 10, "─")
+    ) if f"terminal_{pane['id']}" == files and not pane["is_plugin"] and pane["index_in_pane_group"]), None))
+    samples["group focused"] = divider_color(session, horizontal, 10, "─")
     session.send_key("l")
-    wait_for(lambda: "terminal_2" in session.action("list-clients"))
-    samples["group unfocused"] = divider_color(session, 1, 10, "─")
+    wait_for(lambda: other in session.action("list-clients"))
+    samples["group unfocused"] = divider_color(session, horizontal, 10, "─")
 
     assert len(set(samples.values())) == 1, samples
     color = samples["files focused"]
@@ -73,34 +88,47 @@ def test_native_divider_color_stays_neutral_across_focus_modes_and_group(native_
 
 def test_native_divider_color_stays_unchanged_in_locked_mode(native_desktop: NativeSession) -> None:
     session = native_desktop
-    normal = divider_color(session, 8, 21, "│")
+    row, column, _ = divider_positions(session)
+    normal = divider_color(session, row, column, "│")
     session.send_key("C-g")
     session.send_key("f")
-    wait_for(lambda: "New file name" in session.action("dump-screen", "--pane-id", "terminal_2"))
-    assert divider_color(session, 8, 21, "│") == normal
+    files = files_pane(session)
+    wait_for(lambda: "New file name" in session.action("dump-screen", "--pane-id", files))
+    assert divider_color(session, row, column, "│") == normal
 
 
 def test_sidebar_content_focus_remains_visible_when_pane_focus_moves(native_desktop: NativeSession) -> None:
     session = native_desktop
-    before = cell_style(session, 8, 5, " ")
+    row, column, _ = divider_positions(session)
+    files = files_pane(session)
+    selected = next(
+        i for i, line in enumerate(session.terminal_text().splitlines())
+        if ">" in line[:column] and "Files" in line[:column]
+    )
+    before = cell_style(session, selected, 0, ">")
+    other = session.action("new-pane", "--direction", "right", "--", sys.executable, "-c", "input()").strip()
+    wait_for(lambda: other in session.action("list-clients"))
+    assert cell_style(session, selected, 0, ">") == before
+    separator = divider_color(session, row, column, "│")
     session.send_key("C-p")
     session.send_key("h")
-    wait_for(lambda: "terminal_1" in session.action("list-clients"))
+    wait_for(lambda: files in session.action("list-clients"))
     session.send_key("C-p")
-    session.send_key("Down")
-    focused = wait_for(lambda: ((style,) if (style := cell_style(session, 8, 5, " ")) != before else None))[0]
-    separator = divider_color(session, 8, 21, "│")
+    session.send_key("f")
+    wait_for(lambda: "New file name" in session.action("dump-screen", "--pane-id", files))
+    session.send_key("Escape")
+    wait_for(lambda: "New file name" not in session.action("dump-screen", "--pane-id", files))
     session.send_key("C-p")
     session.send_key("l")
-    wait_for(lambda: "terminal_2" in session.action("list-clients"))
-    unfocused = wait_for(lambda: ((style,) if (style := cell_style(session, 8, 5, " ")) != focused else None))[0]
-    assert (focused.color, focused.bgcolor) != (unfocused.color, unfocused.bgcolor)
-    assert divider_color(session, 8, 21, "│") == separator
+    wait_for(lambda: other in session.action("list-clients"))
+    assert cell_style(session, selected, 0, ">") == before
+    assert divider_color(session, row, column, "│") == separator
 
 
 def test_native_divider_color_stays_unchanged_on_hover(native_desktop: NativeSession) -> None:
     session = native_desktop
-    unfocused = divider_color(session, 1, 10, "─")
+    _, _, horizontal = divider_positions(session)
+    unfocused = divider_color(session, horizontal, 10, "─")
     mouse = b"\x1b[<35;5;5M"
     subprocess.run(
         ["tmux", "-S", session.tmux_socket, "send-keys", "-t", session.tmux_name,
@@ -108,27 +136,36 @@ def test_native_divider_color_stays_unchanged_on_hover(native_desktop: NativeSes
         env=session.env, capture_output=True, check=True, timeout=5,
     )
     session.send_key("f")
-    wait_for(lambda: "New file name" in session.action("dump-screen", "--pane-id", "terminal_2"))
-    assert divider_color(session, 1, 10, "─") == unfocused
+    files = files_pane(session)
+    wait_for(lambda: "New file name" in session.action("dump-screen", "--pane-id", files))
+    assert divider_color(session, horizontal, 10, "─") == unfocused
 
 
 def test_native_divider_color_survives_theme_switches_and_resize(native_desktop: NativeSession) -> None:
     session = native_desktop
-    initial = divider_color(session, 8, 21, "│")
-    for action, target, x in (("set-light-theme", "terminal_1", 5), ("set-dark-theme", "terminal_2", 50)):
+    row, column, _ = divider_positions(session)
+    initial = divider_color(session, row, column, "│")
+    files = files_pane(session)
+    other = session.action("new-pane", "--direction", "right", "--", sys.executable, "-c", "input()").strip()
+    panes = json.loads(session.action("list-panes", "--all", "--json"))
+    for action, target in (("set-light-theme", files), ("set-dark-theme", other)):
+        pane = next(pane for pane in panes if f"terminal_{pane['id']}" == target and not pane["is_plugin"])
+        x, y = pane["pane_x"] + 2, pane["pane_y"] + 2
         session.action(action)
-        session.mouse(x, 5, release=False)
-        session.mouse(x, 5, release=True)
+        session.mouse(x, y, release=False)
+        session.mouse(x, y, release=True)
         wait_for(lambda target=target: target in session.action("list-clients"))
-        assert divider_color(session, 8, 21, "│") == initial
+        assert divider_color(session, row, column, "│") == initial
 
     subprocess.run(
         ["tmux", "-S", session.tmux_socket, "resize-window", "-t", session.tmux_name, "-x", "140", "-y", "40"],
         env=session.env, capture_output=True, check=True, timeout=5,
     )
     wait_for(lambda: any(
-        pane["pane_columns"] == 140 for pane in json.loads(session.action("list-panes", "--all", "--json"))
+        pane["pane_x"] + pane["pane_columns"] == 140
+        for pane in json.loads(session.action("list-panes", "--all", "--json"))
         if not pane["is_plugin"]
     ))
-    assert divider_color(session, 8, 21, "│") == initial
-    assert divider_color(session, 1, 10, "─") == initial
+    row, column, horizontal = divider_positions(session)
+    assert divider_color(session, row, column, "│") == initial
+    assert divider_color(session, horizontal, 10, "─") == initial

@@ -1,6 +1,8 @@
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -16,11 +18,17 @@ from tdnext.core.discovery import discover
 from tdnext.core.errors import PluginError
 from tdnext.core.models import PluginState
 from tdnext.core.presentation import snapshot_views
+from tdnext.core.removal import RemovalRequest
 from tdnext.core.session import SESSION_ENV, SessionSnapshot, SessionView
 from tdnext.launcher import enabled_views
 from tdnext.plugins.desktop.app import DesktopApp
 from tdnext.plugins.desktop.sidebar import sidebar_label
 from tdnext.plugins.icons.plugin import CodiconsProvider
+
+
+@contextmanager
+def allow_removal(request: RemovalRequest) -> Iterator[tuple[str, ...]]:
+    yield ()
 
 
 class AlternateProvider:
@@ -64,6 +72,7 @@ def test_duplicate_discovered_ids_are_rejected(tmp_path: Path) -> None:
 
 def test_icon_service_is_not_a_view_and_disable_does_not_cascade(tmp_path: Path) -> None:
     _app, manager = make_app(tmp_path)
+    manager.removal_guard = allow_removal
     before = manager.store.read()
     manager.enable("icons")
     assert [manifest.id for manifest, _ in enabled_views(manager)] == ["files", "settings"]
@@ -135,7 +144,7 @@ def test_an_alternative_provider_can_replace_codicons(tmp_path: Path) -> None:
     app, manager = make_app(tmp_path)
     manifests = dict(manager.manifests)
     manifests["other-icons"] = manifests["icons"].model_copy(update={
-        "id": "other-icons", "entrypoint": f"{__name__}:AlternateProvider",
+        "id": "other-icons", "entrypoint": f"{__name__}:AlternateProvider", "source_dir": None,
     })
     manager.manifests = manifests
     manager.enable("other-icons")
@@ -190,7 +199,9 @@ def test_native_child_uses_its_session_snapshot_after_state_changes(tmp_path: Pa
     AppearanceStore(manager.store.path.with_name("appearance.json")).write(
         Appearance(provider_id="icons", icon_mode="codicons")
     )
-    session = snapshot_views(manager, app.views)
+    session = snapshot_views(manager, [
+        (manager.manifests[manifest.id], plugin) for manifest, plugin in app.views
+    ])
     manager.store.write(PluginState(installed=frozenset({"desktop"}), enabled=frozenset({"desktop"})))
     code = (
         "from tdnext.launcher import enabled_views; from tdnext.runtime import manager; "
@@ -208,7 +219,12 @@ def test_native_external_program_does_not_inherit_session_snapshot(
 ) -> None:
     _app, manager = make_app(tmp_path)
     manifest = manager.manifests["files"]
-    session = SessionSnapshot(views=(SessionView(manifest=manifest, icon="[F]"),))
+    session = SessionSnapshot(
+        views=(SessionView(manifest=manifest, icon="[F]"),),
+        protected_plugins=frozenset(),
+        view_dependencies={},
+        participants=(manifest,),
+    )
     observed: list[str | None] = []
     monkeypatch.setattr(pane, "manager", lambda: manager)
     monkeypatch.setattr("tdnext.plugins.files.plugin.FilesPlugin.run_pane", lambda _self, _context: observed.append(

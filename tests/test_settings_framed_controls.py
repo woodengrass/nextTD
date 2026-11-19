@@ -95,10 +95,10 @@ async def test_disabled_action_cannot_be_triggered_by_its_frame_or_shortcut(tmp_
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("desktop"))
         await pilot.pause()
-        button = view.query_one("#plugin-uninstall", Button)
+        button = view.query_one("#plugin-enable", Button)
         assert button.disabled
         await pilot.click(button, offset=(0, 1))
-        await pilot.press("u")
+        await pilot.press("e")
         assert manager.store.read() == before
         assert len(app.screen_stack) == 1
 
@@ -115,7 +115,7 @@ async def test_mouse_uninstall_cancel_keeps_the_selected_plugin_installed(tmp_pa
         table = view.query_one(DataTable)
         row = view.plugin_ids.index("monitor")
         await pilot.click(offset=(table.content_region.x + 1, table.content_region.y + 1 + row))
-        await pilot.click("#plugin-uninstall")
+        await pilot.click("#plugin-install")
         assert app.focused is app.screen.query_one("#cancel", Button)
         await pilot.click("#cancel")
         assert "monitor" in manager.store.read().installed
@@ -140,7 +140,7 @@ async def test_native_narrow_pane_keeps_controls_reachable(tmp_path: Path) -> No
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("monitor"))
         await pilot.pause()
         assert "monitor" in manager.store.read().enabled
-        await pilot.press("tab", "tab")
-        uninstall = app.query_one("#plugin-uninstall", Button)
+        await pilot.press("tab")
+        uninstall = app.query_one("#plugin-install", Button)
         assert app.focused is uninstall
         assert app.query_one("#plugin-actions").content_region.contains_region(uninstall.region)

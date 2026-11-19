@@ -1,3 +1,5 @@
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -7,7 +9,13 @@ from tdnext.core.errors import InstallationConsentRequired, PluginError
 from tdnext.core.graph import dependency_order
 from tdnext.core.manager import PluginManager
 from tdnext.core.models import PluginManifest, PluginState
+from tdnext.core.removal import RemovalRequest
 from tdnext.core.state import StateStore
+
+
+@contextmanager
+def allow_removal(request: RemovalRequest) -> Iterator[tuple[str, ...]]:
+    yield ()
 
 
 def manifest(name: str, dependencies: tuple[str, ...] = (), executables: tuple[str, ...] = ()) -> PluginManifest:
@@ -17,6 +25,8 @@ def manifest(name: str, dependencies: tuple[str, ...] = (), executables: tuple[s
         version="1",
         description=name,
         entrypoint="tdnext.plugins.files.plugin:FilesPlugin",
+        manifest_version=1,
+        api_version=1,
         capabilities=("desktop.view",),
         view_interfaces=("tdnext.textual-view.v1",),
         requires_plugins=dependencies,
@@ -28,6 +38,7 @@ def host(name: str) -> PluginManifest:
     return PluginManifest(
         id=name, name=name, version="1", description=name,
         entrypoint="tdnext.plugins.desktop.plugin:DesktopPlugin",
+        manifest_version=1, api_version=1,
         capabilities=("desktop.host",), host_interfaces=("tdnext.textual-view.v1",),
     )
 
@@ -102,18 +113,22 @@ def test_missing_executable_does_not_commit_install(tmp_path: Path) -> None:
 def test_failed_download_does_not_commit_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manifests = discover((Path(__file__).parents[1] / "src" / "tdnext" / "plugins",))
     store = StateStore(tmp_path / "state.json")
-
-    def fail(_name: str, _destination: Path, _release: object) -> Path:
-        raise PluginError("download failed")
-
-    monkeypatch.setattr("tdnext.plugins.monitor.dependencies.install_release", fail)
+    # The managed copy binds its own dependency hook at install time, so fail
+    # the download itself: a curl that always fails makes the staged copy's
+    # installer report a download error and roll back.
+    curl = tmp_path / "failing-bin" / "curl"
+    curl.parent.mkdir()
+    curl.write_text("#!/bin/sh\necho mocked curl failure >&2\nexit 1\n", encoding="utf-8")
+    curl.chmod(0o755)
+    monkeypatch.setenv("PATH", str(curl.parent))
     manager = PluginManager(manifests, store, tmp_path / "bin")
     monkeypatch.setattr(manager, "executable", lambda _name: None)
     with pytest.raises(InstallationConsentRequired) as consent:
         manager.install("monitor")
-    with pytest.raises(PluginError, match="download failed"):
+    with pytest.raises(PluginError, match="Download of btop failed"):
         manager.install("monitor", approved=consent.value.actions)
     assert store.read() == PluginState()
+    assert not manager.code_store.slot("monitor").exists()
 
 
 def test_corrupt_state_is_not_silently_reset(tmp_path: Path) -> None:
@@ -133,6 +148,9 @@ def test_enable_with_invalid_entrypoint_does_not_commit_state(tmp_path: Path) ->
             version="1",
             description="bad",
             entrypoint="builtins:missing_tdnext_plugin",
+            manifest_version=1,
+            api_version=1,
+            capabilities=("desktop.view",),
         ),
     }
     store = StateStore(tmp_path / "state.json")
@@ -151,6 +169,9 @@ def test_install_with_invalid_entrypoint_does_not_commit_state(tmp_path: Path) -
             version="1",
             description="bad",
             entrypoint="builtins:missing_tdnext_plugin",
+            manifest_version=1,
+            api_version=1,
+            capabilities=("desktop.view",),
         ),
     }
     store = StateStore(tmp_path / "state.json")
@@ -167,6 +188,9 @@ def test_desktop_entrypoint_must_provide_desktop_host(tmp_path: Path) -> None:
             version="1",
             description="desktop",
             entrypoint="tdnext.plugins.files.plugin:FilesPlugin",
+            manifest_version=1,
+            api_version=1,
+            capabilities=("desktop.host",),
         ),
     }
     store = StateStore(tmp_path / "state.json")
@@ -199,7 +223,8 @@ def test_uninstall_dependency_cascades_disable_but_keeps_dependants_installed(tm
     }
     store = StateStore(tmp_path / "state.json")
     store.write(PluginState(installed=frozenset(manifests), enabled=frozenset(manifests)))
-    affected = PluginManager(manifests, store, tmp_path / "bin").uninstall("base")
+    manager = PluginManager(manifests, store, tmp_path / "bin", removal_guard=allow_removal)
+    affected = manager.uninstall("base")
     assert affected == frozenset({"base", "mid", "app"})
     assert store.read() == PluginState(installed=frozenset({"mid", "app"}), enabled=frozenset())
 
@@ -210,7 +235,8 @@ def test_uninstall_leaf_only_removes_target(tmp_path: Path) -> None:
     store.write(
         PluginState(installed=frozenset({"base", "app"}), enabled=frozenset({"base", "app"}))
     )
-    affected = PluginManager(manifests, store, tmp_path / "bin").uninstall("app")
+    manager = PluginManager(manifests, store, tmp_path / "bin", removal_guard=allow_removal)
+    affected = manager.uninstall("app")
     assert affected == frozenset({"app"})
     assert store.read() == PluginState(installed=frozenset({"base"}), enabled=frozenset({"base"}))
 
@@ -227,7 +253,7 @@ def test_uninstall_shared_dependency_keeps_sibling_branch_installed(tmp_path: Pa
     }
     store = StateStore(tmp_path / "state.json")
     store.write(PluginState(installed=frozenset(manifests), enabled=frozenset(manifests)))
-    manager = PluginManager(manifests, store, tmp_path / "bin")
+    manager = PluginManager(manifests, store, tmp_path / "bin", removal_guard=allow_removal)
     affected = manager.uninstall("left")
     assert affected == frozenset({"left", "app"})
     assert store.read() == PluginState(
@@ -242,7 +268,7 @@ def test_uninstall_repeated_operation_is_idempotent(tmp_path: Path) -> None:
     store.write(
         PluginState(installed=frozenset({"base", "app"}), enabled=frozenset({"base", "app"}))
     )
-    manager = PluginManager(manifests, store, tmp_path / "bin")
+    manager = PluginManager(manifests, store, tmp_path / "bin", removal_guard=allow_removal)
     first = manager.uninstall("base")
     assert first == frozenset({"base", "app"})
     second = manager.uninstall("base")
@@ -263,7 +289,7 @@ def test_uninstall_keeps_state_consistent_and_reinstallable(tmp_path: Path) -> N
     store.write(
         PluginState(installed=frozenset({"base", "app"}), enabled=frozenset({"base", "app"}))
     )
-    manager = PluginManager(manifests, store, tmp_path / "bin")
+    manager = PluginManager(manifests, store, tmp_path / "bin", removal_guard=allow_removal)
     manager.uninstall("base")
     state = store.read()
     assert state.enabled <= state.installed

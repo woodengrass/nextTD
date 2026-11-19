@@ -1,4 +1,6 @@
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -10,8 +12,15 @@ from tdnext.core.errors import InstallationConsentRequired, PluginError
 from tdnext.core.manager import PluginManager
 from tdnext.core.models import PluginState
 from tdnext.core.presentation import snapshot_views
+from tdnext.core.removal import RemovalRequest
 from tdnext.launcher import enabled_views
+from tdnext.plugins.settings.operations import OperationResult
 from tdnext.plugins.settings.view import SettingsView
+
+
+@contextmanager
+def allow_removal(request: RemovalRequest) -> Iterator[tuple[str, ...]]:
+    yield ()
 
 
 class ProviderInitializationError(RuntimeError):
@@ -50,7 +59,9 @@ def test_unavailable_enabled_provider_keeps_views_and_preferences(tmp_path: Path
             "constructor": f"{__name__}:RaisingProvider",
             "contract": "builtins:int",
         }
-        manifests["icons"] = provider.model_copy(update={"entrypoint": entrypoints[failure]})
+        manifests["icons"] = provider.model_copy(update={
+            "entrypoint": entrypoints[failure], "source_dir": None,
+        })
     manager.manifests = manifests
     before = manager.store.read()
     state = PluginState(installed=before.installed | {"icons"}, enabled=before.enabled | {"icons"})
@@ -82,7 +93,9 @@ def test_broken_provider_remains_fatal_when_a_view_requires_it(tmp_path: Path) -
     _app, manager = make_app(tmp_path)
     manifests = dict(manager.manifests)
     manifests["files"] = manifests["files"].model_copy(update={"requires_plugins": ("desktop", "icons")})
-    manifests["icons"] = manifests["icons"].model_copy(update={"entrypoint": "builtins:int"})
+    manifests["icons"] = manifests["icons"].model_copy(update={
+        "entrypoint": "builtins:int", "source_dir": None,
+    })
     manager.manifests = manifests
     state = manager.store.read()
     manager.store.write(PluginState(installed=state.installed | {"icons"}, enabled=state.enabled | {"icons"}))
@@ -90,11 +103,22 @@ def test_broken_provider_remains_fatal_when_a_view_requires_it(tmp_path: Path) -
         enabled_views(manager)
 
 
-def test_missing_bundled_provider_is_optional_even_without_an_appearance_selection(tmp_path: Path) -> None:
+@pytest.mark.parametrize("operation", ["disable", "uninstall"])
+def test_missing_unselected_provider_reports_recovery_and_can_be_removed(tmp_path: Path, operation: str) -> None:
     _app, manager = make_app(tmp_path)
+    manager.removal_guard = allow_removal
+    initial = manager.store.read()
     manager.enable("icons")
     manager.manifests = {key: value for key, value in manager.manifests.items() if key != "icons"}
+    before = manager.store.read()
+    with pytest.raises(PluginError):
+        enabled_views(manager)
+    assert manager.store.read() == before
+    getattr(manager, operation)("icons")
     assert [manifest.id for manifest, _ in enabled_views(manager)] == ["files", "settings"]
+    assert manager.store.read() == PluginState(
+        installed=initial.installed | ({"icons"} if operation == "disable" else set()), enabled=initial.enabled
+    )
     assert not manager.store.path.with_name("appearance.json").exists()
 
 
@@ -126,7 +150,9 @@ def test_unclassified_missing_enabled_plugin_is_reported(tmp_path: Path) -> None
 def test_broken_required_host_or_view_is_not_ignored(tmp_path: Path, broken: str) -> None:
     _app, manager = make_app(tmp_path)
     manifests = dict(manager.manifests)
-    manifests[broken] = manifests[broken].model_copy(update={"entrypoint": "tdnext_missing_required:Plugin"})
+    manifests[broken] = manifests[broken].model_copy(update={
+        "entrypoint": "tdnext_missing_required:Plugin", "source_dir": None,
+    })
     manager.manifests = manifests
     with pytest.raises(PluginError, match=broken):
         enabled_views(manager)
@@ -135,6 +161,7 @@ def test_broken_required_host_or_view_is_not_ignored(tmp_path: Path, broken: str
 @pytest.mark.parametrize("operation", ["disable", "uninstall"])
 def test_missing_installed_plugin_can_be_removed_without_touching_other_plugins(tmp_path: Path, operation: str) -> None:
     _app, manager = make_app(tmp_path)
+    manager.removal_guard = allow_removal
     initial = manager.store.read()
     manager.store.write(PluginState(installed=initial.installed | {"missing"}, enabled=initial.enabled | {"missing"}))
     affected = getattr(manager, operation)("missing")
@@ -148,6 +175,7 @@ def test_missing_installed_plugin_can_be_removed_without_touching_other_plugins(
 @pytest.mark.parametrize("operation", ["disable", "uninstall"])
 async def test_settings_can_manage_persisted_missing_plugin(tmp_path: Path, operation: str) -> None:
     app, manager = make_app(tmp_path)
+    manager.removal_guard = allow_removal
     manager.enable("icons")
     manager.manifests = {key: value for key, value in manager.manifests.items() if key != "icons"}
     async with app.run_test(size=(80, 24)) as pilot:
@@ -155,8 +183,13 @@ async def test_settings_can_manage_persisted_missing_plugin(tmp_path: Path, oper
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("icons"))
+        if operation == "uninstall":
+            def uninstall_locally(managed: PluginManager, plugin_id: str) -> OperationResult:
+                return OperationResult("uninstall", plugin_id, tuple(sorted(managed.uninstall(plugin_id))))
+
+            view.uninstall_runner = uninstall_locally
         await pilot.pause()
-        await pilot.click(f"#plugin-{operation}")
+        await pilot.click(f"#plugin-{'install' if operation == 'uninstall' else operation}")
         if operation == "uninstall":
             await pilot.click("#confirm-plugin-change")
         await app.workers.wait_for_complete()
@@ -183,7 +216,7 @@ def test_required_executable_is_installed_before_entrypoint_import_and_construct
     manifest = manager.manifests["files"].model_copy(update={
         "id": "requires-binary", "entrypoint": "requires_binary_at_import:RequiredPlugin",
         "requires_plugins": (), "requires_executables": (binary.name,),
-        "dependency_hook": f"{__name__}:FixtureDependencies",
+        "dependency_hook": f"{__name__}:FixtureDependencies", "source_dir": None,
     })
     manager.manifests = {**manager.manifests, manifest.id: manifest}
 
@@ -201,7 +234,7 @@ def test_failed_constructor_after_executable_install_does_not_commit_state(
     binary = "tdnext-fixture-binary"
     manifest = manager.manifests["icons"].model_copy(update={
         "entrypoint": f"{__name__}:RaisingProvider", "requires_executables": (binary,),
-        "dependency_hook": f"{__name__}:FixtureDependencies",
+        "dependency_hook": f"{__name__}:FixtureDependencies", "source_dir": None,
     })
     manager.manifests = {**manager.manifests, manifest.id: manifest}
     before = manager.store.read()

@@ -6,8 +6,8 @@ from typing import Annotated
 import typer
 
 from .core.errors import InstallationConsentRequired, PluginError
-from .core.executables import install_executable
 from .core.local_env import bootstrap as _bootstrap_local_path
+from .core.uninstall_helper import launch_uninstall_helper
 from .runtime import manager, state_dir
 
 cli = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
@@ -26,8 +26,8 @@ def list_plugins() -> None:
     for plugin_id in sorted(state.installed - plugins.manifests.keys()):
         status = "enabled" if plugin_id in state.enabled else "installed"
         typer.echo(f"{plugin_id:12} {status:10} Missing plugin manifest")
-    for error in getattr(plugins.manifests, "errors", {}).values():
-        typer.echo(f"Invalid plugin: {error}", err=True)
+    for error in plugins.errors.values():
+        typer.echo(f"Invalid plugin: {error}")
 
 
 @cli.command()
@@ -65,15 +65,13 @@ def disable(plugin: str) -> None:
 
 @cli.command()
 def uninstall(plugin: str) -> None:
-    """Uninstall a plugin and disable every enabled dependent, keeping dependants installed."""
-    affected = manager().uninstall(plugin)
-    typer.echo(f"Uninstalled: {plugin}; Disabled: {', '.join(sorted(affected)) or '(already disabled)'}")
-
-
-@cli.command("install-zellij")
-def install_zellij() -> None:
-    """Install the pinned optional Zellij binary under the local state directory."""
-    typer.echo(f"Installed Zellij: {install_executable('zellij', state_dir() / 'bin')}")
+    """Uninstall a plugin and disable every enabled dependant, keeping dependants installed."""
+    if not typer.confirm(
+        "Uninstalling requires ending all TDNext sessions and their processes; "
+        "unsaved work will be lost. Continue?", default=False,
+    ):
+        raise PluginError("Uninstall declined; plugin state was not changed")
+    typer.echo(launch_uninstall_helper(state_dir(), plugin, keep_parent=True))
 
 
 @cli.command()

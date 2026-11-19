@@ -1,9 +1,12 @@
 """Validated plugin manifests and persisted state."""
 
 import re
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from .plugin_code import InstalledCode
 
 PluginRole = Literal["desktop.host", "desktop.view", "icons.provider"]
 ROLES: tuple[PluginRole, ...] = ("desktop.host", "desktop.view", "icons.provider")
@@ -22,15 +25,18 @@ class PluginManifest(BaseModel):
     placement: Literal["sidebar", "header"] = "sidebar"
     icon: str | None = Field(default=None, min_length=1, max_length=4)
     icon_key: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_.-]*$")
-    capabilities: tuple[str, ...] | None = None
+    shortcuts: str | None = None
+    settings_contributor: bool | None = None
+    capabilities: tuple[str, ...]
     requires_plugins: tuple[str, ...] = ()
     requires_executables: tuple[str, ...] = ()
-    # 舊快照保留預設值；磁碟格式另行檢查。See ../plugin-compatibility-and-consent.adr.md
-    manifest_version: Literal[1] = 1
-    api_version: Literal[1] = 1
+    manifest_version: Literal[1]
+    api_version: Literal[1]
     host_interfaces: tuple[str, ...] = ()
     view_interfaces: tuple[str, ...] = ()
     dependency_hook: str | None = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$")
+    source_dir: Path | None = Field(default=None, exclude=True)
+    code: InstalledCode | None = None
 
     @field_validator("host_interfaces", "view_interfaces")
     @classmethod
@@ -53,24 +59,18 @@ class PluginManifest(BaseModel):
 
     @field_validator("capabilities")
     @classmethod
-    def capabilities_have_one_role(cls, capabilities: tuple[str, ...] | None) -> tuple[str, ...] | None:
-        if capabilities is None:
-            return None
+    def capabilities_have_one_role(cls, capabilities: tuple[str, ...]) -> tuple[str, ...]:
         if not capabilities or len(set(capabilities)) != len(capabilities):
             raise ValueError("capabilities must be nonempty and unique")
         for capability in capabilities:
             if not re.fullmatch(r"[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+", capability):
                 raise ValueError(f"invalid capability: {capability}")
-            if capability.startswith(("desktop.", "icons.")) and capability not in ROLES:
-                raise ValueError(f"unknown structural role: {capability}")
         if sum(role in capabilities for role in ROLES) != 1:
             raise ValueError("capabilities must declare exactly one structural role")
         return capabilities
 
     @property
     def role(self) -> PluginRole:
-        if self.capabilities is None:
-            return "desktop.host" if self.id == "desktop" else "desktop.view"
         for role in ROLES:
             if role in self.capabilities:
                 return role

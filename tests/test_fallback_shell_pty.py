@@ -1,6 +1,7 @@
 import fcntl
 import os
 import pty
+import shutil
 import signal
 import struct
 import subprocess
@@ -9,10 +10,10 @@ import termios
 from pathlib import Path
 
 import pytest
+from native_environment import capable_core_source
 from test_fallback_footer_pty import read_until
 
-from tdnext.core.models import PluginState
-from tdnext.core.state import StateStore
+from tdnext.runtime import manager_for
 
 
 @pytest.mark.parametrize("size", [(80, 24), (120, 36)], ids=["narrow", "wide"])
@@ -21,9 +22,18 @@ def test_fallback_shell_in_real_outer_pty_keeps_desktop_and_interactive_program(
 ) -> None:
     home = tmp_path / "home"
     home.mkdir()
-    ids = frozenset({"desktop", "files", "settings", "shell"})
     state = tmp_path / "state"
-    StateStore(state / "plugins.json").write(PluginState(installed=ids, enabled=ids))
+    plugins = manager_for(state)
+    for plugin_id in ("desktop", "files", "settings", "shell"):
+        plugins.enable(plugin_id)
+    assert plugins.store.read().enabled == frozenset({"desktop", "files", "settings", "shell"})
+    source = capable_core_source()
+    assert source is not None, "fallback shell test requires a capable tdnext core binary"
+    bin_dir = state / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    dest = bin_dir / "tdnext"
+    shutil.copy2(source, dest)
+    dest.chmod(0o755)
     excluded = {"TMUX", "TMUX_PANE", "ZELLIJ_SESSION_NAME", "ZELLIJ_PANE_ID", "BASH_ENV"}
     env = {key: value for key, value in os.environ.items() if key not in excluded}
     env.update({

@@ -1,3 +1,5 @@
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -7,11 +9,19 @@ from textual.widgets import Button, ContentSwitcher, DataTable, Select
 from textual.widgets._select import SelectOverlay
 
 from tdnext.core.appearance import Appearance, AppearanceStore
+from tdnext.core.manager import PluginManager
 from tdnext.core.models import PluginState
+from tdnext.core.removal import RemovalRequest
 from tdnext.plugins.desktop.tool import ToolPane
 from tdnext.plugins.settings.dialogs import ConfirmPluginChange
+from tdnext.plugins.settings.operations import OperationResult
 from tdnext.plugins.settings.plugin import SettingsPlugin
 from tdnext.plugins.settings.view import SettingsView
+
+
+@contextmanager
+def allow_removal(request: RemovalRequest) -> Iterator[tuple[str, ...]]:
+    yield ()
 
 
 @pytest.mark.anyio
@@ -90,6 +100,8 @@ async def test_confirmation_buttons_fit_and_respond_to_mouse(
     tmp_path: Path, host: str, size: tuple[int, int], operation: str, choice: str, position: str
 ) -> None:
     desktop, manager = make_app(tmp_path, monitor=True)
+    manager.removal_guard = allow_removal
+    manager.enable("monitor")
     if operation == "disable":
         manifests = dict(manager.manifests)
         manifests["extra"] = manifests["files"].model_copy(
@@ -106,6 +118,11 @@ async def test_confirmation_buttons_fit_and_respond_to_mouse(
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("monitor"))
+        if operation == "uninstall":
+            def uninstall_locally(managed: PluginManager, plugin_id: str) -> OperationResult:
+                return OperationResult("uninstall", plugin_id, tuple(sorted(managed.uninstall(plugin_id))))
+
+            view.uninstall_runner = uninstall_locally
         await pilot.pause()
         await pilot.press("d" if operation == "disable" else "u")
         dialog = app.screen
@@ -137,10 +154,19 @@ async def test_confirmation_keyboard_is_safe_and_reachable(
     tmp_path: Path, size: tuple[int, int], keys: tuple[str, ...], removed: bool
 ) -> None:
     desktop, manager = make_app(tmp_path, monitor=True)
+    manager.removal_guard = allow_removal
+    manager.enable("monitor")
     app = ToolPane("settings", SettingsPlugin(), desktop.context)
     async with app.run_test(size=size) as pilot:
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
+        # Run the real manager uninstall locally: spawning the production
+        # helper here would sweep live /proc by name and could signal this
+        # test runner itself once it claims the tdnext process name.
+        def uninstall_locally(managed: PluginManager, plugin_id: str) -> OperationResult:
+            return OperationResult("uninstall", plugin_id, tuple(sorted(managed.uninstall(plugin_id))))
+
+        view.uninstall_runner = uninstall_locally
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("monitor"))
         await pilot.pause()
         await pilot.press("u")

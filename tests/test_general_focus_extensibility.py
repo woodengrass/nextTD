@@ -1,12 +1,46 @@
 from pathlib import Path
 
 import pytest
-from test_settings_ui import make_app
+from test_settings_ui import make_app, text_of
 from textual.containers import Vertical, VerticalScroll
-from textual.widgets import Button, Select
+from textual.events import AppFocus
+from textual.widgets import Button, Select, Static
 
+from tdnext.api import SettingsControls
 from tdnext.plugins.desktop.tool import ToolPane
+from tdnext.plugins.files.editor_controls import EditorControls
+from tdnext.plugins.files.editor_preferences import EditorPreferences, EditorPreferencesStore
 from tdnext.plugins.settings.plugin import SettingsPlugin
+
+
+class BrokenRefreshControls(SettingsControls):
+    def refresh_settings(self) -> None:
+        raise RuntimeError("refresh failed")
+
+    def refresh_if_idle(self) -> None:
+        raise RuntimeError("idle refresh failed")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("trigger", ["activation", "focus"])
+async def test_broken_refresh_reports_control_and_other_controls_refresh(tmp_path: Path, trigger: str) -> None:
+    desktop, manager = make_app(tmp_path)
+    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    store = EditorPreferencesStore(manager.store.path.with_name("editor.json"))
+    async with app.run_test(size=(80, 24)) as pilot:
+        general = app.query_one("#settings-general", VerticalScroll)
+        await general.mount(BrokenRefreshControls(), before=app.query_one(EditorControls))
+        store.write(EditorPreferences(editor="vi"))
+        if trigger == "activation":
+            app.post_message(AppFocus())
+            await pilot.pause()
+        else:
+            await pilot.press("tab")
+        assert app.query_one("#editor-choice", Select).value == "vi"
+        feedback = text_of(app.query_one("#plugin-feedback", Static))
+        assert "BrokenRefreshControls" in feedback
+        assert ("idle refresh failed" if trigger == "focus" else "Cannot refresh ") in feedback
+        assert "refresh failed" in feedback
 
 
 @pytest.mark.anyio

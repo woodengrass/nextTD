@@ -7,9 +7,9 @@ from textual.events import AppFocus
 from textual.widgets import ContentSwitcher, Select, Static
 
 from tdnext.plugins.desktop.tool import ToolPane
+from tdnext.plugins.files.editor_controls import EditorControls
 from tdnext.plugins.files.editor_preferences import EditorPreferences
 from tdnext.plugins.files.view import FilesView
-from tdnext.plugins.settings.editor import EditorControls
 from tdnext.plugins.settings.plugin import SettingsPlugin
 from tdnext.plugins.settings.view import SettingsView
 

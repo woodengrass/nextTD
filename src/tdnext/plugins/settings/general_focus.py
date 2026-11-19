@@ -7,10 +7,10 @@ from textual.containers import Vertical, VerticalScroll
 from textual.events import DescendantFocus
 from textual.widgets import ContentSwitcher, Select
 
+from tdnext.api import SettingsControls
 from tdnext.core.errors import PluginError
 
 from .appearance import AppearanceControls
-from .editor import EditorControls
 
 
 class GeneralFocus(Vertical):
@@ -21,14 +21,22 @@ class GeneralFocus(Vertical):
 
     def refresh_general(self) -> None:
         self.query_one(AppearanceControls).refresh_providers()
-        self.query_one(EditorControls).refresh_preference()
+        self.refresh_contributors("refresh_settings")
+
+    def refresh_contributors(self, method: Literal["refresh_settings", "refresh_if_idle"]) -> None:
+        for controls in self.query(SettingsControls):
+            try:
+                getattr(controls, method)()
+            except Exception as exc:  # noqa: BLE001 - isolate the plugin control boundary
+                name = f"{type(controls).__module__}.{type(controls).__qualname__}"
+                self.post_message(SettingsControls.Feedback(f"Cannot refresh {name}: {exc}"))
 
     def on_descendant_focus(self, event: DescendantFocus) -> None:
         if not isinstance(event.widget, Select) or event.widget.expanded:
             return
+        self.refresh_contributors("refresh_if_idle")
         try:
-            self.query_one(EditorControls).refresh_if_idle()
-            if event.widget.id == "editor-choice":
+            if not any(isinstance(parent, AppearanceControls) for parent in event.widget.ancestors):
                 self.query_one(AppearanceControls).refresh_providers()
         except PluginError as exc:
             self.notify(f"Cannot refresh settings: {exc}", severity="error")

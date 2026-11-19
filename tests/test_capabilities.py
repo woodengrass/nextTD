@@ -14,20 +14,16 @@ class BrokenProvider:
         return 42
 
 
-def manifest_data(plugin_id: str) -> dict[str, str]:
+def manifest_data(plugin_id: str) -> dict[str, str | int]:
     return {
         "id": plugin_id,
         "name": plugin_id,
         "version": "1",
         "description": plugin_id,
         "entrypoint": "tdnext.plugins.files.plugin:FilesPlugin",
+        "manifest_version": 1,
+        "api_version": 1,
     }
-
-
-@pytest.mark.parametrize(("plugin_id", "role"), [("desktop", "desktop.host"), ("external", "desktop.view")])
-def test_legacy_manifests_keep_their_original_roles(plugin_id: str, role: str) -> None:
-    manifest = PluginManifest.model_validate(manifest_data(plugin_id))
-    assert manifest.role == role
 
 
 @pytest.mark.parametrize("capabilities", [[], ["desktop.view", "desktop.view"], ["files.browse"],

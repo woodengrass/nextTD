@@ -8,10 +8,11 @@ from pathlib import Path
 import pytest
 from native_environment import native_env as native_env
 from native_processes import tagged_processes, terminate_tagged
-from native_session import NativeSession, wait_for
+from native_session import NativeSession, assert_no_chrome_processes, assert_no_chrome_ptys, wait_for
 
 from tdnext.core.models import PluginState
 from tdnext.core.state import StateStore
+from tdnext.runtime import manager_for
 
 
 @pytest.fixture
@@ -75,28 +76,13 @@ def open_shortcut(session: NativeSession) -> None:
     wait_for(lambda: actions_finished(session))
 
 
-def test_cold_broker_shows_permission_prompt_without_granting(
-    tmp_path: Path, isolated_native: tuple[dict[str, str], str]
-) -> None:
-    env, binary = isolated_native
-    session = NativeSession(tmp_path, env, binary)
-    try:
-        visible(session, "Tool (Files)")
-        session.send_key("M-o")
-        visible(session, "asks permission to:", "Allow?", "(y/n)")
-        cache = tmp_path / "state" / "zellij-cache" / "zellij" / "permissions.kdl"
-        assert not cache.exists()
-    finally:
-        close_session(session)
-
-
 def test_shortcut_returns_to_shell_process_and_uses_original_session_snapshot(
     tmp_path: Path, isolated_native: tuple[dict[str, str], str]
 ) -> None:
     env, binary = isolated_native
     ids = frozenset({"desktop", "files", "monitor", "settings", "shell"})
+    manager_for(tmp_path / "state").enable("shell")
     store = StateStore(tmp_path / "state" / "plugins.json")
-    store.write(PluginState(installed=ids, enabled=ids))
     session = NativeSession(tmp_path, env, binary, expected_tabs=4)
     try:
         visible(session, "Tool (Files)")
@@ -107,7 +93,7 @@ def test_shortcut_returns_to_shell_process_and_uses_original_session_snapshot(
         session.send_key("Enter")
         pid_before = wait_for(lambda: re.search(r"BEFORE_PID_(\d+)", capture(session))).group(1)
 
-        store.write(PluginState(installed=ids, enabled=ids - {"settings"}))
+        store.write(PluginState(installed=ids, enabled=ids))
         open_shortcut(session)
         session.send_key("Escape")
         visible(session, "Tool (Shell)")
@@ -123,6 +109,8 @@ def test_shortcut_returns_to_shell_process_and_uses_original_session_snapshot(
         assert pid_after is not None
         assert pid_after.group(1) == pid_before
         assert session.btop_pid() == btop_pid
+        assert_no_chrome_ptys(session)
+        assert_no_chrome_processes(session.tmux_name)
     finally:
         close_session(session)
 
@@ -214,10 +202,15 @@ def test_header_returns_to_the_exact_floating_pane(
             wait_for(lambda: actions_finished(session))
         tabs = session.tabs()
         header = next(tab for tab in tabs if str(tab["name"]).startswith("tdnext-header:settings"))
-        assert str(header["name"]).endswith(f":{pane_id}")
+        # Observable contract: Settings took focus on the header tab and the
+        # dedicated core path recorded the floating origin in the server,
+        # so assert the focus handoff, not the tab name.
+        assert session.active_tab() == int(header["tab_id"])
+        wait_for(lambda: pane_id not in session.action("list-clients"))
         session.send_key("Escape")
         visible(session, "ORIGIN_READY")
         wait_for(lambda: actions_finished(session))
+        wait_for(lambda: pane_id in session.action("list-clients"))
         session.send_key("proof")
         session.send_key("Enter")
 

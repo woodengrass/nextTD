@@ -24,6 +24,8 @@ def discover(roots: tuple[Path, ...]) -> DiscoveredPlugins:
             identity: str | None = None
             try:
                 data = loads(path.read_text(encoding="utf-8"))
+                if "source_dir" in data or "code" in data:
+                    raise ValueError("source_dir and code are runtime metadata, not manifest fields")
                 raw_identity = data.get("id")
                 if isinstance(raw_identity, str):
                     identity = raw_identity
@@ -32,7 +34,7 @@ def discover(roots: tuple[Path, ...]) -> DiscoveredPlugins:
                     raise ValueError("manifest_version, api_version and capabilities are required")
                 if type(data["manifest_version"]) is not int or type(data["api_version"]) is not int:
                     raise ValueError("manifest_version and api_version must be integers")
-                manifest = PluginManifest.model_validate(data)
+                manifest = PluginManifest.model_validate(data).model_copy(update={"source_dir": path.parent.resolve()})
                 if manifest.role == "desktop.host" and not manifest.host_interfaces:
                     raise ValueError("host_interfaces must declare supported interfaces")
                 if manifest.role == "desktop.view" and not manifest.view_interfaces:
@@ -58,8 +60,20 @@ def discover(roots: tuple[Path, ...]) -> DiscoveredPlugins:
 
 
 def load_entrypoint(manifest: PluginManifest):
-    """Import the declared local plugin class; plugins are trusted code."""
+    """Import the declared local plugin class; plugins are trusted code.
+
+    Manifests with managed code activate that copy first. Real discovered
+    manifests (source_dir is set) without managed code fail with an explicit
+    install instruction and never fall back to the source tree. In-memory
+    doubles (source_dir is None) load from the source tree for tests.
+    """
     module_name, _, class_name = manifest.entrypoint.partition(":")
+    if manifest.code is not None:
+        from .plugin_imports import activate_code
+
+        activate_code(manifest.code)
+    elif manifest.source_dir is not None:
+        raise PluginError(f"Plugin {manifest.id} has no managed code; run tdnext install {manifest.id}")
     try:
         plugin_class = getattr(import_module(module_name), class_name)
     except (ImportError, AttributeError) as exc:

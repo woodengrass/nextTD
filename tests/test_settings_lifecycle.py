@@ -10,7 +10,7 @@ from tdnext.core.errors import PluginError
 from tdnext.core.manager import PluginManager
 from tdnext.core.models import PluginManifest, PluginState
 from tdnext.core.state import StateStore
-from tdnext.plugins.settings.operations import apply_operation
+from tdnext.plugins.settings.operations import OperationResult, apply_operation
 
 
 class RecordingDesktop:
@@ -23,7 +23,9 @@ class RecordingDesktop:
 def make_manager(tmp_path: Path) -> PluginManager:
     roots = (Path(__file__).parents[1] / "src" / "tdnext" / "plugins",)
     manifests = discover(roots)
-    manifests["desktop"] = manifests["desktop"].model_copy(update={"entrypoint": f"{__name__}:RecordingDesktop"})
+    manifests["desktop"] = manifests["desktop"].model_copy(update={
+        "entrypoint": f"{__name__}:RecordingDesktop", "source_dir": None,
+    })
     return PluginManager(manifests, StateStore(tmp_path / "plugins.json"), tmp_path / "bin")
 
 
@@ -58,7 +60,7 @@ def test_enabled_host_runs_without_views_and_preserves_state(tmp_path: Path, mon
 
 def test_multiple_enabled_hosts_are_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager = make_manager(tmp_path)
-    other = manager.manifests["desktop"].model_copy(update={"id": "other-host"})
+    other = manager.manifests["desktop"].model_copy(update={"id": "other-host", "source_dir": None})
     manager.manifests = {**manager.manifests, other.id: other}
     manager.enable("desktop")
     manager.store.write(PluginState(
@@ -75,8 +77,12 @@ def test_existing_disabled_settings_remains_disabled_on_repeated_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager = make_manager(tmp_path)
-    before = PluginState(installed=frozenset({"desktop", "files", "settings"}), enabled=frozenset({"desktop", "files"}))
-    manager.store.write(before)
+    manager.enable("files")
+    manager.install("settings")
+    before = manager.store.read()
+    assert before == PluginState(
+        installed=frozenset({"desktop", "files", "settings"}), enabled=frozenset({"desktop", "files"})
+    )
     monkeypatch.setattr(launcher, "manager", lambda: manager)
     launcher.launch(tmp_path)
     launcher.launch(tmp_path)
@@ -94,29 +100,46 @@ def test_settings_lifecycle_is_independent_and_requires_desktop(tmp_path: Path) 
 
 
 @pytest.mark.parametrize("target", ["desktop", "settings"])
-@pytest.mark.parametrize("operation", ["disable", "uninstall"])
-def test_settings_operations_protect_running_components(
-    tmp_path: Path, target: str, operation: str
-) -> None:
+def test_settings_disable_protects_running_components(tmp_path: Path, target: str) -> None:
     manager = make_manager(tmp_path)
     manager.enable("settings")
     before = manager.store.read()
     with pytest.raises(PluginError, match="cannot be disabled"):
-        if operation == "disable":
-            apply_operation(manager, "disable", target)
-        else:
-            apply_operation(manager, "uninstall", target)
+        apply_operation(manager, "disable", target, view_id="settings")
+    assert manager.store.read() == before
+
+
+@pytest.mark.parametrize("target", ["desktop", "settings"])
+def test_settings_uninstall_delegates_to_runner_instead_of_protecting(tmp_path: Path, target: str) -> None:
+    manager = make_manager(tmp_path)
+    manager.enable("settings")
+    before = manager.store.read()
+    called: list[str] = []
+
+    def runner(managed: PluginManager, plugin_id: str) -> OperationResult:
+        called.append(plugin_id)
+        return OperationResult("uninstall", plugin_id, ())
+
+    result = apply_operation(
+        manager, "uninstall", target, view_id="settings", uninstall_runner=runner
+    )
+    assert result == OperationResult("uninstall", target, ())
+    assert called == [target]
     assert manager.store.read() == before
 
 
 def test_settings_operation_rejects_cascade_to_running_desktop(tmp_path: Path) -> None:
     manager = make_manager(tmp_path)
     manifests = dict(manager.manifests)
-    manifests["base"] = manifests["files"].model_copy(update={"id": "base", "requires_plugins": ()})
-    manifests["desktop"] = manifests["desktop"].model_copy(update={"requires_plugins": ("base",)})
+    manifests["base"] = manifests["files"].model_copy(update={
+        "id": "base", "requires_plugins": (), "source_dir": None,
+    })
+    manifests["desktop"] = manifests["desktop"].model_copy(update={
+        "requires_plugins": ("base",), "source_dir": None,
+    })
     manager.manifests = manifests
     manager.enable("settings")
     before = manager.store.read()
     with pytest.raises(PluginError, match="cannot be disabled"):
-        apply_operation(manager, "disable", "base")
+        apply_operation(manager, "disable", "base", view_id="settings")
     assert manager.store.read() == before

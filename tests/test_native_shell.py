@@ -4,10 +4,9 @@ import subprocess
 from pathlib import Path
 
 from native_environment import native_env as native_env
-from native_session import NativeSession, wait_for
+from native_session import NativeSession, assert_no_chrome_processes, assert_one_content_pty_per_tab, wait_for
 
-from tdnext.core.models import PluginState
-from tdnext.core.state import StateStore
+from tdnext.runtime import manager_for
 
 
 def test_native_shell_interaction_and_settings_preserve_the_process(
@@ -18,8 +17,9 @@ def test_native_shell_interaction_and_settings_preserve_the_process(
     home.mkdir()
     env.update({"HOME": str(home), "SHELL": "/bin/bash", "HISTFILE": str(home / "history"), "INPUTRC": "/dev/null"})
     env.pop("BASH_ENV", None)
-    ids = frozenset({"desktop", "files", "shell", "settings"})
-    StateStore(tmp_path / "state" / "plugins.json").write(PluginState(installed=ids, enabled=ids))
+    plugins = manager_for(tmp_path / "state")
+    plugins.enable("shell")
+    plugins.disable("monitor")
     session = NativeSession(tmp_path, env, binary, expected_tabs=3)
     try:
         session.send_key("M-2")
@@ -40,6 +40,8 @@ def test_native_shell_interaction_and_settings_preserve_the_process(
         session.send_key("hello")
         session.send_key("Enter")
         wait_for(lambda: "NATIVE_RESULT:hello" in session.action("dump-screen", "--pane-id", pane_id))
+        assert_one_content_pty_per_tab(session)
+        assert_no_chrome_processes(session.tmux_name)
         subprocess.run(
             ["tmux", "-S", session.tmux_socket, "resize-window", "-t", session.tmux_name, "-x", "140", "-y", "40"],
             env=env, capture_output=True, check=True, timeout=5,

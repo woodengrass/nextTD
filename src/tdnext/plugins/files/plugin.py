@@ -3,7 +3,7 @@
 from textual.app import App, ComposeResult
 from textual.widget import Widget
 
-from tdnext.api import PluginContext
+from tdnext.api import PluginContext, SettingsControls
 
 from .view import FilesView
 
@@ -24,6 +24,11 @@ class FilesPlugin:
         "Enter open   Backspace up   ? help   v preview   b folders   g path   n folder   r rename   "
         "y/x/p copy/move   d delete"
     )
+
+    def make_settings_controls(self, context: PluginContext) -> SettingsControls:
+        from .editor_controls import EditorControls
+
+        return EditorControls(context)
 
     def make_view(self, context: PluginContext) -> Widget:
         return FilesView(context.directory, context)

@@ -18,6 +18,8 @@ from local_path_fixtures import (
     run_child,
 )
 
+from tdnext.core.models import PluginManifest
+
 
 def test_imports_leave_the_process_environment_identical(tmp_path: Path) -> None:
     state = tmp_path / "state"
@@ -128,8 +130,13 @@ def test_native_pane_view_runs_plugin_runtime_by_bare_name(
     marker = tmp_path / "run-pane-marker.txt"
     monkeypatch.delenv("TDNEXT_TEST_MARKER", raising=False)
     probe_view(tmp_path, state)
-    token = probe_token()
     env = base_env(tmp_path, state, path_state=path_state)
+    enabled = run_child([PY, "-m", "tdnext", "enable", "probeview"], env)
+    assert enabled.returncode == 0, enabled.stderr
+    receipt = PluginManifest.model_validate_json(
+        (state / "plugin-code" / "probeview" / "manifest.json").read_text(encoding="utf-8")
+    )
+    token = probe_token(receipt)
     env["TDNEXT_TEST_MARKER"] = str(marker)
     env["TDNEXT_DIRECTORY"] = str(tmp_path)
     result = run_child([PY, "-m", "tdnext.pane", "view", "probeview", "--snapshot", token], env)

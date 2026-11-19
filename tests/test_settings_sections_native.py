@@ -2,11 +2,12 @@ import json
 from pathlib import Path
 
 from native_environment import native_env as native_env
-from native_session import NativeSession, wait_for
+from native_session import NativeSession, assert_no_chrome_processes, assert_no_chrome_ptys, wait_for
 
 from tdnext.core.appearance import Appearance, AppearanceStore
 from tdnext.core.models import PluginState
 from tdnext.core.state import StateStore
+from tdnext.runtime import manager_for
 
 
 def open_general(session: NativeSession) -> str:
@@ -14,7 +15,7 @@ def open_general(session: NativeSession) -> str:
     target = session.tab_id("tdnext-header:settings")
     wait_for(lambda: session.active_tab() == target)
     panes = json.loads(session.action("list-panes", "--all", "--json"))
-    tool = next(pane for pane in panes if "panes tool settings" in (pane.get("pane_command") or ""))
+    tool = next(pane for pane in panes if "tdnext.pane view settings" in (pane.get("pane_command") or ""))
     pane_id = f"terminal_{tool['id']}"
     wait_for(lambda: pane_id in session.action("list-clients"))
     wait_for(lambda: "Icon appearance" in session.action("dump-screen", "--pane-id", pane_id))
@@ -38,6 +39,8 @@ def test_native_sections_return_to_files_without_restarting_btop(
         wait_for(lambda: "Icon appearance" in session.action("dump-screen", "--pane-id", pane))
         session.back_to("Files")
         assert session.btop_pid() == monitor
+        assert_no_chrome_ptys(session)
+        assert_no_chrome_processes(session.tmux_name)
     finally:
         session.close()
 
@@ -51,7 +54,7 @@ def test_native_settings_readiness_accepts_plugins_on_reentry(
         monitor = wait_for(session.btop_pid)
         session.open_settings()
         panes = json.loads(session.action("list-panes", "--all", "--json"))
-        tool = next(pane for pane in panes if "panes tool settings" in (pane.get("pane_command") or ""))
+        tool = next(pane for pane in panes if "tdnext.pane view settings" in (pane.get("pane_command") or ""))
         pane_id = f"terminal_{tool['id']}"
         assert "> General" in session.action("dump-screen", "--pane-id", pane_id)
         session.send_key("BTab")
@@ -62,6 +65,8 @@ def test_native_settings_readiness_accepts_plugins_on_reentry(
         assert "> Plugins" in session.action("dump-screen", "--pane-id", pane_id)
         session.back_to("Files")
         assert session.btop_pid() == monitor
+        assert_no_chrome_ptys(session)
+        assert_no_chrome_processes(session.tmux_name)
     finally:
         session.close()
 
@@ -71,9 +76,7 @@ def test_native_sessions_refresh_appearance_without_changing_running_icons(
 ) -> None:
     env, binary = native_env
     state_dir = Path(env["TDNEXT_STATE_DIR"])
-    plugins = StateStore(state_dir / "plugins.json")
-    state = plugins.read()
-    plugins.write(PluginState(installed=state.installed | {"icons"}, enabled=state.enabled | {"icons"}))
+    manager_for(state_dir).enable("icons")
     appearance = AppearanceStore(state_dir / "appearance.json")
     first = NativeSession(tmp_path, env, binary)
     try:
@@ -117,6 +120,7 @@ def test_native_shell_keeps_interactive_job_when_settings_opens(
     env.update({"HOME": str(home), "SHELL": "/bin/bash", "HISTFILE": "/dev/null", "INPUTRC": "/dev/null"})
     env.pop("BASH_ENV", None)
     ids = frozenset({"desktop", "files", "shell", "settings"})
+    manager_for(tmp_path / "state").enable("shell")
     StateStore(tmp_path / "state" / "plugins.json").write(PluginState(installed=ids, enabled=ids))
     session = NativeSession(tmp_path, env, binary, expected_tabs=3)
     try:
@@ -138,5 +142,7 @@ def test_native_shell_keeps_interactive_job_when_settings_opens(
         session.send_key("hello")
         session.send_key("Enter")
         wait_for(lambda: "NATIVE_RESULT:hello" in session.action("dump-screen", "--pane-id", pane_id))
+        assert_no_chrome_ptys(session)
+        assert_no_chrome_processes(session.tmux_name)
     finally:
         session.close()

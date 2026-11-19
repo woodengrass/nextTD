@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 from native_environment import native_env as native_env
-from native_session import NativeSession, wait_for
+from native_session import NativeSession, assert_no_chrome_processes, assert_no_chrome_ptys, wait_for
 from test_native_core_navigation import capture
 from test_native_core_navigation import core_native as core_native
 
@@ -21,7 +21,7 @@ def wait_for_click_ready(session: NativeSession) -> None:
         nonlocal steady
         panes = json.loads(session.action("list-panes", "--all", "--json"))
         tool = next(
-            (pane for pane in panes if "panes tool settings" in (pane.get("pane_command") or "")),
+            (pane for pane in panes if "tdnext.pane view settings" in (pane.get("pane_command") or "")),
             None,
         )
         if tool is None:
@@ -33,13 +33,27 @@ def wait_for_click_ready(session: NativeSession) -> None:
             steady = 0
             return False
         screen = capture(session).splitlines()
-        if len(screen) <= 3 or screen[3][111:115] != "Back":
+        if len(screen) <= 3 or screen[2][111:115] != "Back":
             steady = 0
             return False
         steady += 1
         return steady >= 3
 
     wait_for(click_ready)
+
+
+def wait_for_back_cell(session: NativeSession) -> None:
+    """Bounded wait for Back at its pinned settings chrome cell.
+
+    The settings pane dump can show Back before the core composites
+    the frame to the terminal, so poll the capture instead of asserting
+    on the first frame; the pinned-cell assertion itself is unchanged.
+    """
+    def visible() -> bool:
+        screen = capture(session).splitlines()
+        return len(screen) > 2 and screen[2][111:115] == "Back"
+
+    wait_for(visible)
 
 
 def test_core_back_click_without_detach(tmp_path: Path, core_native: tuple[dict[str, str], str]) -> None:
@@ -50,9 +64,10 @@ def test_core_back_click_without_detach(tmp_path: Path, core_native: tuple[dict[
         origin_tab = session.active_tab()
         origin_pane = session.action("list-clients").splitlines()[1].split()[1]
         session.open_settings()
-        assert capture(session).splitlines()[3][111:115] == "Back"
-        session.mouse(113, 4, release=False)
-        session.mouse(113, 4, release=True)
+        wait_for_back_cell(session)
+        assert capture(session).splitlines()[2][111:115] == "Back"
+        session.mouse(113, 3, release=False)
+        session.mouse(113, 3, release=True)
         wait_for(lambda: session.active_tab() == origin_tab)
         wait_for(lambda: session.action("list-clients").splitlines()[1].split()[1] == origin_pane)
     finally:
@@ -94,14 +109,17 @@ def test_core_reconnect_restores_exact_tab_and_pane(
         )
         wait_for(lambda: session.ready(3))
         session.wait_for_settings()
+        assert_no_chrome_ptys(session)
+        assert_no_chrome_processes(session.tmux_name)
+        wait_for_back_cell(session)
         captured = capture(session)
         (tmp_path / "reattached-screen.txt").write_text(captured)
         screen = captured.splitlines()
-        assert screen[3][111:115] == "Back", screen[3]
+        assert screen[2][111:115] == "Back", screen[2]
         if return_method == "click":
             wait_for_click_ready(session)
-            session.mouse(113, 4, release=False)
-            session.mouse(113, 4, release=True)
+            session.mouse(113, 3, release=False)
+            session.mouse(113, 3, release=True)
         elif return_method == "escape":
             session.send_key("Escape")
         else:

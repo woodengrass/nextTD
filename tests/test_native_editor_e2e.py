@@ -23,6 +23,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+from native_environment import capable_core_source, core_wanted_message
 from native_environment import native_env as native_env
 from native_session import NativeSession, wait_for
 
@@ -51,14 +52,17 @@ def require_vi() -> str:
 
 
 def resolve_binary(stock: str) -> str:
-    """Prefer TDNEXT_CORE_BINARY when set, after validating it is executable."""
-    candidate = os.environ.get("TDNEXT_CORE_BINARY")
-    if not candidate:
-        return stock
-    binary = Path(candidate)
-    if not binary.is_file() or not os.access(binary, os.X_OK):
-        pytest.fail("TDNEXT_CORE_BINARY is not an executable file")
-    return str(binary)
+    """Return the stage-3 core binary; fail when it is missing or incapable.
+
+    The editor flows run the real desktop, which only starts on the
+    stage-3 core now. Falling back to the stock binary would mask that
+    failure behind an unrelated legacy route.
+    """
+    del stock
+    source = capable_core_source()
+    if source is None:
+        pytest.fail(f"editor test requires a capable core binary: {core_wanted_message()}")
+    return str(source)
 
 
 def isolate_home(env: dict[str, str], tmp_path: Path) -> None:
@@ -74,7 +78,7 @@ def isolate_home(env: dict[str, str], tmp_path: Path) -> None:
 def settings_pane(session: NativeSession) -> str:
     """Return the terminal id of the Settings tool pane."""
     panes = json.loads(session.action("list-panes", "--all", "--json"))
-    tool = next(pane for pane in panes if "panes tool settings" in (pane.get("pane_command") or ""))
+    tool = next(pane for pane in panes if "tdnext.pane view settings" in (pane.get("pane_command") or ""))
     return f"terminal_{tool['id']}"
 
 

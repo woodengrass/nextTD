@@ -13,8 +13,7 @@ from pathlib import Path
 import pytest
 from native_environment import native_env as native_env
 
-from tdnext.core.models import PluginState
-from tdnext.core.state import StateStore
+from tdnext.runtime import manager_for
 
 ANSI = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[()][A-Za-z0-9]|.)", re.DOTALL)
 
@@ -39,8 +38,15 @@ def test_fallback_footer_in_real_pty(
     tmp_path: Path, native_env: tuple[dict[str, str], str], size: tuple[int, int], header: bool
 ) -> None:
     env, _binary = native_env
+    plugins = manager_for(tmp_path / "state")
+    for plugin_id in ("desktop", "files", "monitor"):
+        plugins.enable(plugin_id)
+    if header:
+        plugins.enable("settings")
+    else:
+        plugins.disable("settings")
     ids = frozenset({"desktop", "files", "monitor"} | ({"settings"} if header else set()))
-    StateStore(tmp_path / "state" / "plugins.json").write(PluginState(installed=ids, enabled=ids))
+    assert plugins.store.read().enabled == ids
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", size[1], size[0], 0, 0))
     process = subprocess.Popen(

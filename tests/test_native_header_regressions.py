@@ -4,10 +4,16 @@ from pathlib import Path
 
 import pytest
 from native_environment import native_env as native_env
-from native_session import NativeSession, wait_for
+from native_session import (
+    NativeSession,
+    assert_no_chrome_ptys,
+    chrome_header_text,
+    wait_for,
+)
 
 from tdnext.core.models import PluginState
 from tdnext.core.state import StateStore
+from tdnext.runtime import manager_for
 
 
 def files_pane(session: NativeSession) -> str:
@@ -17,9 +23,8 @@ def files_pane(session: NativeSession) -> str:
 
 
 def wait_for_header(session: NativeSession) -> None:
-    panes = json.loads(session.action("list-panes", "--all", "--json"))
-    header = next(pane for pane in panes if "panes header files" in (pane.get("pane_command") or ""))
-    wait_for(lambda: "Settings" in session.action("dump-screen", "--pane-id", f"terminal_{header['id']}"))
+    """The core-drawn header shows the old labels; it has no PTY to dump."""
+    wait_for(lambda: "Settings" in chrome_header_text(session))
 
 
 @pytest.mark.parametrize("x", [5, 110], ids=["non-action", "settings-action"])
@@ -34,10 +39,8 @@ def test_native_header_mouse_returns_focus_to_files_and_file_keys_work(
         wait_for(lambda: "Files" in session.action("dump-screen", "--pane-id", pane))
         wait_for_header(session)
         if x == 5:
-            panes = json.loads(session.action("list-panes", "--all", "--json"))
-            header = next(p for p in panes if "panes header files" in (p.get("pane_command") or ""))
             session.header_mouse(x, release=False)
-            wait_for(lambda: f"terminal_{header['id']}" in session.action("list-clients"))
+            wait_for(lambda: pane in session.action("list-clients"))
             session.header_mouse(x, release=True)
         else:
             session.click_header(x=x)
@@ -62,15 +65,16 @@ def test_native_active_settings_header_click_keeps_escape_operable(
     session = NativeSession(tmp_path, env, binary)
     try:
         session.open_settings()
-        panes = json.loads(session.action("list-panes", "--all", "--json"))
-        header = next(pane for pane in panes if "panes header settings" in (pane.get("pane_command") or ""))
-        wait_for(lambda: "Settings" in session.action("dump-screen", "--pane-id", f"terminal_{header['id']}"))
+        wait_for_header(session)
+        tool = next(
+            pane for pane in json.loads(session.action("list-panes", "--all", "--json"))
+            if "tdnext.pane view settings" in (pane.get("pane_command") or "")
+        )
         session.header_mouse(x, release=False)
-        wait_for(lambda: f"terminal_{header['id']}" in session.action("list-clients"))
         session.header_mouse(x, release=True)
-        tool = next(pane for pane in panes if "panes tool settings" in (pane.get("pane_command") or ""))
         wait_for(lambda: f"terminal_{tool['id']}" in session.action("list-clients"))
         session.back_to("Files")
+        assert_no_chrome_ptys(session)
     finally:
         session.close()
 
@@ -82,20 +86,27 @@ def test_native_settings_returns_to_originating_sidebar_pane(
     env, binary = native_env
     session = NativeSession(tmp_path, env, binary)
     try:
-        panes = json.loads(session.action("list-panes", "--all", "--json"))
-        sidebar = next(pane for pane in panes if "panes sidebar files" in (pane.get("pane_command") or ""))
-        sidebar_id = f"terminal_{sidebar['id']}"
         wait_for_header(session)
         session.mouse(5, 5, release=False)
         session.mouse(5, 5, release=True)
-        wait_for(lambda: sidebar_id in session.action("list-clients"))
+
+        def settled_clients() -> str | None:
+            first = session.action("list-clients")
+            return first if first == session.action("list-clients") else None
+
+        origin_clients = wait_for(settled_clients)
+        origin_pane = origin_clients.splitlines()[1].split()[1]
+        origin_tab = session.active_tab()
+        assert origin_tab is not None
+        origin_name = next(str(tab["name"]) for tab in session.tabs() if int(tab["tab_id"]) == origin_tab)
         if mouse:
             session.click_header()
             session.wait_for_settings()
         else:
             session.open_settings()
-        session.back_to("Files")
-        wait_for(lambda: sidebar_id in session.action("list-clients"))
+        session.back_to(origin_name)
+        wait_for(lambda: origin_pane in session.action("list-clients"))
+        assert_no_chrome_ptys(session)
     finally:
         session.close()
 
@@ -115,6 +126,7 @@ def test_native_shortcut_returns_to_originating_floating_pane(
         session.open_settings()
         session.back_to("Files")
         wait_for(lambda: pane_id in session.action("list-clients"))
+        assert_no_chrome_ptys(session)
     finally:
         session.close()
 
@@ -142,20 +154,33 @@ def test_native_numeric_shortcuts_follow_three_sidebar_views(
     tmp_path: Path, native_env: tuple[dict[str, str], str]
 ) -> None:
     env, binary = native_env
-    plugin = tmp_path / "state" / "plugins" / "third"
+    state = tmp_path / "state"
+    plugin = state / "plugins" / "third"
     plugin.mkdir(parents=True)
+    (plugin / "third_mod.py").write_text(
+        "from tdnext.plugins.files.plugin import FilesPlugin\n"
+        "class ThirdPlugin(FilesPlugin):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
     (plugin / "plugin.toml").write_text(
         'id = "third"\nname = "Third"\nversion = "0.1.0"\ndescription = "Third view"\n'
         'manifest_version = 1\napi_version = 1\nview_interfaces = ["tdnext.textual-view.v1"]\n'
-        'entrypoint = "tdnext.plugins.files.plugin:FilesPlugin"\nrequires_plugins = ["desktop"]\n'
+        'entrypoint = "third_mod:ThirdPlugin"\nrequires_plugins = ["desktop"]\n'
         'capabilities = ["desktop.view", "files.browse"]\nrequires_executables = []\n',
         encoding="utf-8",
     )
-    ids = frozenset({"desktop", "files", "monitor", "settings", "third"})
-    StateStore(tmp_path / "state" / "plugins.json").write(PluginState(installed=ids, enabled=ids))
+    manager = manager_for(state)
+    manager.enable("third")
     session = NativeSession(tmp_path, env, binary, expected_tabs=4)
     try:
+        files_target = session.tab_id("Files")
+        monitor_target = session.tab_id("Monitor")
         target = session.tab_id("Third")
+        session.send_key("M-1")
+        wait_for(lambda: session.active_tab() == files_target)
+        session.send_key("M-2")
+        wait_for(lambda: session.active_tab() == monitor_target)
         session.send_key("M-3")
         wait_for(lambda: session.active_tab() == target)
         panes = json.loads(session.action("list-panes", "--all", "--json"))

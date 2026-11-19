@@ -5,17 +5,14 @@ from pathlib import Path
 
 import pytest
 from native_environment import native_env as native_env
-from native_session import NativeSession, wait_for
+from native_session import NativeSession, chrome_header_text, wait_for
 from test_native_core_navigation import capture, core_flag_active
 from test_native_core_navigation import core_native as core_native
 
 
-def header_pane(session: NativeSession, tab: str) -> str:
-    panes = json.loads(session.action("list-panes", "--all", "--json"))
-    header = next(pane for pane in panes if f"panes header {tab}" in (pane.get("pane_command") or ""))
-    pane_id = f"terminal_{header['id']}"
-    wait_for(lambda: "Settings" in session.action("dump-screen", "--pane-id", pane_id))
-    return pane_id
+def wait_for_chrome_header(session: NativeSession) -> None:
+    """The core-drawn header shows the old labels; it has no PTY to dump."""
+    wait_for(lambda: "Settings" in chrome_header_text(session))
 
 
 def open_floating(session: NativeSession) -> str:
@@ -38,7 +35,7 @@ def test_core_rapid_blank_then_settings_returns_to_exact_pane(
         assert session.sessions() == {session.name}
         wait_for(lambda: core_flag_active(session))
         session.switch("Files")
-        header_pane(session, "files")
+        wait_for_chrome_header(session)
         if floating:
             open_floating(session)
         origin = session.action("list-clients")
@@ -62,10 +59,10 @@ def test_core_blank_header_returns_focus_to_floating_origin(
     session = NativeSession(tmp_path, env, core)
     try:
         assert session.sessions() == {session.name}
-        header = header_pane(session, "files")
+        wait_for_chrome_header(session)
         floating = open_floating(session)
         session.header_mouse(10, release=False)
-        wait_for(lambda: header in session.action("list-clients"))
+        wait_for(lambda: floating in session.action("list-clients"))
         session.header_mouse(10, release=True)
         wait_for(lambda: floating in session.action("list-clients"))
     finally:
@@ -81,14 +78,13 @@ def test_core_active_header_preserves_dialog_and_restores_tool_focus(
     try:
         assert session.sessions() == {session.name}
         session.open_settings()
-        header = header_pane(session, "settings")
+        wait_for_chrome_header(session)
         panes = json.loads(session.action("list-panes", "--all", "--json"))
-        tool = next(pane for pane in panes if "panes tool settings" in (pane.get("pane_command") or ""))
+        tool = next(pane for pane in panes if "tdnext.pane view settings" in (pane.get("pane_command") or ""))
         tool_id = f"terminal_{tool['id']}"
         session.send_key("Enter")
         wait_for(lambda: capture(session).count("None (text)") >= 2)
         session.header_mouse(x, release=False)
-        wait_for(lambda: header in session.action("list-clients"))
         session.header_mouse(x, release=True)
         wait_for(lambda: tool_id in session.action("list-clients"))
         session.send_key("Escape")

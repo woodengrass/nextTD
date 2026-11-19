@@ -19,8 +19,7 @@ SETTINGS_CSS = """
     SettingsView #settings-intro { height: 2; color: $text-muted; }
     SettingsView.narrow #settings-intro { height: 3; }
     SettingsView .settings-group { height: auto; }
-    SettingsView #editor-group { margin-top: 1; }
-    SettingsView #general-title, SettingsView #editor-title { height: 2; text-style: bold; }
+    SettingsView #general-title { height: 2; text-style: bold; }
     SettingsView #general-help { height: auto; color: $text-muted; margin-top: 1; }
     SettingsView #plugin-list, SettingsView #plugin-list:focus { height: 1fr; border: solid $foreground-muted; }
     SettingsView #plugin-detail { height: 1; color: $text-muted; text-wrap: nowrap; text-overflow: ellipsis; }
@@ -28,7 +27,7 @@ SETTINGS_CSS = """
     SettingsView.narrow #plugin-actions { height: 4; }
     SettingsView #plugin-actions Button { width: 1fr; min-width: 11; height: 3; padding: 0; }
     SettingsView.narrow #plugin-actions Button { width: 13; }
-    SettingsView #plugin-uninstall:enabled { color: $error; text-style: bold; }
+    SettingsView #plugin-install.uninstall:enabled { color: $error; text-style: bold; }
     SettingsView #settings-feedback-scroll {
         height: auto; min-height: 3; max-height: 4; overflow-x: hidden; border: solid $foreground-muted;
     }
