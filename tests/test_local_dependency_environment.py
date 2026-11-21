@@ -6,10 +6,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
-from test_settings_ui import make_app
 
-from tdnext.api import ViewPlugin
+from tdnext.api import PluginContext, ViewPlugin
 from tdnext.core.appearance import Appearance, AppearanceStore
+from tdnext.core.discovery import discover, instantiate
 from tdnext.core.errors import InstallationConsentRequired
 from tdnext.core.local_env import (
     BOOTSTRAPPED_ENV,
@@ -19,11 +19,28 @@ from tdnext.core.local_env import (
     restored_env,
 )
 from tdnext.core.manager import PluginManager
-from tdnext.core.presentation import snapshot_views
-from tdnext.launcher import enabled_views
+from tdnext.core.models import PluginState
+from tdnext.core.state import StateStore
+from tdnext.core.views import enabled_views
 from tdnext.plugins.files.plugin import FilesPlugin
+from tdnext.plugins.settings.plugin import SettingsPane
+
+
+def make_app(tmp_path: Path) -> tuple[SettingsPane, PluginManager]:
+    """Mount the Settings pane with an isolated plugin state."""
+    roots = (Path(__file__).parents[1] / "src" / "tdnext" / "plugins",)
+    manifests = discover(roots)
+    manifests["monitor"] = manifests["monitor"].model_copy(
+        update={"requires_executables": (), "dependency_hook": None}
+    )
+    manager = PluginManager(manifests, StateStore(tmp_path / "plugins.json"), tmp_path / "bin")
+    installed = frozenset({"desktop", "files", "settings"})
+    manager.store.write(PluginState(installed=installed, enabled=installed))
+    return SettingsPane(PluginContext(tmp_path, manager)), manager
 
 BTOP = Path(__file__).parents[1] / "state" / "bin" / "btop"
+if not BTOP.is_file() and (system_btop := shutil.which("btop")):
+    BTOP = Path(system_btop)
 STARTED = threading.Event()
 RELEASE = threading.Event()
 
@@ -153,7 +170,8 @@ def test_local_binary_is_available_to_import_constructor_and_runtime(
         assert plugin.make_view(app.context) is not None
     else:
         AppearanceStore(manager.store.path.with_name("appearance.json")).write(Appearance(provider_id="probe"))
-        assert snapshot_views(manager, app.views).icon_for("files") == "[]"
+        provider = instantiate(manager.manifests["probe"])
+        assert provider.resolve("files", "compatibility") == "[]"
     assert os.environ["PATH"] == str(manager.local_bin)
     assert restored_env()["PATH"] == ""
 

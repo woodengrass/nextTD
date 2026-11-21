@@ -3,21 +3,39 @@ import json
 from pathlib import Path
 
 import pytest
-from test_settings_ui import make_app
 from textual.widgets import DataTable
 from typer.testing import CliRunner
 
-from tdnext import cli, launcher
+from tdnext import cli
+from tdnext.api import PluginContext
 from tdnext.core.discovery import discover
 from tdnext.core.errors import PluginError
 from tdnext.core.manager import PluginManager
 from tdnext.core.models import PluginState
 from tdnext.core.session import current_session
 from tdnext.core.state import StateStore
+from tdnext.core.views import enabled_views
 from tdnext.plugins.monitor.dependencies import MonitorDependencies
+from tdnext.plugins.settings.plugin import SettingsPane
 from tdnext.plugins.settings.view import SettingsView
 
 BUILTINS = Path(__file__).parents[1] / "src" / "tdnext" / "plugins"
+
+
+def make_app(tmp_path: Path) -> tuple[SettingsPane, PluginManager]:
+    """Local harness: retained Settings pane over the bundled manifests.
+
+    (test_settings_ui.make_app still targets the removed Python desktop host;
+    its owner needs to migrate it. This file owns only its own harness.)
+    """
+    manifests = discover((BUILTINS,))
+    manifests["monitor"] = manifests["monitor"].model_copy(
+        update={"requires_executables": (), "dependency_hook": None}
+    )
+    manager = PluginManager(manifests, StateStore(tmp_path / "plugins.json"), tmp_path / "bin")
+    installed = frozenset({"desktop", "files", "settings"})
+    manager.store.write(PluginState(installed=installed, enabled=installed))
+    return SettingsPane(PluginContext(tmp_path, manager)), manager
 
 
 def fake_monitor_installer(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -56,10 +74,9 @@ def test_enabled_conflicting_plugin_stops_launch_and_is_reported_by_cli(
         installed=frozenset({"desktop", "files"}), enabled=frozenset({"desktop", "files"})
     ))
     monkeypatch.setattr(cli, "manager", lambda: manager)
-    monkeypatch.setattr(launcher, "manager", lambda: manager)
     assert "Duplicate plugin id files" in CliRunner().invoke(cli.cli, ["list"]).output
     with pytest.raises(PluginError, match="Duplicate plugin id files"):
-        launcher.launch(tmp_path)
+        enabled_views(manager)
 
 
 def test_ambiguous_host_requires_selection_without_writing_state(tmp_path: Path) -> None:
@@ -147,7 +164,6 @@ async def test_settings_refusal_never_installs_or_changes_state(
 
     monkeypatch.setattr(MonitorDependencies, "install", forbidden)
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o")
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("monitor"))
@@ -168,7 +184,6 @@ async def test_settings_consent_installs_monitor(tmp_path: Path, monkeypatch: py
                         if (manager.local_bin / name).exists() else None)
     fake_monitor_installer(monkeypatch)
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o")
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("monitor"))

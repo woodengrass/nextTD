@@ -31,7 +31,7 @@ class PluginManager:
         existing: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         # Local import avoids a circular import (tdnext.api imports PluginManager).
-        from ..api import DesktopHost, IconProvider
+        from ..api import IconProvider
         from .icons import check_provider
 
         hooks = {}
@@ -75,12 +75,13 @@ class PluginManager:
                 binary = self.executable(executable)
                 if binary is None:
                     raise PluginError(f"{name} requires missing executable '{executable}'; install it on PATH")
+            if manifest.role == "desktop.host":
+                continue
             plugin = instantiate(manifest)
             instances[name] = plugin
             match manifest.role:
                 case "desktop.host":
-                    if not isinstance(plugin, DesktopHost) or not callable(plugin.run):
-                        raise PluginError(f"{name} does not implement the desktop host contract")
+                    pass
                 case "desktop.view":
                     pass
                 case "icons.provider":

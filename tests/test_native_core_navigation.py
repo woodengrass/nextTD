@@ -1,28 +1,22 @@
-"""Native end-to-end regression for the pending Zellij core navigation integration.
+"""Native end-to-end regression for core navigation on the supported desktop.
 
-Scope: real single-client settings open/back through the compiled core
-candidate only. The core agent owns the exact ``open-tab-with-return`` /
-``return-to-origin`` CLI plus the direct ``OpenTabWithReturn`` KDL binding;
-the desktop agent owns wiring the custom binary into the launcher. These
-tests pin the observable contract both agents must satisfy and stay red
-until the wiring lands.
+Scope: real single-client settings open/back through the supported Rust
+desktop (``native-desktop/target/release/tdnext-desktop``) and the patched
+core from ``TDNEXT_CORE_BINARY``. Navigation is the core's
+``open-tab-with-return`` / ``return-to-origin`` CLI plus the direct
+``OpenTabWithReturn`` KDL binding, with the original Python Files/Settings
+panes as content programs.
 
 Harness: stock ``native_env`` fixture for the isolated tmp state, tmux
 socket, and tagged sessions, plus ``NativeSession`` for the single-client
-drive. The core candidate comes from the explicit ``TDNEXT_CORE_BINARY``
-executable path and is symlinked into the isolated
-``env['TDNEXT_STATE_DIR']/bin/zellij-core-navigation-v3``; the isolated
-``bin/zellij`` shadow makes the session under test launch on the candidate
-server while every other path keeps using explicit binaries. When the
-candidate is absent or does not yet expose the core CLI, every test skips
-with an explicit reason instead of failing.
+drive. The core candidate comes from the ``TDNEXT_CORE_BINARY`` executable
+path set by ``native_env``; when it does not expose the core CLI, every
+test fails with an explicit reason.
 
-Core-route proof (no mocks, no weakened assertions): the header tab keeps
-its bare ``tdnext-header:settings`` name (the core switch is by stable id
-and never renames; the Python fallback always appends the ``@`` origin
-suffix when origin and destination differ), no
-``tdnext.plugins.desktop.shortcut`` fallback process is sampled while the
-settings window is open, and the session carries both core v2 environment flags.
+Core-route proof (no mocks): the header tab keeps its bare
+``tdnext-header:settings`` name (the core switches by stable id and never
+renames) and no ``tdnext.plugins.desktop.shortcut`` fallback process is
+sampled while the settings window is open.
 Isolation proof: single-session tests assert the isolated socket shows
 exactly this session; the two-session test asserts exactly both sessions.
 """
@@ -49,11 +43,11 @@ SETTINGS_PARTS = ("Settings", "Back", "> General", "Provider:", "Style:")
 def core_native(
     native_env: tuple[dict[str, str], str],
 ) -> tuple[dict[str, str], str]:
-    """Isolated session env launching on the core candidate; skip while pending."""
-    env, _stock = native_env
-    candidate = os.environ.get(CANDIDATE_ENV, "").strip()
+    """Isolated session env launching on the supported patched core."""
+    env, stock = native_env
+    candidate = env.get(CANDIDATE_ENV, "").strip() or os.environ.get(CANDIDATE_ENV, "").strip()
     if not candidate:
-        pytest.skip(f"{CANDIDATE_ENV} is not set: build the core navigation candidate first")
+        pytest.skip(f"{CANDIDATE_ENV} is not set: native_env must provide the patched core")
     source = Path(candidate)
     if not source.is_file() or not os.access(source, os.X_OK):
         pytest.fail(f"{CANDIDATE_ENV}={candidate!r} is not an executable file")
@@ -66,20 +60,7 @@ def core_native(
         )
         if probe.returncode != 0:
             pytest.fail(f"core candidate {source} does not expose '{cli}' (exit={probe.returncode})")
-    session_env = dict(env)
-    session_env.pop(CORE_FLAG, None)
-    session_env.pop("TDNEXT_CORE_NAVIGATION_VERSION", None)
-    bin_dir = Path(session_env["TDNEXT_STATE_DIR"]) / "bin"
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    link = bin_dir / LINK_NAME
-    if link.is_symlink() or link.exists():
-        link.unlink()
-    link.symlink_to(source)
-    shadow = bin_dir / "zellij"
-    if shadow.is_symlink() or shadow.exists():
-        shadow.unlink()
-    shadow.symlink_to(source)
-    return session_env, str(link)
+    return dict(env), stock
 
 
 def capture(session: NativeSession) -> str:
@@ -94,12 +75,13 @@ def header_tab_name(session: NativeSession) -> str:
 
 
 def core_flag_active(session: NativeSession) -> bool:
-    """The session's own tagged processes carry the core navigation flag."""
+    """The session's own tagged processes run on the supported patched core."""
     marker = f"TDNEXT_TEST_SESSION={session.tmux_name}".encode()
-    for _pid, environ, _command in tagged_processes(session.tmux_name):
+    core = session.binary.encode()
+    for _pid, environ, command in tagged_processes(session.tmux_name):
         if marker not in environ:
             continue
-        if b"TDNEXT_CORE_NAVIGATION=1" in environ and b"TDNEXT_CORE_NAVIGATION_VERSION=2" in environ:
+        if any(core in part for part in command):
             return True
     return False
 
@@ -160,10 +142,6 @@ def test_core_mouse_open_back_proves_core_route(
         assert session.sessions() == {session.name}
         wait_for(lambda: core_flag_active(session))
         session.switch("Files")
-        panes = json.loads(session.action("list-panes", "--all", "--json"))
-        header = next(pane for pane in panes if "panes header files" in (pane.get("pane_command") or ""))
-        pane_id = f"terminal_{header['id']}"
-        wait_for(lambda: "Settings" in session.action("dump-screen", "--pane-id", pane_id))
         session.click_header()
         dest = session.tab_id(BARE_HEADER)
         sightings: list[str] = []
@@ -186,9 +164,6 @@ def test_core_header_without_action_preserves_origin_for_next_click(
     try:
         wait_for(lambda: core_flag_active(session))
         session.switch("Files")
-        panes = json.loads(session.action("list-panes", "--all", "--json"))
-        header = next(pane for pane in panes if "panes header files" in (pane.get("pane_command") or ""))
-        wait_for(lambda: "Settings" in session.action("dump-screen", "--pane-id", f"terminal_{header['id']}"))
         origin = session.action("list-clients")
         session.click_header(x=10)
         wait_for(lambda: session.active_tab() == session.tab_id("Files"))
@@ -250,9 +225,6 @@ def test_core_floating_origin_returns_to_floating_pane(
         session.mouse(floating["pane_x"] + 2, floating["pane_y"] + 2, release=True)
         wait_for(lambda: origin in session.action("list-clients"))
         if via_mouse:
-            headers = json.loads(session.action("list-panes", "--all", "--json"))
-            header = next(pane for pane in headers if "panes header files" in (pane.get("pane_command") or ""))
-            wait_for(lambda: "Settings" in session.action("dump-screen", "--pane-id", f"terminal_{header['id']}"))
             session.click_header()
         else:
             session.send_key("M-o")

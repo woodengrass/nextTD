@@ -27,14 +27,6 @@ skip-excluded-dirs = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tdnext"]
-artifacts = ["src/tdnext/plugins/desktop/navigator-broker.wasm"]
-
-[tool.hatch.build.targets.wheel.hooks.custom]
-path = "hatch_build.py"
-
-[tool.hatch.build.targets.sdist]
-exclude = ["/zellij-navigator-broker/target"]
-artifacts = ["src/tdnext/plugins/desktop/navigator-broker.wasm"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

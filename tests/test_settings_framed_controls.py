@@ -21,7 +21,6 @@ async def test_sections_are_framed_and_their_edges_are_clickable(
     app, _manager = make_app(tmp_path)
     app.theme = theme
     async with app.run_test(size=size) as pilot:
-        await pilot.press("alt+o")
         plugins = app.query_one("#section-plugins", Button)
         assert plugins.region.height >= 3
         assert all(edge[0] != "none" for edge in plugins.styles.border)
@@ -36,7 +35,6 @@ async def test_sections_are_framed_and_their_edges_are_clickable(
 async def test_section_frame_does_not_change_with_focus_or_hover(tmp_path: Path) -> None:
     app, _manager = make_app(tmp_path)
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o")
         button = app.query_one("#section-plugins", Button)
         border = button.styles.border
         await pilot.press("shift+tab")
@@ -55,7 +53,6 @@ async def test_appearance_frame_click_opens_and_mouse_choice_persists(
     app, manager = make_app(tmp_path)
     manager.enable("icons")
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o")
         frame = app.query_one(f"#icon-{field}-frame")
         selector = app.query_one(f"#icon-{field}", Select)
         assert frame.region.height == 3
@@ -73,7 +70,6 @@ async def test_appearance_frame_click_opens_and_mouse_choice_persists(
 async def test_clicking_plugin_row_targets_that_plugin_for_an_action(tmp_path: Path) -> None:
     app, manager = make_app(tmp_path)
     async with app.run_test(size=(120, 36)) as pilot:
-        await pilot.press("alt+o")
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         table = app.query_one("#plugin-list", DataTable)
@@ -90,7 +86,6 @@ async def test_disabled_action_cannot_be_triggered_by_its_frame_or_shortcut(tmp_
     app, manager = make_app(tmp_path)
     before = manager.store.read()
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o")
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("desktop"))
@@ -109,7 +104,6 @@ async def test_mouse_uninstall_cancel_keeps_the_selected_plugin_installed(tmp_pa
     state = manager.store.read()
     manager.store.write(PluginState(installed=state.installed | {"monitor"}, enabled=state.enabled))
     async with app.run_test(size=(120, 36)) as pilot:
-        await pilot.press("alt+o")
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         table = view.query_one(DataTable)
@@ -124,7 +118,7 @@ async def test_mouse_uninstall_cancel_keeps_the_selected_plugin_installed(tmp_pa
 @pytest.mark.anyio
 async def test_native_narrow_pane_keeps_controls_reachable(tmp_path: Path) -> None:
     desktop, manager = make_app(tmp_path, monitor=True)
-    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=(35, 24)) as pilot:
         await pilot.pause()
         provider = app.query_one("#icon-provider-frame")

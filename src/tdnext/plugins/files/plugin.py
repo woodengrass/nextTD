@@ -1,6 +1,7 @@
 """Files plugin entry point."""
 
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.widget import Widget
 
 from tdnext.api import PluginContext
@@ -9,7 +10,7 @@ from .view import FilesView
 
 
 class FilesPane(App[None]):
-    BINDINGS = [("ctrl+q", "quit", "Quit")]
+    BINDINGS = [Binding("ctrl+q", "quit", "Quit", priority=True)]
 
     def __init__(self, context: PluginContext) -> None:
         super().__init__()

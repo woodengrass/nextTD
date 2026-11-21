@@ -14,7 +14,7 @@ from tdnext.plugins.settings.plugin import SettingsPlugin
 async def test_native_focus_refreshes_saved_appearance_without_changing_focus(tmp_path: Path) -> None:
     desktop, manager = make_app(tmp_path)
     manager.enable("icons")
-    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=(80, 24)) as pilot:
         focus = app.focused
         appearance = Appearance(provider_id="icons", icon_mode="codicons")
@@ -31,7 +31,7 @@ async def test_unchanged_native_focus_does_not_rebuild_provider_options(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     desktop, _manager = make_app(tmp_path)
-    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=(80, 24)) as pilot:
         selector = app.query_one("#icon-provider", Select)
         calls: list[bool] = []

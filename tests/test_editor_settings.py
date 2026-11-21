@@ -17,7 +17,7 @@ from tdnext.plugins.settings.plugin import SettingsPlugin
 @pytest.mark.anyio
 async def test_default_editor_is_displayed_without_creating_a_preference(tmp_path: Path) -> None:
     desktop, manager = make_app(tmp_path)
-    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     path = manager.store.path.with_name("editor.json")
     async with app.run_test(size=(80, 24)):
         assert app.focused is app.query_one("#icon-provider", Select)
@@ -40,14 +40,14 @@ async def test_keyboard_choice_survives_a_new_settings_pane(
     desktop, manager = make_app(tmp_path)
     store = EditorPreferencesStore(manager.store.path.with_name("editor.json"))
     store.write(EditorPreferences(editor=initial))
-    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press("tab", "tab", "tab")
         assert app.focused is app.query_one("#editor-choice", Select)
         await pilot.press("enter", *keys, "enter")
         assert store.read().editor == expected
         assert "next file open" in text_of(app.query_one("#plugin-feedback", Static))
-    reopened = ToolPane("settings", SettingsPlugin(), desktop.context)
+    reopened = ToolPane(SettingsPlugin(), desktop.context)
     async with reopened.run_test(size=(80, 24)):
         assert reopened.query_one("#editor-choice", Select).value == expected
 
@@ -56,7 +56,7 @@ async def test_keyboard_choice_survives_a_new_settings_pane(
 @pytest.mark.parametrize("position", ["left", "label", "right", "top", "bottom"])
 async def test_editor_frame_opens_with_pointer_and_saves_selected_option(tmp_path: Path, position: str) -> None:
     desktop, manager = make_app(tmp_path)
-    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=(120, 36)) as pilot:
         frame = app.query_one("#editor-choice-frame")
         selector = app.query_one("#editor-choice", Select)
@@ -77,7 +77,7 @@ async def test_editor_frame_opens_with_pointer_and_saves_selected_option(tmp_pat
 @pytest.mark.anyio
 async def test_selecting_current_editor_closes_without_a_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     desktop, _manager = make_app(tmp_path)
-    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=(120, 36)) as pilot:
         controls = app.query_one(EditorControls)
         writes: list[EditorPreferences] = []
@@ -93,7 +93,7 @@ async def test_selecting_current_editor_closes_without_a_write(tmp_path: Path, m
 @pytest.mark.anyio
 async def test_tab_traversal_leaves_editor_and_reverses_without_a_focus_loop(tmp_path: Path) -> None:
     desktop, _manager = make_app(tmp_path)
-    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press("tab", "tab", "tab", "tab")
         assert app.focused is app.query_one("#settings-back")
@@ -110,7 +110,7 @@ async def test_keyboard_reveals_full_editor_frame_at_each_size(
     tmp_path: Path, size: tuple[int, int], theme: str
 ) -> None:
     desktop, _manager = make_app(tmp_path)
-    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     app.theme = theme
     async with app.run_test(size=size) as pilot:
         await pilot.press("tab", "tab", "tab")
@@ -132,7 +132,7 @@ async def test_native_activation_refreshes_without_writes_or_focus_changes(
 ) -> None:
     desktop, manager = make_app(tmp_path)
     store = EditorPreferencesStore(manager.store.path.with_name("editor.json"))
-    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=(80, 24)) as pilot:
         controls = app.query_one(EditorControls)
         writes: list[EditorPreferences] = []
@@ -152,7 +152,7 @@ async def test_focusing_an_appearance_selector_refreshes_editor_without_writing(
 ) -> None:
     desktop, manager = make_app(tmp_path)
     store = EditorPreferencesStore(manager.store.path.with_name("editor.json"))
-    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=(80, 24)) as pilot:
         writes: list[EditorPreferences] = []
         monkeypatch.setattr(app.query_one(EditorControls).store, "write", writes.append)
@@ -168,7 +168,7 @@ async def test_returning_to_general_refreshes_editor_without_writing(
 ) -> None:
     desktop, manager = make_app(tmp_path)
     store = EditorPreferencesStore(manager.store.path.with_name("editor.json"))
-    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.click("#section-plugins")
         store.write(EditorPreferences(editor="vi"))
@@ -186,7 +186,7 @@ async def test_failed_save_restores_latest_saved_editor_and_reports_error(
 ) -> None:
     desktop, manager = make_app(tmp_path)
     store = EditorPreferencesStore(manager.store.path.with_name("editor.json"))
-    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=(120, 36)) as pilot:
         controls = app.query_one(EditorControls)
 
@@ -203,11 +203,13 @@ async def test_failed_save_restores_latest_saved_editor_and_reports_error(
 
 
 @pytest.mark.anyio
-async def test_reopening_desktop_settings_refreshes_the_saved_editor(tmp_path: Path) -> None:
-    app, manager = make_app(tmp_path)
+async def test_reopening_settings_pane_refreshes_the_saved_editor(tmp_path: Path) -> None:
+    desktop, manager = make_app(tmp_path)
     store = EditorPreferencesStore(manager.store.path.with_name("editor.json"))
-    async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o", "escape")
+    app = ToolPane(SettingsPlugin(), desktop.context)
+    async with app.run_test(size=(80, 24)):
+        assert app.query_one("#editor-choice", Select).value == "environment"
         store.write(EditorPreferences(editor="nvim"))
-        await pilot.press("alt+o")
-        assert app.query_one("#editor-choice", Select).value == "nvim"
+    reopened = ToolPane(SettingsPlugin(), desktop.context)
+    async with reopened.run_test(size=(80, 24)):
+        assert reopened.query_one("#editor-choice", Select).value == "nvim"

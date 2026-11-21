@@ -57,18 +57,14 @@ def terminate_tagged(tag: str) -> None:
                     raise AssertionError(f"Tagged process did not exit after SIGKILL: pidfd={handle}")
 
 
-def monitor_pid(name: str) -> int | None:
+def monitor_pid(name: str, tag: str) -> int | None:
     marker = f"ZELLIJ_SESSION_NAME={name}".encode()
-    for process in Path("/proc").iterdir():
-        if not process.name.isdigit():
+    for pid, environ, command in tagged_processes(tag):
+        if marker not in environ or len(command) != 2 or command[1] or Path(os.fsdecode(command[0])).name != "btop":
             continue
         try:
-            if marker not in (process / "environ").read_bytes().split(b"\0"):
-                continue
-            command = (process / "cmdline").read_bytes().split(b"\0")
-            if ((process / "comm").read_text().strip() == "btop" and len(command) == 2 and command[1] == b""
-                    and Path(os.fsdecode(command[0])).name == "btop"):
-                return int(process.name)
+            if Path(f"/proc/{pid}/comm").read_text().strip() == "btop":
+                return pid
         except (FileNotFoundError, PermissionError, ProcessLookupError):
             continue
     return None

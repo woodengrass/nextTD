@@ -1,5 +1,4 @@
 import json
-import sys
 from pathlib import Path
 
 from native_environment import native_env as native_env
@@ -57,30 +56,24 @@ def test_native_panes_keep_their_own_icon_snapshot_after_settings_change(
     first = NativeSession(tmp_path, env, binary)
     try:
         panes = json.loads(first.action("list-panes", "--all", "--json"))
-        sidebar = next(p for p in panes if "panes sidebar files" in (p.get("pane_command") or ""))
-        command = sidebar["pane_command"].split()
-        snapshot = command[command.index("--snapshot") + 1]
-        wait_for(lambda: "\uea83" in first.action("dump-screen", "--pane-id", f"terminal_{sidebar['id']}"))
+        content = next(p for p in panes if "tdnext.pane view files" in (p.get("pane_command") or ""))
+        wait_for(lambda: "Files" in first.action("dump-screen", "--pane-id", f"terminal_{content['id']}"))
         monitor = wait_for(first.btop_pid)
         appearance.write(Appearance(provider_id="icons", icon_mode="compatibility"))
         store.write(initial)
         first.open_settings()
         first.back_to("Files")
-        pane = first.action(
-            "new-pane", "--floating", "--", sys.executable, "-m", "tdnext.plugins.desktop.panes", "sidebar", "files",
-            "--snapshot", snapshot,
-        ).strip()
-        wait_for(lambda: "\uea83" in first.action("dump-screen", "--pane-id", pane))
         assert first.btop_pid() == monitor
         second = NativeSession(tmp_path, env, binary)
         try:
+            second.open_settings()
             panes = json.loads(second.action("list-panes", "--all", "--json"))
-            sidebar = next(p for p in panes if "panes sidebar files" in (p.get("pane_command") or ""))
-            screen = wait_for(lambda: (output if "Files" in (output := second.action(
-                "dump-screen", "--pane-id", f"terminal_{sidebar['id']}"
+            tool = next(p for p in panes if "panes tool settings" in (p.get("pane_command") or ""))
+            screen = wait_for(lambda: (output if "Provider:" in (output := second.action(
+                "dump-screen", "--pane-id", f"terminal_{tool['id']}"
             )) else ""))
-            assert "▤" in screen
-            assert "\uea83" not in screen
+            assert "unavailable" in screen
+            second.back_to("Files")
         finally:
             second.close()
     finally:

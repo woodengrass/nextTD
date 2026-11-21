@@ -1,7 +1,4 @@
-"""Command-line entry point for plugin management and the desktop."""
-
-from pathlib import Path
-from typing import Annotated
+"""Command-line entry point for plugin management."""
 
 import typer
 
@@ -74,14 +71,6 @@ def uninstall(plugin: str) -> None:
 def install_zellij() -> None:
     """Install the pinned optional Zellij binary under the local state directory."""
     typer.echo(f"Installed Zellij: {install_executable('zellij', state_dir() / 'bin')}")
-
-
-@cli.command()
-def run(directory: Annotated[Path, typer.Argument()] = Path(".")) -> None:
-    """Open the desktop at DIRECTORY."""
-    from .launcher import launch
-
-    launch(directory.resolve())
 
 
 def main() -> None:

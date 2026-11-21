@@ -12,21 +12,15 @@ from tdnext.plugins.settings.plugin import SettingsPlugin
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    "host_size",
-    [("pane", (35, 24)), ("pane", (80, 24)), ("pane", (120, 36)), ("desktop", (80, 24)), ("desktop", (120, 36))],
-)
+@pytest.mark.parametrize("size", [(35, 24), (80, 24), (120, 36)])
 @pytest.mark.parametrize("theme", ["textual-dark", "textual-light"])
 async def test_editor_options_occupy_clean_rows_without_obscuring_feedback(
-    tmp_path: Path, host_size: tuple[str, tuple[int, int]], theme: str
+    tmp_path: Path, size: tuple[int, int], theme: str
 ) -> None:
-    host, size = host_size
     desktop, _manager = make_app(tmp_path)
-    app = desktop if host == "desktop" else ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     app.theme = theme
     async with app.run_test(size=size) as pilot:
-        if host == "desktop":
-            await pilot.press("alt+o")
         await pilot.press("tab", "tab", "tab")
         feedback = app.query_one("#settings-feedback-scroll", VerticalScroll)
         before = app.screen._compositor.render_strips()
@@ -58,18 +52,11 @@ async def test_editor_options_occupy_clean_rows_without_obscuring_feedback(
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    "host_size", [("pane", (35, 24)), ("pane", (80, 24)), ("pane", (120, 36)), ("desktop", (80, 24))]
-)
-async def test_mouse_can_select_bottom_editor_option_after_expansion(
-    tmp_path: Path, host_size: tuple[str, tuple[int, int]]
-) -> None:
-    host, size = host_size
+@pytest.mark.parametrize("size", [(35, 24), (80, 24), (120, 36)])
+async def test_mouse_can_select_bottom_editor_option_after_expansion(tmp_path: Path, size: tuple[int, int]) -> None:
     desktop, manager = make_app(tmp_path)
-    app = desktop if host == "desktop" else ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=size) as pilot:
-        if host == "desktop":
-            await pilot.press("alt+o")
         await pilot.press("tab", "tab", "tab")
         frame = app.query_one("#editor-choice-frame")
         selector = app.query_one("#editor-choice", Select)
@@ -84,7 +71,7 @@ async def test_mouse_can_select_bottom_editor_option_after_expansion(
 @pytest.mark.anyio
 async def test_open_editor_menu_stays_visible_when_terminal_narrows(tmp_path: Path) -> None:
     desktop, _manager = make_app(tmp_path)
-    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=(120, 36)) as pilot:
         await pilot.press("tab", "tab", "tab", "enter")
         selector = app.query_one("#editor-choice", Select)

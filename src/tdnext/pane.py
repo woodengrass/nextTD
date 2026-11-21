@@ -10,7 +10,7 @@ from .api import PluginContext
 from .core.errors import PluginError
 from .core.local_env import bootstrap as _bootstrap_local_path
 from .core.session import SESSION_ENV, current_session
-from .launcher import enabled_views
+from .core.views import enabled_views
 from .plugins.desktop.contract import textual_views
 from .runtime import manager
 

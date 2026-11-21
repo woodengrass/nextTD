@@ -6,10 +6,10 @@ import anyio
 import pytest
 from ghostty_textual import TerminalView
 from test_settings_ui import make_app
-from textual.content import Content
-from textual.widgets import ContentSwitcher, ListView, Static
+from textual.widgets import Static
 
-from tdnext.plugins.desktop.app import DesktopApp
+from tdnext.api import PluginContext
+from tdnext.plugins.desktop.tool import ToolPane
 from tdnext.plugins.shell.plugin import ShellPlugin
 from tdnext.plugins.shell.transport import PtySession
 from tdnext.plugins.shell.view import ShellView
@@ -20,13 +20,13 @@ def screen_text(terminal: TerminalView) -> str:
     return "\n".join(terminal.render_line(row).text for row in range(terminal.terminal.rows))
 
 
-async def wait_for(predicate, *, timeout: float = 8) -> None:
+async def wait_for(predicate, *, timeout: float = 8) -> None:  # type: ignore[no-untyped-def]
     with anyio.fail_after(timeout):
         while not predicate():
             await anyio.sleep(0.02)
 
 
-def isolated_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> DesktopApp:
+def isolated_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ToolPane:
     home = tmp_path / "home"
     home.mkdir()
     workspace = tmp_path / "workspace ; $(not-a-command)"
@@ -37,15 +37,10 @@ def isolated_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> DesktopApp:
     monkeypatch.setenv("INPUTRC", "/dev/null")
     monkeypatch.delenv("BASH_ENV", raising=False)
     app, manager = make_app(tmp_path)
-    views = [app.views[0], (manager.manifests["shell"], ShellPlugin()), app.views[-1]]
-    return DesktopApp(type(app.context)(workspace, manager), views)
+    return ToolPane(ShellPlugin(), PluginContext(workspace, manager))
 
 
-async def focus_shell(app: DesktopApp, pilot) -> tuple[ShellView, TerminalView, PtySession]:
-    rail = app.query_one("#destinations", ListView)
-    rail.focus()
-    rail.index = 1
-    await pilot.press("enter")
+async def focus_shell(app: ToolPane, pilot) -> tuple[ShellView, TerminalView, PtySession]:  # type: ignore[no-untyped-def]
     view = app.query_one(ShellView)
     await wait_for(lambda: view.session is not None and app.focused is app.query_one(TerminalView))
     assert view.session is not None
@@ -53,7 +48,7 @@ async def focus_shell(app: DesktopApp, pilot) -> tuple[ShellView, TerminalView, 
 
 
 @pytest.mark.anyio
-async def test_real_shell_accepts_interactive_input_and_survives_settings(
+async def test_real_shell_accepts_interactive_input(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = isolated_app(tmp_path, monkeypatch)
@@ -62,22 +57,8 @@ async def test_real_shell_accepts_interactive_input_and_survives_settings(
         await session.send(b"read -r answer; printf 'USER_RESULT:%s\\n' \"$answer\"\n")
         await pilot.press("o", "k", "enter")
         await wait_for(lambda: "USER_RESULT:ok" in screen_text(terminal))
-        await pilot.press("alt+o")
-        assert app.query_one(ContentSwitcher).current == "view-settings"
-        await pilot.press("escape")
-        assert app.query_one(ContentSwitcher).current == "view-shell"
-        assert app.focused is terminal
         assert view.session is session and session.process.poll() is None
         assert "USER_RESULT:ok" in screen_text(terminal)
-        width = terminal.size.width
-        await pilot.press("f7")
-        assert terminal.size.width > width
-        assert app.focused is terminal and view.session is session and session.process.poll() is None
-        await pilot.press("f6")
-        assert app.focused is app.query_one("#destinations", ListView)
-        footer = app.query_one("#shortcuts", Static).render()
-        assert isinstance(footer, Content)
-        assert "Global:" in footer.plain
 
 
 @pytest.mark.anyio
@@ -93,10 +74,9 @@ async def test_terminal_forwards_tab_and_control_keys_without_stealing_focus(
         )
         await session.send(command)
         await wait_for(lambda: "GOING" in screen_text(terminal))
-        theme = app.theme
         await pilot.press("a", "tab", "b", "ctrl+t", "enter")
         await wait_for(lambda: "READ:'a\\tb\\x14\\n'" in screen_text(terminal))
-        assert app.focused is terminal and app.theme == theme
+        assert app.focused is terminal
 
 
 @pytest.mark.anyio
@@ -157,17 +137,22 @@ async def test_shell_exit_is_reported_and_enter_starts_a_new_process(
 
 
 @pytest.mark.anyio
-async def test_closing_desktop_reaps_the_shell_and_foreground_job(
+async def test_closing_pane_reaps_the_shell_and_foreground_job(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = isolated_app(tmp_path, monkeypatch)
     async with app.run_test(size=(100, 30)) as pilot:
         _view, _terminal, session = await focus_shell(app, pilot)
         await session.send(b"sleep 60\n")
-        await wait_for(lambda: session.master is not None and os.tcgetpgrp(session.master) != session.process.pid)
+        await wait_for(
+            lambda: session.master is not None and os.tcgetpgrp(session.master) not in (0, session.process.pid)
+        )
         assert session.master is not None
         foreground = os.tcgetpgrp(session.master)
         assert foreground > 0
+        await wait_for(
+            lambda: Path(f"/proc/{foreground}/cmdline").read_bytes().split(b"\0")[0].endswith(b"sleep")
+        )
     assert session.process.poll() is not None
     process_stat = Path(f"/proc/{foreground}/stat")
     assert not process_stat.exists(), process_stat.read_text(encoding="utf-8")
@@ -176,7 +161,7 @@ async def test_closing_desktop_reaps_the_shell_and_foreground_job(
 
 
 @pytest.mark.anyio
-async def test_closing_desktop_terminates_a_foreground_job_ignoring_hangup(
+async def test_closing_pane_terminates_a_foreground_job_ignoring_hangup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = isolated_app(tmp_path, monkeypatch)

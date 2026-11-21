@@ -45,10 +45,7 @@ def test_native_header_responds_to_mouse(tmp_path: Path, native_env: tuple[dict[
     env, binary = native_env
     session = NativeSession(tmp_path, env, binary)
     try:
-        panes = json.loads(session.action("list-panes", "--all", "--json"))
-        header = next(pane for pane in panes if "panes header files" in (pane.get("pane_command") or ""))
-        pane_id = f"terminal_{header['id']}"
-        wait_for(lambda: "Settings" in session.action("dump-screen", "--pane-id", pane_id))
+        session.switch("Files")
         session.click_header()
         target = session.tab_id("tdnext-header:settings")
         wait_for(lambda: session.active_tab() == target)
@@ -61,15 +58,15 @@ def test_native_header_clicks_only_activate_actions(tmp_path: Path, native_env: 
     env, binary = native_env
     session = NativeSession(tmp_path, env, binary)
     try:
+        session.switch("Files")
         panes = json.loads(session.action("list-panes", "--all", "--json"))
-        header = next(pane for pane in panes if "panes header files" in (pane.get("pane_command") or ""))
-        pane_id = f"terminal_{header['id']}"
-        wait_for(lambda: "Settings" in session.action("dump-screen", "--pane-id", pane_id))
         files = next(pane for pane in panes if "tdnext.pane view files" in (pane.get("pane_command") or ""))
+        files_id = f"terminal_{files['id']}"
+        wait_for(lambda: files_id in session.action("list-clients"))
+        # Blank header area focuses nothing away: no tab switch, focus stays.
         session.header_mouse(5, release=False)
-        wait_for(lambda: pane_id in session.action("list-clients"))
         session.header_mouse(5, release=True)
-        wait_for(lambda: f"terminal_{files['id']}" in session.action("list-clients"))
+        wait_for(lambda: files_id in session.action("list-clients"))
         assert session.active_tab() == session.tab_id("Files")
         session.click_header()
         wait_for(lambda: session.active_tab() == session.tab_id("tdnext-header:settings"))

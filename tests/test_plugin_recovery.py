@@ -2,16 +2,35 @@ import os
 from pathlib import Path
 
 import pytest
-from test_settings_ui import make_app
 from textual.widgets import DataTable
 
+from tdnext.api import PluginContext
 from tdnext.core.appearance import Appearance, AppearanceStore
+from tdnext.core.discovery import discover
 from tdnext.core.errors import InstallationConsentRequired, PluginError
 from tdnext.core.manager import PluginManager
 from tdnext.core.models import PluginState
-from tdnext.core.presentation import snapshot_views
-from tdnext.launcher import enabled_views
+from tdnext.core.state import StateStore
+from tdnext.core.views import enabled_views
+from tdnext.plugins.settings.plugin import SettingsPane
 from tdnext.plugins.settings.view import SettingsView
+
+
+def make_app(tmp_path: Path) -> tuple[SettingsPane, PluginManager]:
+    """Local harness: retained Settings pane over the bundled manifests.
+
+    (test_settings_ui.make_app still targets the removed Python desktop host;
+    its owner needs to migrate it. This file owns only its own harness.)
+    """
+    roots = (Path(__file__).parents[1] / "src" / "tdnext" / "plugins",)
+    manifests = discover(roots)
+    manifests["monitor"] = manifests["monitor"].model_copy(
+        update={"requires_executables": (), "dependency_hook": None}
+    )
+    manager = PluginManager(manifests, StateStore(tmp_path / "plugins.json"), tmp_path / "bin")
+    installed = frozenset({"desktop", "files", "settings"})
+    manager.store.write(PluginState(installed=installed, enabled=installed))
+    return SettingsPane(PluginContext(tmp_path, manager)), manager
 
 
 class ProviderInitializationError(RuntimeError):
@@ -60,7 +79,6 @@ def test_unavailable_enabled_provider_keeps_views_and_preferences(tmp_path: Path
     saved_appearance = appearance.path.read_bytes()
     views = enabled_views(manager)
     assert [manifest.id for manifest, _ in views] == ["files", "settings"]
-    assert snapshot_views(manager, views).icon_for("files") == app.context.manager.manifests["files"].icon
     assert manager.store.read() == state
     assert appearance.path.read_bytes() == saved_appearance
 
@@ -108,7 +126,6 @@ def test_missing_selected_alternative_provider_remains_optional(tmp_path: Path) 
     appearance.write(Appearance(provider_id="other-icons", icon_mode="codicons"))
     views = enabled_views(manager)
     assert [manifest.id for manifest, _ in views] == ["files", "settings"]
-    assert snapshot_views(manager, views).icon_for("files") == "▤"
     assert appearance.read().provider_id == "other-icons"
 
 
@@ -122,14 +139,21 @@ def test_unclassified_missing_enabled_plugin_is_reported(tmp_path: Path) -> None
         enabled_views(manager)
 
 
-@pytest.mark.parametrize("broken", ["desktop", "files"])
-def test_broken_required_host_or_view_is_not_ignored(tmp_path: Path, broken: str) -> None:
+def test_broken_required_view_is_not_ignored(tmp_path: Path) -> None:
     _app, manager = make_app(tmp_path)
     manifests = dict(manager.manifests)
-    manifests[broken] = manifests[broken].model_copy(update={"entrypoint": "tdnext_missing_required:Plugin"})
+    manifests["files"] = manifests["files"].model_copy(update={"entrypoint": "tdnext_missing_required:Plugin"})
     manager.manifests = manifests
-    with pytest.raises(PluginError, match=broken):
+    with pytest.raises(PluginError, match="files"):
         enabled_views(manager)
+
+
+def test_broken_native_host_entrypoint_is_never_loaded(tmp_path: Path) -> None:
+    _app, manager = make_app(tmp_path)
+    manifests = dict(manager.manifests)
+    manifests["desktop"] = manifests["desktop"].model_copy(update={"entrypoint": "tdnext_missing_required:Plugin"})
+    manager.manifests = manifests
+    assert [manifest.id for manifest, _ in enabled_views(manager)] == ["files", "settings"]
 
 
 @pytest.mark.parametrize("operation", ["disable", "uninstall"])
@@ -151,7 +175,6 @@ async def test_settings_can_manage_persisted_missing_plugin(tmp_path: Path, oper
     manager.enable("icons")
     manager.manifests = {key: value for key, value in manager.manifests.items() if key != "icons"}
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o")
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("icons"))

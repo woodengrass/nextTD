@@ -75,7 +75,7 @@ def open_shortcut(session: NativeSession) -> None:
     wait_for(lambda: actions_finished(session))
 
 
-def test_cold_broker_shows_permission_prompt_without_granting(
+def test_cold_start_opens_settings_without_a_permission_prompt(
     tmp_path: Path, isolated_native: tuple[dict[str, str], str]
 ) -> None:
     env, binary = isolated_native
@@ -83,9 +83,10 @@ def test_cold_broker_shows_permission_prompt_without_granting(
     try:
         visible(session, "Tool (Files)")
         session.send_key("M-o")
-        visible(session, "asks permission to:", "Allow?", "(y/n)")
-        cache = tmp_path / "state" / "zellij-cache" / "zellij" / "permissions.kdl"
-        assert not cache.exists()
+        visible(session, "Settings", "Back", "> General", "Provider:", "Style:")
+        tabs = session.tabs()
+        header = next(tab for tab in tabs if str(tab["name"]).startswith("tdnext-header:settings"))
+        assert str(header["name"]) == "tdnext-header:settings"
     finally:
         close_session(session)
 
@@ -214,7 +215,7 @@ def test_header_returns_to_the_exact_floating_pane(
             wait_for(lambda: actions_finished(session))
         tabs = session.tabs()
         header = next(tab for tab in tabs if str(tab["name"]).startswith("tdnext-header:settings"))
-        assert str(header["name"]).endswith(f":{pane_id}")
+        assert str(header["name"]) == "tdnext-header:settings"
         session.send_key("Escape")
         visible(session, "ORIGIN_READY")
         wait_for(lambda: actions_finished(session))

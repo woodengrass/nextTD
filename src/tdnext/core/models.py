@@ -18,7 +18,7 @@ class PluginManifest(BaseModel):
     name: str = Field(min_length=1)
     version: str = Field(min_length=1)
     description: str = Field(min_length=1)
-    entrypoint: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$")
+    entrypoint: str | None = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$")
     placement: Literal["sidebar", "header"] = "sidebar"
     icon: str | None = Field(default=None, min_length=1, max_length=4)
     icon_key: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_.-]*$")
@@ -75,6 +75,12 @@ class PluginManifest(BaseModel):
             if role in self.capabilities:
                 return role
         raise AssertionError("validated manifest has no structural role")
+
+    @model_validator(mode="after")
+    def non_host_has_entrypoint(self) -> "PluginManifest":
+        if self.role != "desktop.host" and self.entrypoint is None:
+            raise ValueError("non-host plugins must declare an entrypoint")
+        return self
 
 
 class PluginState(BaseModel):

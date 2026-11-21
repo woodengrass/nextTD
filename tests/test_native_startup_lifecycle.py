@@ -41,6 +41,7 @@ def test_native_startup_does_not_unlink_an_in_progress_peer_socket(
 def test_monitor_pid_does_not_confuse_version_probe_for_monitor() -> None:
     session = NativeSession.__new__(NativeSession)
     session.name = f"pid-probe-{uuid.uuid4().hex}"
+    session.tmux_name = f"tmux-{session.name}"
     code = (
         "import ctypes, os; "
         "assert ctypes.CDLL(None).prctl(15, ctypes.c_char_p(b'btop'), 0, 0, 0) == 0; "
@@ -48,7 +49,8 @@ def test_monitor_pid_does_not_confuse_version_probe_for_monitor() -> None:
     )
     with subprocess.Popen(
         [sys.executable, "-c", code, "--version"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, env={**os.environ, "ZELLIJ_SESSION_NAME": session.name}, text=True,
+        stderr=subprocess.PIPE, text=True,
+        env={**os.environ, "ZELLIJ_SESSION_NAME": session.name, "TDNEXT_TEST_SESSION": session.tmux_name},
     ) as probe:
         try:
             assert probe.stdout is not None

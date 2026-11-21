@@ -3,11 +3,11 @@ from pathlib import Path
 
 import pytest
 
-from tdnext import launcher
 from tdnext.core.discovery import discover
 from tdnext.core.manager import PluginManager
 from tdnext.core.models import PluginState
 from tdnext.core.state import StateStore
+from tdnext.core.views import enabled_views
 from tdnext.plugins.shell.launch import exec_shell
 
 
@@ -36,7 +36,7 @@ def test_shell_lifecycle_is_independent_and_depends_on_desktop(tmp_path: Path) -
     plugins = PluginManager(manifests, store, tmp_path / "bin")
     assert store.read() == PluginState()
     assert plugins.enable("shell") == ("desktop", "shell")
-    assert [manifest.id for manifest, _ in launcher.enabled_views(plugins)] == ["shell"]
+    assert [manifest.id for manifest, _ in enabled_views(plugins)] == ["shell"]
     assert plugins.disable("shell") == frozenset({"shell"})
     assert store.read() == PluginState(installed=frozenset({"desktop", "shell"}), enabled=frozenset({"desktop"}))
     assert plugins.uninstall("shell") == frozenset()

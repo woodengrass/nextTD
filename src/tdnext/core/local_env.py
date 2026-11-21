@@ -1,7 +1,6 @@
 """User-approved shared-process PATH for locally installed executables.
 
-A desktop process (``tdnext run`` / ``python -m tdnext`` / native pane
-processes) shares one process-wide ``PATH`` that starts with the absolute
+A management or native pane process shares one process-wide ``PATH`` that starts with the absolute
 ``<state>/bin`` directory, so plugins can use locally installed executables
 by bare name at import, construction, and runtime.
 

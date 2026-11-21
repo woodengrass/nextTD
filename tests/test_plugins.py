@@ -27,7 +27,7 @@ def manifest(name: str, dependencies: tuple[str, ...] = (), executables: tuple[s
 def host(name: str) -> PluginManifest:
     return PluginManifest(
         id=name, name=name, version="1", description=name,
-        entrypoint="tdnext.plugins.desktop.plugin:DesktopPlugin",
+        entrypoint=None,
         capabilities=("desktop.host",), host_interfaces=("tdnext.textual-view.v1",),
     )
 
@@ -159,20 +159,43 @@ def test_install_with_invalid_entrypoint_does_not_commit_state(tmp_path: Path) -
     assert store.read() == PluginState()
 
 
-def test_desktop_entrypoint_must_provide_desktop_host(tmp_path: Path) -> None:
+def test_native_host_has_no_python_entrypoint(tmp_path: Path) -> None:
     manifests = {
         "desktop": PluginManifest(
             id="desktop",
             name="desktop",
             version="1",
             description="desktop",
-            entrypoint="tdnext.plugins.files.plugin:FilesPlugin",
+            entrypoint=None,
+            capabilities=("desktop.host",),
+            host_interfaces=("tdnext.textual-view.v1",),
         ),
     }
     store = StateStore(tmp_path / "state.json")
-    with pytest.raises(PluginError, match="desktop host contract"):
-        PluginManager(manifests, store, tmp_path / "bin").enable("desktop")
-    assert store.read() == PluginState()
+    PluginManager(manifests, store, tmp_path / "bin").enable("desktop")
+    assert store.read() == PluginState(
+        installed=frozenset({"desktop"}), enabled=frozenset({"desktop"})
+    )
+
+
+def test_native_host_entrypoint_lookup_is_reported(tmp_path: Path) -> None:
+    from tdnext.core.discovery import load_entrypoint
+
+    manifests = {
+        "desktop": PluginManifest(
+            id="desktop",
+            name="desktop",
+            version="1",
+            description="desktop",
+            entrypoint=None,
+            capabilities=("desktop.host",),
+            host_interfaces=("tdnext.textual-view.v1",),
+        ),
+    }
+    store = StateStore(tmp_path / "state.json")
+    manager = PluginManager(manifests, store, tmp_path / "bin")
+    with pytest.raises(PluginError, match="native host"):
+        load_entrypoint(manager.manifests["desktop"])
 
 
 def test_wrong_monitor_binary_does_not_commit_install(tmp_path: Path) -> None:

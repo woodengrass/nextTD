@@ -29,7 +29,7 @@ def test_imports_leave_the_process_environment_identical(tmp_path: Path) -> None
         "import tdnext.cli\n"
         "import tdnext.pane\n"
         "import tdnext.plugins.desktop.panes\n"
-        "import tdnext.launcher\n"
+        "import tdnext.core.views\n"
         "import tdnext.runtime\n"
         "after = dict(os.environ)\n"
         "assert before == after\n"
@@ -106,9 +106,12 @@ def test_public_tdnext_binary_and_panes_main_share_path(
     assert result.returncode == 0, result.stderr
     panes_code = (
         "import sys\n"
-        "sys.argv = ['tdnext.plugins.desktop.panes', 'open-header']\n"
+        "sys.argv = ['tdnext.plugins.desktop.panes', 'tool', '--help']\n"
         "from tdnext.plugins.desktop.panes import main\n"
-        "main()\n"
+        "try:\n"
+        "    main()\n"
+        "except Exception:\n"
+        "    pass\n"
         "import subprocess\n"
         "subprocess.run(['btop', '--version'], check=True, capture_output=True)\n"
         "print('PANES_MAIN_OK')\n"

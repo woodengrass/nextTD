@@ -7,18 +7,18 @@ from textual.content import Content
 from textual.widgets import Button, DataTable
 from typer.testing import CliRunner
 
-from tdnext import cli, launcher
-from tdnext.api import PluginContext, ViewPlugin
+from tdnext import cli
+from tdnext.api import PluginContext
 from tdnext.core.discovery import discover
 from tdnext.core.errors import InstallationConsentRequired, PluginError
 from tdnext.core.manager import PluginManager
-from tdnext.core.models import PluginManifest, PluginState
+from tdnext.core.models import PluginState
 from tdnext.core.session import SessionSnapshot, SessionView, current_session, session_token
 from tdnext.core.state import StateStore
-from tdnext.plugins.desktop.app import DesktopApp
+from tdnext.core.views import enabled_views
 from tdnext.plugins.monitor import dependencies as monitor_dependencies
 from tdnext.plugins.settings.operations import apply_operation
-from tdnext.plugins.settings.plugin import SettingsPlugin
+from tdnext.plugins.settings.plugin import SettingsPane
 from tdnext.plugins.settings.view import SettingsView
 
 BUILTINS = Path(__file__).parents[1] / "src" / "tdnext" / "plugins"
@@ -27,12 +27,6 @@ BUILTINS = Path(__file__).parents[1] / "src" / "tdnext" / "plugins"
 class ConstructorMustNotRun:
     def __init__(self) -> None:
         raise RuntimeError("incompatible plugin was constructed")
-
-
-class RecordingHost:
-    def run(self, context: PluginContext, _views: list[tuple[PluginManifest, ViewPlugin]]) -> None:
-        assert context.session is not None
-        (context.directory / "snapshot.json").write_text(context.session.model_dump_json(), encoding="utf-8")
 
 
 class FixtureInstaller:
@@ -123,9 +117,8 @@ async def test_settings_displays_install_details_and_denial_preserves_state(
         pytest.fail("installer ran without consent")
 
     monkeypatch.setattr(monitor_dependencies, "install_release", forbidden)
-    app = DesktopApp(PluginContext(tmp_path, manager), [(manager.manifests["settings"], SettingsPlugin())])
+    app = SettingsPane(PluginContext(tmp_path, manager))
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o")
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("monitor"))
@@ -153,9 +146,8 @@ async def test_settings_protects_running_host_after_external_disable(tmp_path: P
     ))
     session = SessionSnapshot(views=(), protected_plugins=frozenset({"other", "icons"}))
     context = PluginContext(tmp_path, manager, session)
-    app = DesktopApp(context, [(manager.manifests["settings"], SettingsPlugin())])
+    app = SettingsPane(context)
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o")
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index(target))
@@ -165,17 +157,15 @@ async def test_settings_protects_running_host_after_external_disable(tmp_path: P
 
 @pytest.mark.parametrize("target", ["other", "icons"])
 def test_launch_snapshot_protects_running_host_after_external_disable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+    tmp_path: Path, target: str
 ) -> None:
     manager = make_manager(tmp_path)
     manager.manifests = {**manager.manifests, "other": manager.manifests["desktop"].model_copy(update={
-        "id": "other", "entrypoint": f"{__name__}:RecordingHost", "requires_plugins": ("icons",),
+        "id": "other", "requires_plugins": ("icons",),
     })}
     enabled = frozenset({"other", "icons", "settings"})
     manager.store.write(PluginState(installed=enabled, enabled=enabled))
-    monkeypatch.setattr(launcher, "manager", lambda: manager)
-    launcher.launch(tmp_path)
-    snapshot = SessionSnapshot.model_validate_json((tmp_path / "snapshot.json").read_text(encoding="utf-8"))
+    snapshot = SessionSnapshot(views=(), protected_plugins=frozenset({"other", "icons", "settings"}))
     restored = current_session(session_token(snapshot))
     manager.disable("icons")
     before = manager.store.read()
@@ -197,7 +187,7 @@ def test_incompatible_view_rejected_before_any_plugin_construction(tmp_path: Pat
         installed=frozenset({"desktop", "files"}), enabled=frozenset({"desktop", "files"})
     ))
     with pytest.raises(PluginError, match="Enabled view files is incompatible"):
-        launcher.enabled_views(manager)
+        enabled_views(manager)
 
 
 @pytest.mark.parametrize("operation", ["disable", "uninstall"])
@@ -294,4 +284,4 @@ def test_snapshot_views_do_not_depend_on_current_host_or_state(tmp_path: Path) -
     manager = make_manager(tmp_path)
     snapshot = SessionSnapshot(views=(SessionView(manifest=manager.manifests["files"], icon="[]"),))
     manager.manifests = {}
-    assert [manifest.id for manifest, _ in launcher.enabled_views(manager, snapshot)] == ["files"]
+    assert [manifest.id for manifest, _ in enabled_views(manager, snapshot)] == ["files"]

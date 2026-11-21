@@ -7,15 +7,14 @@ from tdnext.api import PluginContext
 from tdnext.core.discovery import discover
 from tdnext.core.manager import PluginManager
 from tdnext.core.state import StateStore
-from tdnext.plugins.desktop.app import DesktopApp
-from tdnext.plugins.files.plugin import FilesPlugin
+from tdnext.plugins.files.plugin import FilesPane
 
 
-def desktop(tmp_path: Path) -> DesktopApp:
+def desktop(tmp_path: Path) -> FilesPane:
     roots = (Path(__file__).parents[1] / "src" / "tdnext" / "plugins",)
     manifests = discover(roots)
     manager = PluginManager(manifests, StateStore(tmp_path / "state.json"), tmp_path / "bin")
-    return DesktopApp(PluginContext(tmp_path, manager), [(manifests["files"], FilesPlugin())])
+    return FilesPane(PluginContext(tmp_path, manager))
 
 
 @pytest.mark.anyio

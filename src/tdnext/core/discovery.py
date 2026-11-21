@@ -59,6 +59,8 @@ def discover(roots: tuple[Path, ...]) -> DiscoveredPlugins:
 
 def load_entrypoint(manifest: PluginManifest):
     """Import the declared local plugin class; plugins are trusted code."""
+    if manifest.entrypoint is None:
+        raise PluginError(f"{manifest.id} is a native host and has no Python entry point")
     module_name, _, class_name = manifest.entrypoint.partition(":")
     try:
         plugin_class = getattr(import_module(module_name), class_name)

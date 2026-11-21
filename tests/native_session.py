@@ -5,7 +5,8 @@ import time
 import uuid
 from pathlib import Path
 
-from native_processes import attached_session, monitor_pid, terminate_tagged
+from native_processes import attached_session as _attached_session
+from native_processes import monitor_pid, terminate_tagged
 
 CLIENT_HEADER = ("CLIENT_ID", "ZELLIJ_PANE_ID", "RUNNING_COMMAND")
 
@@ -20,24 +21,80 @@ def wait_for(predicate, *, timeout: float = 15):
     raise AssertionError("Timed out waiting for native desktop state")
 
 
+def attached_session(tag: str, expected_tabs: int) -> str | None:
+    return _attached_session(tag, expected_tabs)
+
+
+def views_for_state(state_dir: Path, python: str) -> list[dict[str, object]]:
+    try:
+        import json as _json
+
+        enabled = set(_json.loads((state_dir / "plugins.json").read_text(encoding="utf-8"))["enabled"])
+    except (OSError, ValueError, KeyError):
+        enabled = {"desktop", "files", "monitor", "settings"}
+    sidebar = sorted(name for name in enabled if name not in {"desktop", "settings", "icons"})
+    shortcuts = {
+        "files": (
+            "Enter open   Backspace up   ? help   v preview   b folders   g path   n folder   r rename   "
+            "y/x/p copy/move   d delete"
+        ),
+        "monitor": "btop: q quit   arrows select   ? help",
+        "shell": "Shell keys   Ctrl+g Zellij lock",
+        "settings": "Esc Back   Tab Sections and controls",
+    }
+    views: list[dict[str, object]] = []
+    for name in sidebar:
+        views.append({
+            "id": name, "name": name.capitalize(), "icon": name[0].upper() if name else "?",
+            "placement": "sidebar", "command": python, "args": ["-m", "tdnext.pane", "view", name],
+            "shortcuts": shortcuts.get(name, ""),
+        })
+    if "settings" in enabled:
+        views.append({
+            "id": "settings", "name": "Settings", "icon": "S", "placement": "header",
+            "command": python, "args": ["-m", "tdnext.plugins.desktop.panes", "tool", "settings"],
+            "shortcuts": "Esc back",
+        })
+    return views
+
+
 class NativeSession:
+    """Drive one isolated real desktop: Rust tdnext-desktop plus patched core.
+
+    Each session owns a private tmux server, a private Zellij socket dir,
+    and a private state dir (from the ``native_env`` fixture). Content
+    programs are the original Python Files/Settings panes; the desktop
+    chrome and navigation (Alt+o/Esc, bare ``tdnext-header:settings`` tab)
+    come from the supported Rust core/desktop under test.
+    """
+
     def __init__(
         self, root: Path, env: dict[str, str], binary: str, *, expected_tabs: int = 3, expected_panes: int | None = None
     ) -> None:
         self.env = env
         self.binary = binary
+        desktop = env.get("TDNEXT_DESKTOP_BINARY", "")
+        python = env.get("TDNEXT_PYTHON", sys.executable)
+        if not desktop:
+            root_dir = Path(__file__).parents[1]
+            desktop = str(root_dir / "native-desktop" / "target" / "release" / "tdnext-desktop")
+        self.desktop = desktop
+        state_dir = Path(env["TDNEXT_STATE_DIR"])
+        config_path = state_dir / "desktop.json"
+        config_path.write_text(
+            json.dumps({"views": views_for_state(state_dir, python)}), encoding="utf-8",
+        )
         self.tmux_socket = env["TDNEXT_TEST_TMUX_SOCKET"]
         self.tmux_name = f"tdnext-{uuid.uuid4().hex}"
         subprocess.run(
             ["tmux", "-S", self.tmux_socket, "-f", "/dev/null", "new-session", "-d", "-s", self.tmux_name,
              "-x", "120", "-y", "36", "-e", f"TDNEXT_TEST_SESSION={self.tmux_name}",
-             sys.executable, "-m", "tdnext", "run", str(root)],
+             self.desktop, "--core", self.binary, "--config", str(config_path), str(root)],
             env=env, capture_output=True, check=True, timeout=5,
         )
         self.startup_diagnostics = "waiting for an attached native pane"
         try:
-            # Zellij's session listing can unlink a socket between bind and listen.
-            self.name = wait_for(lambda: attached_session(self.tmux_name, expected_panes or expected_tabs * 4))
+            self.name = wait_for(lambda: attached_session(self.tmux_name, expected_tabs))
             self.target_env = {**env, "ZELLIJ_SESSION_NAME": self.name}
             wait_for(lambda: self.ready(expected_tabs))
         except (AssertionError, OSError, ValueError, subprocess.SubprocessError) as exc:
@@ -167,7 +224,7 @@ class NativeSession:
 
     def switch(self, name: str) -> None:
         target = self.tab_id(name)
-        self.send_key({"Files": "M-1", "Monitor": "M-2"}[name])
+        self.send_key({"Files": "M-1", "Monitor": "M-2", "Shell": "M-3"}[name])
         wait_for(lambda: self.active_tab() == target)
 
     def open_settings(self) -> None:
@@ -232,7 +289,7 @@ class NativeSession:
             ) from exc
 
     def btop_pid(self) -> int | None:
-        return monitor_pid(self.name)
+        return monitor_pid(self.name, self.tmux_name)
 
     def close(self) -> None:
         try:

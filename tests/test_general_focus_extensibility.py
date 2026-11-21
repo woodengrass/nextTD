@@ -10,17 +10,13 @@ from tdnext.plugins.settings.plugin import SettingsPlugin
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("host", "size"), [("pane", (35, 24)), ("pane", (120, 36)), ("desktop", (80, 24))]
-)
+@pytest.mark.parametrize("size", [(35, 24), (120, 36), (80, 24)])
 async def test_added_general_controls_are_reached_once_in_each_direction(
-    tmp_path: Path, host: str, size: tuple[int, int]
+    tmp_path: Path, size: tuple[int, int]
 ) -> None:
     desktop, manager = make_app(tmp_path)
-    app = desktop if host == "desktop" else ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=size) as pilot:
-        if host == "desktop":
-            await pilot.press("alt+o")
         general = app.query_one("#settings-general", VerticalScroll)
         first = Button("First additional setting", id="extra-first")
         second = Button("Second additional setting", id="extra-second")
@@ -51,7 +47,7 @@ async def test_added_general_controls_are_reached_once_in_each_direction(
 @pytest.mark.anyio
 async def test_general_traversal_skips_disabled_and_hidden_added_controls(tmp_path: Path) -> None:
     desktop, _manager = make_app(tmp_path)
-    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=(35, 24)) as pilot:
         general = app.query_one("#settings-general", VerticalScroll)
         disabled = Button("Disabled", disabled=True)
@@ -70,7 +66,7 @@ async def test_general_traversal_skips_disabled_and_hidden_added_controls(tmp_pa
 @pytest.mark.anyio
 async def test_open_selector_keeps_its_escape_and_tab_behavior(tmp_path: Path) -> None:
     desktop, manager = make_app(tmp_path)
-    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=(80, 24)) as pilot:
         general = app.query_one("#settings-general", VerticalScroll)
         extra = Button("Additional setting")

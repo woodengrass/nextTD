@@ -15,7 +15,6 @@ async def test_plugin_shortcuts_do_nothing_in_general(tmp_path: Path) -> None:
     app, manager = make_app(tmp_path)
     before = manager.store.read()
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o")
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("monitor"))
         await pilot.press("i", "e", "d", "u")
@@ -40,7 +39,6 @@ async def test_plugin_shortcut_operates_on_selected_row(
         enabled=state.enabled | ({"monitor"} if initial == "enabled" else set()),
     ))
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o")
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("monitor"))
@@ -61,7 +59,6 @@ async def test_uninstall_confirmation_escape_stays_in_plugins(tmp_path: Path) ->
     state = manager.store.read()
     manager.store.write(PluginState(installed=state.installed | {"monitor"}, enabled=state.enabled))
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o")
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("monitor"))
@@ -81,7 +78,6 @@ async def test_plugin_error_is_retained_across_section_changes(tmp_path: Path) -
     manager.manifests = manifests
     before = manager.store.read()
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o")
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("monitor"))
@@ -104,7 +100,6 @@ async def test_long_plugin_error_is_keyboard_scrollable_at_80_by_24(tmp_path: Pa
     )
     manager.manifests = manifests
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o")
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("monitor"))
@@ -132,7 +127,6 @@ async def test_disable_confirms_dependent_cascade_in_plugins(tmp_path: Path) -> 
     state = manager.store.read()
     manager.store.write(PluginState(installed=state.installed | {"extra"}, enabled=state.enabled | {"extra"}))
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o")
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("monitor"))
@@ -152,7 +146,6 @@ async def test_running_components_remain_protected_in_plugins(tmp_path: Path, ta
     app, manager = make_app(tmp_path)
     before = manager.store.read()
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o")
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index(target))
@@ -170,7 +163,6 @@ async def test_missing_installed_plugin_can_be_removed_from_plugins(tmp_path: Pa
     manager.enable("icons")
     manager.manifests = {key: value for key, value in manager.manifests.items() if key != "icons"}
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o")
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("icons"))
@@ -199,7 +191,6 @@ async def test_busy_operation_survives_section_switch_and_blocks_more_operations
     monkeypatch.setattr(manager, "enable", slow_enable)
     async with app.run_test(size=(80, 24)) as pilot:
         try:
-            await pilot.press("alt+o")
             await pilot.click("#section-plugins")
             view = app.query_one(SettingsView)
             view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("monitor"))
@@ -215,9 +206,7 @@ async def test_busy_operation_survives_section_switch_and_blocks_more_operations
             assert "monitor" not in manager.store.read().installed
             assert "Enabling monitor" in text_of(view.query_one("#plugin-feedback", Static))
             await pilot.press("escape")
-            assert app.query_one(ContentSwitcher).current == "view-files"
-            await pilot.press("alt+o")
-            await pilot.click("#section-plugins")
+            assert app.query_one("#settings-pages", ContentSwitcher).current == "settings-plugins"
             assert all(button.disabled for button in view.query("#plugin-actions Button"))
         finally:
             release.set()
@@ -226,10 +215,9 @@ async def test_busy_operation_survives_section_switch_and_blocks_more_operations
 
 
 @pytest.mark.anyio
-async def test_back_and_f6_preserve_desktop_navigation(tmp_path: Path) -> None:
+async def test_section_buttons_switch_between_general_and_plugins(tmp_path: Path) -> None:
     app, _manager = make_app(tmp_path)
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o", "f6")
-        assert app.focused is app.query_one("#destinations")
-        await pilot.press("alt+o", "escape")
-        assert app.query_one(ContentSwitcher).current == "view-files"
+        await pilot.click("#section-plugins")
+        await pilot.click("#section-general")
+        assert app.query_one("#settings-pages", ContentSwitcher).current == "settings-general"

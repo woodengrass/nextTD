@@ -1,18 +1,12 @@
-"""Launch the configured desktop host with the enabled views."""
+"""Resolve enabled view plugins for content panes."""
 
-import os
-from pathlib import Path
-
-from .api import DesktopHost, PluginContext
-from .core.appearance import AppearanceStore
-from .core.discovery import instantiate
-from .core.errors import PluginError
-from .core.graph import dependency_order
-from .core.manager import PluginManager
-from .core.models import PluginManifest
-from .core.presentation import snapshot_views
-from .core.session import SESSION_ENV, SessionSnapshot
-from .runtime import manager
+from .appearance import AppearanceStore
+from .discovery import instantiate
+from .errors import PluginError
+from .graph import dependency_order
+from .manager import PluginManager
+from .models import PluginManifest
+from .session import SessionSnapshot
 
 
 def enabled_views(
@@ -56,33 +50,3 @@ def enabled_views(
         plugin = checked[plugin_id]
         views.append((manifest, plugin))
     return views
-
-
-def launch(directory: Path) -> None:
-    if not directory.is_dir():
-        raise PluginError(f"Not a directory: {directory}")
-    os.environ.pop(SESSION_ENV, None)
-    plugins = manager()
-    # 啟動只使用已啟用的插件；允許空桌面。See explicit-plugin-startup.adr.md
-    state = plugins.store.read()
-    errors = getattr(plugins.manifests, "errors", {})
-    for plugin_id in sorted(state.enabled & errors.keys()):
-        raise PluginError(errors[plugin_id])
-    hosts = [plugins.manifests[plugin_id] for plugin_id in sorted(state.enabled)
-             if plugin_id in plugins.manifests and plugins.manifests[plugin_id].role == "desktop.host"]
-    if not hosts:
-        raise PluginError("Desktop is disabled. Run: tdnext enable desktop")
-    if len(hosts) != 1:
-        raise PluginError("Exactly one desktop host must be enabled")
-    instances: dict[str, object] = {}
-    views = enabled_views(plugins, instances=instances)
-    snapshot = snapshot_views(plugins, views, instances)
-    protected = set(dependency_order(plugins.manifests, hosts[0].id))
-    if any(manifest.id == "settings" for manifest, _ in views):
-        protected.update(dependency_order(plugins.manifests, "settings"))
-    session = SessionSnapshot(views=snapshot.views, protected_plugins=frozenset(protected))
-    context = PluginContext(directory, plugins, session)
-    desktop = instances[hosts[0].id]
-    if not isinstance(desktop, DesktopHost):
-        raise PluginError("desktop does not implement the desktop host contract")
-    desktop.run(context, views)

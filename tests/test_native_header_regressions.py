@@ -16,12 +16,6 @@ def files_pane(session: NativeSession) -> str:
     return f"terminal_{pane['id']}"
 
 
-def wait_for_header(session: NativeSession) -> None:
-    panes = json.loads(session.action("list-panes", "--all", "--json"))
-    header = next(pane for pane in panes if "panes header files" in (pane.get("pane_command") or ""))
-    wait_for(lambda: "Settings" in session.action("dump-screen", "--pane-id", f"terminal_{header['id']}"))
-
-
 @pytest.mark.parametrize("x", [5, 110], ids=["non-action", "settings-action"])
 def test_native_header_mouse_returns_focus_to_files_and_file_keys_work(
     tmp_path: Path, native_env: tuple[dict[str, str], str], x: int
@@ -32,18 +26,15 @@ def test_native_header_mouse_returns_focus_to_files_and_file_keys_work(
         pane = files_pane(session)
         wait_for(lambda: pane in session.action("list-clients"))
         wait_for(lambda: "Files" in session.action("dump-screen", "--pane-id", pane))
-        wait_for_header(session)
-        if x == 5:
-            panes = json.loads(session.action("list-panes", "--all", "--json"))
-            header = next(p for p in panes if "panes header files" in (p.get("pane_command") or ""))
-            session.header_mouse(x, release=False)
-            wait_for(lambda: f"terminal_{header['id']}" in session.action("list-clients"))
-            session.header_mouse(x, release=True)
-        else:
-            session.click_header(x=x)
         if x == 110:
+            session.click_header(x=x)
             wait_for(lambda: session.active_tab() == session.tab_id("tdnext-header:settings"))
             session.back_to("Files")
+        else:
+            session.header_mouse(x, release=False)
+            session.header_mouse(x, release=True)
+            wait_for(lambda: pane in session.action("list-clients"))
+            assert session.active_tab() == session.tab_id("Files")
         wait_for(lambda: pane in session.action("list-clients"), timeout=3)
         session.send_key("f")
         wait_for(lambda: "New file name" in session.action("dump-screen", "--pane-id", pane))
@@ -63,13 +54,12 @@ def test_native_active_settings_header_click_keeps_escape_operable(
     try:
         session.open_settings()
         panes = json.loads(session.action("list-panes", "--all", "--json"))
-        header = next(pane for pane in panes if "panes header settings" in (pane.get("pane_command") or ""))
-        wait_for(lambda: "Settings" in session.action("dump-screen", "--pane-id", f"terminal_{header['id']}"))
-        session.header_mouse(x, release=False)
-        wait_for(lambda: f"terminal_{header['id']}" in session.action("list-clients"))
-        session.header_mouse(x, release=True)
         tool = next(pane for pane in panes if "panes tool settings" in (pane.get("pane_command") or ""))
         wait_for(lambda: f"terminal_{tool['id']}" in session.action("list-clients"))
+        session.header_mouse(x, release=False)
+        session.header_mouse(x, release=True)
+        wait_for(lambda: f"terminal_{tool['id']}" in session.action("list-clients"))
+        assert session.active_tab() == session.tab_id("tdnext-header:settings")
         session.back_to("Files")
     finally:
         session.close()
@@ -82,20 +72,18 @@ def test_native_settings_returns_to_originating_sidebar_pane(
     env, binary = native_env
     session = NativeSession(tmp_path, env, binary)
     try:
-        panes = json.loads(session.action("list-panes", "--all", "--json"))
-        sidebar = next(pane for pane in panes if "panes sidebar files" in (pane.get("pane_command") or ""))
-        sidebar_id = f"terminal_{sidebar['id']}"
-        wait_for_header(session)
-        session.mouse(5, 5, release=False)
-        session.mouse(5, 5, release=True)
-        wait_for(lambda: sidebar_id in session.action("list-clients"))
+        pane = files_pane(session)
+        wait_for(lambda: pane in session.action("list-clients"))
+        session.mouse(60, 20, release=False)
+        session.mouse(60, 20, release=True)
+        wait_for(lambda: pane in session.action("list-clients"))
         if mouse:
             session.click_header()
             session.wait_for_settings()
         else:
             session.open_settings()
         session.back_to("Files")
-        wait_for(lambda: sidebar_id in session.action("list-clients"))
+        wait_for(lambda: pane in session.action("list-clients"))
     finally:
         session.close()
 

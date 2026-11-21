@@ -6,13 +6,14 @@ from typing import Protocol, runtime_checkable
 import pytest
 from typer.testing import CliRunner
 
-from tdnext import launcher, pane
+from tdnext import pane
 from tdnext.api import PluginContext
 from tdnext.core.errors import PluginError
 from tdnext.core.manager import PluginManager
 from tdnext.core.models import PluginManifest, PluginState
 from tdnext.core.state import StateStore
-from tdnext.plugins.desktop.plugin import DesktopPlugin
+from tdnext.core.views import enabled_views
+from tdnext.plugins.desktop.contract import textual_views
 from tdnext.plugins.files.plugin import FilesPlugin
 
 
@@ -52,18 +53,18 @@ def make_manager(tmp_path: Path, view_entrypoint: str, interface: str = "example
     return PluginManager({host.id: host, view.id: view}, StateStore(tmp_path / "plugins.json"), tmp_path / "bin")
 
 
-def test_non_textual_host_enables_and_launches_its_view(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_non_textual_host_enables_and_launches_its_view(tmp_path: Path) -> None:
     manager = make_manager(tmp_path, f"{__name__}:OtherView")
     manager.enable("other-view")
-    monkeypatch.setattr(launcher, "manager", lambda: manager)
 
-    launcher.launch(tmp_path)
+    views = enabled_views(manager)
+    OtherHost().run(PluginContext(tmp_path, manager), views)
 
     assert manager.store.read().enabled == frozenset({"other-host", "other-view"})
     assert (tmp_path / "rendered.txt").read_text(encoding="utf-8") == "other architecture rendered"
 
 
-def test_incompatible_view_is_rejected_before_construction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_incompatible_view_is_rejected_before_construction(tmp_path: Path) -> None:
     manager = make_manager(tmp_path, f"{__name__}:ForbiddenConstructor", "example.incompatible.v1")
     manager.enable("other-host")
     before = manager.store.read()
@@ -73,9 +74,8 @@ def test_incompatible_view_is_rejected_before_construction(tmp_path: Path, monke
 
     enabled = frozenset({"other-host", "other-view"})
     manager.store.write(PluginState(installed=enabled, enabled=enabled))
-    monkeypatch.setattr(launcher, "manager", lambda: manager)
     with pytest.raises(PluginError, match="incompatible"):
-        launcher.launch(tmp_path)
+        enabled_views(manager)
 
 
 @pytest.mark.parametrize("broken", [OtherView(), type("BrokenView", (), {
@@ -85,23 +85,22 @@ def test_textual_host_reports_invalid_view_contract(tmp_path: Path, broken: obje
     manager = make_manager(tmp_path, f"{__name__}:OtherView")
     manifest = manager.manifests["other-view"]
     with pytest.raises(PluginError, match="other-view.*Textual view plugin contract"):
-        DesktopPlugin().run(PluginContext(tmp_path, manager), [(manifest, broken)])
+        textual_views([(manifest, broken)])
 
 
-def test_launcher_reports_textual_host_contract_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_native_pane_reports_textual_host_contract_error(tmp_path: Path) -> None:
     manager = make_manager(tmp_path, f"{__name__}:OtherView", "tdnext.textual-view.v1")
     manager.manifests = {
         **manager.manifests,
         "other-host": manager.manifests["other-host"].model_copy(update={
-            "entrypoint": "tdnext.plugins.desktop.plugin:DesktopPlugin",
+            "entrypoint": None,
             "host_interfaces": ("tdnext.textual-view.v1",),
         }),
     }
     manager.enable("other-view")
-    monkeypatch.setattr(launcher, "manager", lambda: manager)
 
     with pytest.raises(PluginError, match="other-view.*Textual view plugin contract"):
-        launcher.launch(tmp_path)
+        textual_views(enabled_views(manager))
 
 
 def test_old_snapshot_runs_native_view_pane_without_current_state(

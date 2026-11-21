@@ -15,18 +15,16 @@ from tdnext.plugins.settings.view import SettingsView
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(("host", "size"), [("desktop", (80, 24)), ("pane", (35, 24)), ("pane", (80, 24))])
+@pytest.mark.parametrize("size", [(35, 24), (80, 24)])
 @pytest.mark.parametrize("field", ["provider", "mode"])
 @pytest.mark.parametrize("option", [0, 1])
 async def test_mouse_option_selection_restores_focus_and_tab_order(
-    tmp_path: Path, host: str, size: tuple[int, int], field: str, option: int
+    tmp_path: Path, size: tuple[int, int], field: str, option: int
 ) -> None:
     desktop, manager = make_app(tmp_path)
     manager.enable("icons")
-    app = desktop if host == "desktop" else ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=size) as pilot:
-        if host == "desktop":
-            await pilot.press("alt+o")
         await pilot.pause()
         selector = app.query_one(f"#icon-{field}", Select)
         await pilot.click(f"#icon-{field}-frame", offset=(0, 1))
@@ -47,7 +45,6 @@ async def test_clicking_another_appearance_frame_switches_the_open_selector(tmp_
     app, manager = make_app(tmp_path)
     manager.enable("icons")
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o")
         await pilot.click("#icon-provider-frame", offset=(0, 1))
         await pilot.click("#icon-mode-frame", offset=(0, 1))
         assert not app.query_one("#icon-provider", Select).expanded
@@ -58,12 +55,11 @@ async def test_clicking_another_appearance_frame_switches_the_open_selector(tmp_
 async def test_escape_dismisses_the_open_appearance_menu_without_leaving_settings(tmp_path: Path) -> None:
     app, _manager = make_app(tmp_path)
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o")
         selector = app.query_one("#icon-mode", Select)
         await pilot.click("#icon-mode-frame", offset=(0, 1))
         assert selector.expanded
         await pilot.press("escape")
-        assert app.query_one(ContentSwitcher).current == "view-settings"
+        assert app.query_one("#settings-pages", ContentSwitcher).current == "settings-general"
         assert not selector.expanded
         assert app.focused is selector
 
@@ -73,7 +69,6 @@ async def test_disabled_appearance_frame_does_not_open(tmp_path: Path) -> None:
     app, manager = make_app(tmp_path)
     before = AppearanceStore(manager.store.path.with_name("appearance.json")).read()
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.press("alt+o")
         selector = app.query_one("#icon-provider", Select)
         selector.disabled = True
         await pilot.click("#icon-provider-frame", offset=(0, 1))
@@ -82,12 +77,12 @@ async def test_disabled_appearance_frame_does_not_open(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(("host", "size"), [("desktop", (80, 24)), ("pane", (35, 24))])
+@pytest.mark.parametrize("size", [(80, 24), (35, 24)])
 @pytest.mark.parametrize("operation", ["disable", "uninstall"])
 @pytest.mark.parametrize("choice", ["cancel", "confirm-plugin-change"])
 @pytest.mark.parametrize("position", ["center", "right-edge"])
 async def test_confirmation_buttons_fit_and_respond_to_mouse(
-    tmp_path: Path, host: str, size: tuple[int, int], operation: str, choice: str, position: str
+    tmp_path: Path, size: tuple[int, int], operation: str, choice: str, position: str
 ) -> None:
     desktop, manager = make_app(tmp_path, monitor=True)
     if operation == "disable":
@@ -99,10 +94,8 @@ async def test_confirmation_buttons_fit_and_respond_to_mouse(
         state = manager.store.read()
         manager.store.write(PluginState(installed=state.installed | {"extra"}, enabled=state.enabled | {"extra"}))
     before = manager.store.read()
-    app = desktop if host == "desktop" else ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=size) as pilot:
-        if host == "desktop":
-            await pilot.press("alt+o")
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
         view.query_one(DataTable).move_cursor(row=view.plugin_ids.index("monitor"))
@@ -137,7 +130,7 @@ async def test_confirmation_keyboard_is_safe_and_reachable(
     tmp_path: Path, size: tuple[int, int], keys: tuple[str, ...], removed: bool
 ) -> None:
     desktop, manager = make_app(tmp_path, monitor=True)
-    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=size) as pilot:
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
@@ -154,7 +147,7 @@ async def test_confirmation_keyboard_is_safe_and_reachable(
 async def test_open_confirmation_reflows_on_resize_without_losing_focus(tmp_path: Path) -> None:
     desktop, manager = make_app(tmp_path, monitor=True)
     before = manager.store.read()
-    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
@@ -188,7 +181,7 @@ async def test_long_cascade_keeps_actions_visible_and_details_scrollable(tmp_pat
     state = manager.store.read()
     manager.store.write(PluginState(installed=state.installed | dependants, enabled=state.enabled | dependants))
     before = manager.store.read()
-    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=size) as pilot:
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
@@ -215,7 +208,7 @@ async def test_confirmation_button_frames_do_not_change_with_focus_or_hover(
     tmp_path: Path, size: tuple[int, int]
 ) -> None:
     desktop, _manager = make_app(tmp_path, monitor=True)
-    app = ToolPane("settings", SettingsPlugin(), desktop.context)
+    app = ToolPane(SettingsPlugin(), desktop.context)
     async with app.run_test(size=size) as pilot:
         await pilot.click("#section-plugins")
         view = app.query_one(SettingsView)
