@@ -1,0 +1,7 @@
+{
+  "views": [
+    {"id":"shell", "name":"Shell", "icon":">_", "placement":"sidebar", "command":"/bin/sh"},
+    {"id":"monitor", "name":"Monitor", "icon":"M", "placement":"sidebar", "command":"top"},
+    {"id":"settings", "name":"Tools", "icon":"S", "placement":"header", "command":"/bin/sh", "shortcuts":"run $TDNEXT_ZELLIJ action return-to-origin"}
+  ]
+}

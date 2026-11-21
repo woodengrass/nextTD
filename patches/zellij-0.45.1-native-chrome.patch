@@ -18,8 +18,9 @@ new file mode 100644
 index 0000000..bfa458d
 --- /dev/null
 +++ b/zellij-server/src/desktop_chrome.rs
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,226 @@
 +use serde::Deserialize;
++use std::collections::HashSet;
 +use std::path::Path;
 +use std::sync::atomic::{AtomicBool, Ordering};
 +use std::sync::OnceLock;
@@ -79,7 +80,7 @@ index 0000000..bfa458d
 +    }
 +    let width = if COLLAPSED.load(Ordering::Relaxed) { 10 } else { 22 };
 +    let x = width.min(size.cols.saturating_sub(1));
-+    let y = usize::from(size.rows >= 3);
++    let y = if size.rows >= 6 { 2 } else { usize::from(size.rows >= 3) };
 +    let bottom = if size.rows >= 5 { 3 } else if size.rows >= 4 { 2 } else { usize::from(size.rows >= 3) };
 +    Viewport { x, y, cols: size.cols - x, rows: size.rows - y - bottom }
 +}
@@ -110,73 +111,138 @@ index 0000000..bfa458d
 +    Content,
 +}
 +
++struct RailGeometry {
++    tiles: std::ops::Range<usize>,
++    hints: Option<usize>,
++}
++
++impl RailGeometry {
++    fn new(size: Size, viewport: Viewport, count: usize, collapsed: bool) -> Self {
++        let start = viewport.y.saturating_add(6);
++        let end = start.saturating_add(count.saturating_mul(3)).min(viewport.y + viewport.rows);
++        let end = if end > start && (end - start) % 3 == 1 { end - 1 } else { end };
++        let tiles = start..end.max(start);
++        let hint_row = size.rows.saturating_sub(4);
++        let hints = (!collapsed && hint_row >= tiles.end && hint_row >= viewport.y + 5).then_some(hint_row);
++        Self { tiles, hints }
++    }
++
++    fn tile_index(&self, row: usize) -> Option<usize> {
++        self.tiles.contains(&row).then(|| (row - self.tiles.start) / 3)
++    }
++}
++
 +impl DesktopChrome {
-+    pub fn render(&self, size: Size, active_tab: &str) -> String {
++    pub fn render(&self, size: Size, active_tab: &str, sidebar_tab: &str, live_tabs: &HashSet<&str>) -> Vec<String> {
 +        let viewport = content_viewport(size);
-+        if size.rows == 0 || size.cols == 0 { return String::new(); }
-+        let mut output = String::from("\x1b7\x1b[0m");
++        if size.rows == 0 || size.cols == 0 { return Vec::new(); }
++        let color_term = std::env::var("COLORTERM").unwrap_or_default().to_ascii_lowercase();
++        let term = std::env::var("TERM").unwrap_or_default().to_ascii_lowercase();
++        let (surface, selected_bg, separator_color, foreground, muted) = if color_term == "truecolor" || color_term == "24bit" {
++            ("\x1b[48;2;25;27;29m", "\x1b[48;2;147;184;179m", "\x1b[38;2;128;128;128m", "\x1b[38;2;224;224;224m", "\x1b[38;2;128;128;128m")
++        } else if term.ends_with("-256color") {
++            ("\x1b[48;5;234m", "\x1b[48;5;109m", "\x1b[38;2;128;128;128m", "\x1b[38;5;253m", "\x1b[38;5;244m")
++        } else {
++            ("\x1b[40m", "\x1b[46m", "\x1b[38;2;128;128;128m", "\x1b[97m", "\x1b[37m")
++        };
++        let mut output = Vec::new();
 +        if viewport.y > 0 {
 +            let header = self.items.iter().filter(|item| matches!(item.placement, Placement::Header))
-+                .map(|item| format!(" {} {} ", item.icon, item.name)).collect::<String>();
-+            let start = size.cols.saturating_sub(UnicodeWidthStr::width(header.as_str()));
-+            let title = padded(" TDNEXT", start);
-+            output.push_str(&format!("\x1b[1;1H\x1b[48;5;237m\x1b[38;5;255m{}\x1b[0m", padded(&format!("{title}{header}"), size.cols)));
++                .enumerate().map(|(index, item)| format!(" {}{} ", item.name, if index == 0 { " [Alt+o]" } else { "" })).collect::<String>();
++            let start = size.cols.saturating_sub(UnicodeWidthStr::width(header.as_str()).saturating_add(1));
++            let title = clip("TERMINAL DESKTOP", start.saturating_sub(1));
++            let title_padding = start.saturating_sub(1 + UnicodeWidthStr::width(title.as_str()));
++            output.push(format!("\x1b[1;1H{surface}{}{foreground}\x1b[1m{title}\x1b[0m{surface}{}{foreground}\x1b[1;7m{}\x1b[0m{surface} ", if start > 0 { " " } else { "" }, " ".repeat(title_padding), clip(&header, size.cols.saturating_sub(start).saturating_sub(1))));
 +        }
-+        for row in viewport.y..viewport.y + viewport.rows {
++        if viewport.y > 1 {
++            let left = viewport.x.saturating_sub(1);
++            let junction = if viewport.x > 0 { "┬" } else { "" };
++            output.push(format!("\x1b[2;1H\x1b[49m{separator_color}{}{junction}{}\x1b[0m", "─".repeat(left), "─".repeat(size.cols.saturating_sub(viewport.x))));
++        }
++        let collapsed = COLLAPSED.load(Ordering::Relaxed);
++        let rail = RailGeometry::new(size, viewport, self.items.iter().filter(|item| matches!(item.placement, Placement::Sidebar)).count(), collapsed);
++        for row in viewport.y..size.rows {
 +            if viewport.x == 0 { break; }
-+            let item = self.items.iter().filter(|item| matches!(item.placement, Placement::Sidebar)).nth(row.saturating_sub(viewport.y + 1));
-+            let text = if row == viewport.y {
-+                if COLLAPSED.load(Ordering::Relaxed) { " > F7 ".to_owned() } else { " < F7 Desktop".to_owned() }
-+            } else if let Some(item) = item {
-+                let selected = if item.tab_name == active_tab { ">" } else { " " };
-+                let name = if item.name.is_empty() { &item.id } else { &item.name };
-+                if COLLAPSED.load(Ordering::Relaxed) { format!("{selected} {}", item.icon) } else { format!("{selected} {} {name}", item.icon) }
++            let offset = row - viewport.y;
++            let item = rail.tile_index(row).and_then(|index| self.items.iter().filter(|item| matches!(item.placement, Placement::Sidebar)).nth(index));
++            let available = item.is_some_and(|item| live_tabs.contains(item.tab_name.as_str()));
++            let selected = available && item.is_some_and(|item| item.tab_name == sidebar_tab);
++            let text = if offset == 1 {
++                if collapsed { " F7: >".to_owned() } else { " F7: Collapse".to_owned() }
++            } else if offset == 2 && !collapsed { " WORKSPACE".to_owned() }
++            else if offset == 4 && !collapsed { " VIEWS".to_owned() }
++            else if rail.hints == Some(row) { " Alt+1..9 switch".to_owned() }
++            else if rail.hints.is_some_and(|first| row == first + 1) { " Ctrl+q quit".to_owned() }
++            else if offset >= 6 && (offset - 6) % 3 == 1 {
++                item.map(|item| {
++                    let marker = if selected && item.tab_name == active_tab { ">" } else { " " };
++                    let name = if item.name.is_empty() { &item.id } else { &item.name };
++                    if collapsed { format!("{marker} {}", item.icon) } else { format!("{marker} {}    {name}", item.icon) }
++                }).unwrap_or_default()
 +            } else { String::new() };
-+            output.push_str(&format!("\x1b[{};1H\x1b[48;5;236m\x1b[38;5;255m{}\x1b[38;5;245m│\x1b[0m", row + 1, padded(&text, viewport.x - 1)));
++            let tile = selected && offset >= 6 && row < viewport.y + viewport.rows;
++            let background = if tile { selected_bg } else { surface };
++            if viewport.x == 1 {
++                output.push(format!("\x1b[{};1H\x1b[49m{separator_color}│\x1b[0m", row + 1));
++            } else {
++                let color = if (item.is_some() && !available) || offset == 4 && !collapsed || rail.hints.is_some_and(|first| row == first || row == first + 1) { muted } else { foreground };
++                let label = if item.is_some() { text.as_str() } else { text.strip_prefix(' ').unwrap_or(&text) };
++                let width = viewport.x.saturating_sub(3);
++                let weight = if !label.is_empty() && (tile || offset == 2 && !collapsed) { "\x1b[1m" } else { "" };
++                let label = clip(label, width);
++                let padding = width.saturating_sub(UnicodeWidthStr::width(label.as_str()));
++                output.push(format!("\x1b[{};1H{surface} {background}{color}{weight}{label}\x1b[0m{background}{}{surface} \x1b[49m{separator_color}│\x1b[0m", row + 1, " ".repeat(padding)));
++            }
 +        }
 +        let bottom = size.rows.saturating_sub(viewport.y + viewport.rows);
 +        if bottom > 0 {
 +            let separator = usize::from(bottom > 2);
 +            if separator > 0 {
-+                output.push_str(&format!("\x1b[{};1H\x1b[48;5;237m\x1b[38;5;245m{}\x1b[0m", viewport.y + viewport.rows + 1, "─".repeat(size.cols)));
++                output.push(format!("\x1b[{};{}H\x1b[49m{separator_color}├{}\x1b[0m", viewport.y + viewport.rows + 1, viewport.x.max(1), "─".repeat(viewport.cols)));
 +            }
 +            let tool = self.items.iter().find(|item| item.tab_name == active_tab)
 +                .map(|item| format!("Tool ({}): {}", item.name, item.shortcuts))
 +                .unwrap_or_else(|| "No views enabled".to_owned());
-+            output.push_str(&format!("\x1b[{};1H\x1b[48;5;237m\x1b[38;5;255m{}\x1b[0m", viewport.y + viewport.rows + separator + 1, padded(&tool, size.cols)));
++            output.push(format!("\x1b[{};{}H{surface}{foreground}{}\x1b[0m", viewport.y + viewport.rows + separator + 1, viewport.x + 1, padded(&format!(" {tool}"), viewport.cols)));
 +            if bottom > 1 {
 +                let mut hints = String::from("Global: Ctrl+q quit Ctrl+p panes");
 +                if self.items.iter().any(|item| matches!(item.placement, Placement::Header)) { hints.push_str(" Alt+o header"); }
 +                let count = self.items.iter().filter(|item| matches!(item.placement, Placement::Sidebar)).count().min(9);
 +                if count == 1 { hints.push_str(" Alt+1 view"); }
 +                else if count > 1 { hints.push_str(&format!(" Alt+1..{count} views")); }
-+                output.push_str(&format!("\x1b[{};1H\x1b[48;5;237m\x1b[38;5;255m{}\x1b[0m", size.rows, padded(&hints, size.cols)));
++                output.push(format!("\x1b[{};{}H{surface}{foreground}{}\x1b[0m", size.rows, viewport.x + 1, padded(&format!(" {hints}"), viewport.cols)));
 +            }
 +        }
-+        output.push_str("\x1b8");
 +        output
 +    }
 +
-+    pub fn click(&self, size: Size, row: usize, col: usize) -> Click<'_> {
++    pub fn click(&self, size: Size, row: usize, col: usize, live_tabs: &HashSet<&str>) -> Click<'_> {
 +        let viewport = content_viewport(size);
 +        if viewport.y > 0 && row == 0 {
 +            let header_width: usize = self.items.iter().filter(|item| matches!(item.placement, Placement::Header))
-+                .map(|item| UnicodeWidthStr::width(format!(" {} {} ", item.icon, item.name).as_str())).sum();
-+            let mut start = size.cols.saturating_sub(header_width);
-+            for item in self.items.iter().filter(|item| matches!(item.placement, Placement::Header)) {
-+                let label = format!(" {} {} ", item.icon, item.name);
++                .enumerate().map(|(index, item)| UnicodeWidthStr::width(format!(" {}{} ", item.name, if index == 0 { " [Alt+o]" } else { "" }).as_str())).sum();
++            let mut start = size.cols.saturating_sub(header_width.saturating_add(1));
++            for (index, item) in self.items.iter().filter(|item| matches!(item.placement, Placement::Header)).enumerate() {
++                let label = format!(" {}{} ", item.name, if index == 0 { " [Alt+o]" } else { "" });
 +                let end = start + UnicodeWidthStr::width(clip(&label, size.cols).as_str());
 +                if col >= start && col < end { return Click::Header(&item.tab_name); }
 +                start = end;
 +            }
 +            return Click::Chrome;
 +        }
-+        if col < viewport.x && row >= viewport.y && row < viewport.y + viewport.rows {
-+            if row == viewport.y { return Click::Toggle; }
-+            return self.items.iter().filter(|item| matches!(item.placement, Placement::Sidebar))
-+                .nth(row - viewport.y - 1).map(|item| Click::Sidebar(item.tab_name.as_str())).unwrap_or(Click::Chrome);
++        if col < viewport.x && row >= viewport.y {
++            let offset = row - viewport.y;
++            if col == viewport.x - 1 { return Click::Chrome; }
++            if offset == 1 { return Click::Toggle; }
++            let rail = RailGeometry::new(size, viewport, self.items.iter().filter(|item| matches!(item.placement, Placement::Sidebar)).count(), COLLAPSED.load(Ordering::Relaxed));
++            if let Some(index) = rail.tile_index(row) {
++                return self.items.iter().filter(|item| matches!(item.placement, Placement::Sidebar))
++                    .nth(index).filter(|item| live_tabs.contains(item.tab_name.as_str()))
++                    .map(|item| Click::Sidebar(item.tab_name.as_str())).unwrap_or(Click::Chrome);
++            }
++            return Click::Chrome;
 +        }
-+        if row >= viewport.y + viewport.rows { Click::Chrome } else { Click::Content }
++        if row < viewport.y || row >= viewport.y + viewport.rows { Click::Chrome } else { Click::Content }
 +    }
 +}
 diff --git a/zellij-server/src/lib.rs b/zellij-server/src/lib.rs
@@ -203,6 +269,23 @@ index bfebd7b..47de00a 100644
              .pre_exec(move || -> io::Result<()> {
                  if libc::login_tty(pid_secondary) != 0 {
                      panic!("failed to set controlling terminal");
+diff --git a/zellij-server/src/output/mod.rs b/zellij-server/src/output/mod.rs
+index ee2138f..390a65b 100644
+--- a/zellij-server/src/output/mod.rs
++++ b/zellij-server/src/output/mod.rs
+@@ -757,6 +757,12 @@ impl Output {
+     pub fn mark_host_display_cleared_for_client(&mut self, client_id: ClientId) {
+         self.clients_with_cleared_host_display.insert(client_id);
+     }
++    pub(crate) fn host_display_was_cleared(&self, client_id: ClientId) -> bool {
++        self.clients_with_cleared_host_display.contains(&client_id)
++    }
++    pub(crate) fn prepend_post_vte_instruction_to_client(&mut self, client_id: ClientId, instruction: String) {
++        self.post_vte_instructions.entry(client_id).or_default().insert(0, instruction);
++    }
+     pub fn add_post_vte_instruction_to_client(
+         &mut self,
+         client_id: ClientId,
 diff --git a/zellij-server/src/panes/floating_panes/mod.rs b/zellij-server/src/panes/floating_panes/mod.rs
 index bf6b98c..99ca486 100644
 --- a/zellij-server/src/panes/floating_panes/mod.rs
@@ -440,7 +523,23 @@ index 5f87cd1..ce1dcd5 100644
              ScreenInstruction::Copy(..) => ScreenContext::Copy,
              ScreenInstruction::ToggleTab(..) => ScreenContext::ToggleTab,
              ScreenInstruction::AddClient(..) => ScreenContext::AddClient,
-@@ -2169,6 +2171,10 @@ impl Screen {
+@@ -1550,6 +1552,7 @@ pub(crate) struct Screen {
+     kitty_host_capabilities: Rc<RefCell<HashMap<ClientId, bool>>>,
+     sixel_host_capabilities: Rc<RefCell<HashMap<ClientId, bool>>>,
+     client_kitty_host_state: Rc<RefCell<HashMap<ClientId, HostKittyState>>>,
++    client_chrome: HashMap<ClientId, (Size, Vec<String>)>,
+     terminal_emulator_colors: Rc<RefCell<Palette>>,
+     terminal_emulator_color_codes: Rc<RefCell<HashMap<usize, String>>>,
+     connected_clients: Rc<RefCell<HashMap<ClientId, bool>>>, // bool -> is_web_client
+@@ -1764,6 +1767,7 @@ impl Screen {
+             kitty_host_capabilities: Rc::new(RefCell::new(HashMap::new())),
+             sixel_host_capabilities: Rc::new(RefCell::new(HashMap::new())),
+             client_kitty_host_state: Rc::new(RefCell::new(HashMap::new())),
++            client_chrome: HashMap::new(),
+             style: client_attributes.style,
+             connected_clients: Rc::new(RefCell::new(HashMap::new())),
+             active_tab_ids: BTreeMap::new(),
+@@ -2169,6 +2173,10 @@ impl Screen {
                      self.recompute_tab_size(new_tab_index)
                          .with_context(err_context)?;
  
@@ -451,22 +550,60 @@ index 5f87cd1..ce1dcd5 100644
                      self.log_and_report_session_state()
                          .with_context(err_context)?;
                      for (affected_client_id, old_pane_id) in old_focused_panes {
-@@ -4370,6 +4376,14 @@ impl Screen {
-                 .senders
-                 .send_to_plugin(PluginInstruction::PaneRenderReport(pane_render_report));
+@@ -4358,6 +4366,36 @@ impl Screen {
+                 }
+             }
  
++            // Inspect the actual host erase after tab rendering, then paint before
++            // the tab's cursor instructions. Save/restore also covers chrome-only frames.
 +            if let Some(chrome) = crate::desktop_chrome::current() {
++                let live_tabs = self.tabs.values().map(|tab| tab.name.as_str()).collect();
 +                for (client_id, tab_id) in &self.active_tab_ids {
++                    if self.watcher_clients.contains_key(client_id) { continue; }
 +                    if let Some(tab) = self.tabs.get(tab_id) {
 +                        let size = self.size_for_client(Some(*client_id));
-+                        output.add_post_vte_instruction_to_client(*client_id, &chrome.render(size, &tab.name));
++                        let sidebar_tab = self.navigation_origins.get(client_id)
++                            .filter(|origin| origin.destination_id == *tab_id)
++                            .and_then(|origin| self.tabs.get(&origin.tab_id))
++                            .map(|origin| origin.name.as_str()).unwrap_or(&tab.name);
++                        let rendered = chrome.render(size, &tab.name, sidebar_tab, &live_tabs);
++                        let previous = self.client_chrome.get(client_id);
++                        let full = output.host_display_was_cleared(*client_id)
++                            || previous.is_none_or(|(old_size, _)| *old_size != size);
++                        let mut changed = String::new();
++                        for (index, segment) in rendered.iter().enumerate() {
++                            if full || previous.and_then(|(_, segments)| segments.get(index)) != Some(segment) {
++                                changed.push_str(segment);
++                            }
++                        }
++                        if !changed.is_empty() {
++                            output.prepend_post_vte_instruction_to_client(*client_id, format!("\x1b7\x1b[0m{changed}\x1b8"));
++                        }
++                        self.client_chrome.insert(*client_id, (size, rendered));
 +                    }
 +                }
 +            }
-             non_watcher_output_was_dirty = output.is_dirty();
++
+             let pane_render_report = output.drain_pane_render_report();
  
-             let mut bell_state_changed = false;
-@@ -7430,7 +7444,36 @@ impl Screen {
+             // Subscriber delivery — gated behind is_empty() for zero overhead
+@@ -5219,6 +5257,7 @@ impl Screen {
+         };
+ 
+         self.active_tab_ids.insert(client_id, tab_index);
++        self.client_chrome.remove(&client_id);
+         self.client_kitty_host_state.borrow_mut().remove(&client_id);
+         self.connected_clients
+             .borrow_mut()
+@@ -5337,6 +5376,7 @@ impl Screen {
+             self.detached_navigation_origin = removed_origin;
+         }
+         self.connected_clients.borrow_mut().remove(&client_id);
++        self.client_chrome.remove(&client_id);
+         self.client_kitty_host_state.borrow_mut().remove(&client_id);
+         let removed_kitty_capability = self
+             .kitty_host_capabilities
+@@ -7430,7 +7470,37 @@ impl Screen {
              }
          }
      }
@@ -484,7 +621,8 @@ index 5f87cd1..ce1dcd5 100644
      pub fn handle_mouse_event(&mut self, event: MouseEvent, client_id: ClientId) {
 +        if let (Some(chrome), Ok(row)) = (crate::desktop_chrome::current(), usize::try_from(event.position.line())) {
 +            let size = self.size_for_client(Some(client_id));
-+            match chrome.click(size, row, event.position.column()) {
++            let live_tabs = self.tabs.values().map(|tab| tab.name.as_str()).collect();
++            match chrome.click(size, row, event.position.column(), &live_tabs) {
 +                crate::desktop_chrome::Click::Content => {},
 +                click => {
 +                    if event.event_type == MouseEventType::Press && event.left {
@@ -503,7 +641,7 @@ index 5f87cd1..ce1dcd5 100644
          let is_bare_motion = event.event_type == MouseEventType::Motion
              && !event.left
              && !event.right
-@@ -10378,6 +10421,9 @@ pub(crate) fn screen_thread_main(
+@@ -10378,6 +10448,9 @@ pub(crate) fn screen_thread_main(
              ) => {
                  screen.handle_mouse_event(event, client_id);
              },
@@ -557,7 +695,36 @@ index 345b909..c6845f1 100644
          let viewport = Rc::new(RefCell::new(viewport));
          let display_area = Rc::new(RefCell::new(display_area));
          let connected_clients = Rc::new(RefCell::new(connected_clients));
-@@ -5088,6 +5088,45 @@ impl Tab {
+@@ -4973,11 +4973,23 @@ impl Tab {
+                                 cursor_position_x + 1,
+                                 desired_cursor_shape
+                             ); // goto row/col
+-                            output.add_post_vte_instruction_to_client(client_id, show_cursor);
+-                            output.add_post_vte_instruction_to_client(
+-                                client_id,
+-                                goto_cursor_position,
+-                            );
++                            // With native chrome the paint lands after the VTE
++                            // with the cursor hidden, so move before showing.
++                            let chrome_active =
++                                crate::desktop_chrome::current().is_some();
++                            if chrome_active {
++                                output.add_post_vte_instruction_to_client(
++                                    client_id,
++                                    goto_cursor_position,
++                                );
++                                output.add_post_vte_instruction_to_client(client_id, show_cursor);
++                            } else {
++                                output.add_post_vte_instruction_to_client(client_id, show_cursor);
++                                output.add_post_vte_instruction_to_client(
++                                    client_id,
++                                    goto_cursor_position,
++                                );
++                            }
+                             self.cursor_positions_and_shape.insert(
+                                 client_id,
+                                 (cursor_position_x, cursor_position_y, desired_cursor_shape),
+@@ -5088,6 +5100,45 @@ impl Tab {
          }
          Ok(())
      }
