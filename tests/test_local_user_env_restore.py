@@ -7,7 +7,7 @@ from local_path_fixtures import PY, base_env, run_child
 
 
 @pytest.mark.parametrize("path_state", ["absent", "empty", "normal"])
-def test_user_facing_shell_and_editor_restore_original_path(tmp_path, path_state: str) -> None:
+def test_user_facing_shell_restores_original_path(tmp_path, path_state: str) -> None:
     state = tmp_path / "state"
     state.mkdir(parents=True, exist_ok=True)
     env = base_env(tmp_path, state, path_state=path_state)
@@ -24,8 +24,6 @@ def test_user_facing_shell_and_editor_restore_original_path(tmp_path, path_state
         "restored = restored_env()\n"
         "print('SHELL_PATH=' + repr(restored.get('PATH', '<unset>')))\n"
         "print('MARKERS=' + repr(sorted(k for k in restored if k in BAD)))\n"
-        "import subprocess\n"
-        "from unittest import mock\n"
         "from pathlib import Path\n"
         "from tdnext.plugins.shell.launch import exec_shell\n"
         "captured = {}\n"
@@ -36,32 +34,6 @@ def test_user_facing_shell_and_editor_restore_original_path(tmp_path, path_state
         "exec_shell(Path('.'))\n"
         "print('EXEC_PATH=' + repr(captured['env'].get('PATH', '<unset>')))\n"
         "print('EXEC_MARKERS=' + repr(sorted(k for k in captured['env'] if k in BAD)))\n"
-        "from tdnext.plugins.files.view import FilesView\n"
-        "view = FilesView.__new__(FilesView)\n"
-        "sent = {}\n"
-        "def fake_run(cmd, **kw):\n"
-        "    sent.update(kw)\n"
-        "    sent['cmd'] = cmd\n"
-        "    class R:\n"
-        "        returncode = 0\n"
-        "    return R()\n"
-        "subprocess.run = fake_run\n"
-        "class FakeApp:\n"
-        "    def suspend(self):\n"
-        "        from contextlib import nullcontext\n"
-        "        return nullcontext()\n"
-        "    def notify(self, *a, **k): pass\n"
-        "with mock.patch.object(FilesView, 'app', new_callable=mock.PropertyMock) as pm:\n"
-        "    pm.return_value = FakeApp()\n"
-        "    import tempfile\n"
-        "    target = Path(tempfile.mkdtemp()) / 'note.txt'\n"
-        "    target.write_text('hi')\n"
-        "    view.directory = target.parent\n"
-        "    view.reload_directory = lambda *a, **k: None\n"
-        "    os.environ['EDITOR'] = 'true'\n"
-        "    view.edit(target)\n"
-        "print('EDITOR_PATH=' + repr(sent.get('env', {}).get('PATH', '<unset>')))\n"
-        "print('EDITOR_MKS=' + repr(sorted(k for k in sent.get('env', {}) if k in BAD)))\n"
     )
     result = run_child([PY, "-c", code], env)
     assert result.returncode == 0, result.stderr
@@ -70,8 +42,6 @@ def test_user_facing_shell_and_editor_restore_original_path(tmp_path, path_state
     assert "MARKERS=[]" in result.stdout, result.stdout
     assert f"EXEC_PATH={want!r}" in result.stdout, result.stdout
     assert "EXEC_MARKERS=[]" in result.stdout, result.stdout
-    assert f"EDITOR_PATH={want!r}" in result.stdout, result.stdout
-    assert "EDITOR_MKS=[]" in result.stdout, result.stdout
 
 
 def test_pty_child_shell_observes_original_path(tmp_path) -> None:

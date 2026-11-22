@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from textual.widget import Widget
 
 from tdnext.api import PluginContext, ViewPlugin
 from tdnext.core.appearance import Appearance, AppearanceStore
@@ -22,7 +23,6 @@ from tdnext.core.manager import PluginManager
 from tdnext.core.models import PluginState
 from tdnext.core.state import StateStore
 from tdnext.core.views import enabled_views
-from tdnext.plugins.files.plugin import FilesPlugin
 from tdnext.plugins.settings.plugin import SettingsPane
 
 
@@ -70,12 +70,20 @@ PROBE_HEADER = (
 
 
 
-class BlockingView(FilesPlugin):
+class BlockingView:
+    shortcuts = ""
+
     def __init__(self) -> None:
         subprocess.run(["btop", "--version"], check=True, capture_output=True)
         STARTED.set()
         if not RELEASE.wait(timeout=10):
             raise TimeoutError("constructor did not resume")
+
+    def make_view(self, _context: PluginContext) -> Widget:
+        return Widget()
+
+    def run_pane(self, _context: PluginContext) -> None:
+        subprocess.run(["btop", "--version"], check=True, capture_output=True)
 
 
 def install_btop(name: str, destination: Path) -> Path:
@@ -133,14 +141,17 @@ def test_local_binary_is_available_to_import_constructor_and_runtime(
     hook = f"{name}_deps:ProbeDependencies"
     if role == "view":
         body = (
-            "from tdnext.plugins.files.plugin import FilesPlugin\n"
-            "class Probe(FilesPlugin):\n"
+            "from textual.widget import Widget\n"
+            "class Probe:\n"
+            "    shortcuts = ''\n"
             "    def __init__(self): probe()\n"
             "    def make_view(self, context):\n"
             "        probe()\n"
-            "        return super().make_view(context)\n"
+            "        return Widget()\n"
+            "    def run_pane(self, context):\n"
+            "        probe()\n"
         )
-        manifest = manager.manifests["files"].model_copy(update={
+        manifest = manager.manifests["settings"].model_copy(update={
             "id": "probe", "entrypoint": f"{name}:Probe", "requires_plugins": (),
             "requires_executables": ("btop",),
             "dependency_hook": hook,
@@ -183,7 +194,7 @@ def test_plugin_constructor_does_not_change_other_threads_path(
         pytest.skip("requires the existing project-local btop binary")
     _app, manager = make_app(tmp_path)
     install_btop("btop", manager.local_bin)
-    manifest = manager.manifests["files"].model_copy(update={
+    manifest = manager.manifests["settings"].model_copy(update={
         "id": "probe", "entrypoint": f"{__name__}:BlockingView", "requires_plugins": (),
         "requires_executables": ("btop",),
     })
@@ -218,14 +229,17 @@ def test_local_binary_is_available_when_a_view_runs_after_construction(
     module = tmp_path / f"{name}.py"
     module.write_text(
         "import subprocess\n"
-        "from tdnext.plugins.files.plugin import FilesPlugin\n"
-        "class Probe(FilesPlugin):\n"
+        "from textual.widget import Widget\n"
+        "class Probe:\n"
+        "    shortcuts = ''\n"
         "    def make_view(self, context):\n"
         "        subprocess.run(['btop', '--version'], check=True, capture_output=True)\n"
-        "        return super().make_view(context)\n",
+        "        return Widget()\n"
+        "    def run_pane(self, context):\n"
+        "        subprocess.run(['btop', '--version'], check=True, capture_output=True)\n",
         encoding="utf-8",
     )
-    manifest = manager.manifests["files"].model_copy(update={
+    manifest = manager.manifests["settings"].model_copy(update={
         "id": "probe", "entrypoint": f"{name}:Probe", "requires_plugins": (),
         "requires_executables": ("btop",),
     })
