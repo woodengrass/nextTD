@@ -13,7 +13,8 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
 
 use crate::actions::{
-    EditorChoice, RestoredPath, create, editor, expanduser, find_executable_in,
+    EditorChoice, RestoredPath, cleanup_copied, copy_dir_noreplace, copy_file_noreplace, create,
+    create_private_dir, create_private_file, editor, expanduser, find_executable_in,
     parse_editor_choice, paste, remove, rename, resolve_editor_argv_with, resolve_state_dir_from,
     restored_path_plan,
 };
@@ -46,6 +47,48 @@ fn read(path: &Path) -> Result<Vec<u8>, String> {
 
 fn mode_of(path: &Path) -> Result<u32, String> {
     Ok(path.metadata().map_err(|error| error.to_string())?.mode() & 0o777)
+}
+
+fn times_of(path: &Path) -> Result<(i64, i64, i64, i64), String> {
+    let meta = path.metadata().map_err(|error| error.to_string())?;
+    Ok((
+        meta.atime(),
+        meta.atime_nsec(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+    ))
+}
+
+fn set_times(path: &Path, atime_sec: i64, mtime_sec: i64) -> Result<(), String> {
+    let times = rustix::fs::Timestamps {
+        last_access: rustix::fs::Timespec {
+            tv_sec: atime_sec as _,
+            tv_nsec: 0,
+        },
+        last_modification: rustix::fs::Timespec {
+            tv_sec: mtime_sec as _,
+            tv_nsec: 0,
+        },
+    };
+    rustix::fs::utimensat(rustix::fs::CWD, path, &times, rustix::fs::AtFlags::empty())
+        .map_err(|error| error.to_string())
+}
+
+/// Set a user xattr; `Ok(false)` when the filesystem cannot hold xattrs so
+/// the caller asserts copy success instead of xattr preservation.
+fn try_set_xattr(path: &Path, name: &str, value: &[u8]) -> Result<bool, String> {
+    match rustix::fs::setxattr(path, name, value, rustix::fs::XattrFlags::empty()) {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
+fn get_xattr(path: &Path, name: &str) -> Result<Vec<u8>, String> {
+    let len = rustix::fs::getxattr_query(path, name).map_err(|error| error.to_string())?;
+    let mut value = Vec::with_capacity(len.saturating_add(1));
+    rustix::fs::getxattr(path, name, rustix::buffer::spare_capacity(&mut value))
+        .map_err(|error| error.to_string())?;
+    Ok(value)
 }
 
 #[test]
@@ -198,6 +241,92 @@ fn paste_copies_file_with_metadata() -> Result<(), String> {
 }
 
 #[test]
+fn paste_copies_file_xattrs_and_times() -> Result<(), String> {
+    let root = dir()?;
+    let source_dir = root.path().join("src");
+    let dest_dir = root.path().join("dst");
+    std::fs::create_dir(&source_dir).map_err(|error| error.to_string())?;
+    std::fs::create_dir(&dest_dir).map_err(|error| error.to_string())?;
+    let source = source_dir.join("note.txt");
+    write(&source, b"hello")?;
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640))
+        .map_err(|error| error.to_string())?;
+    set_times(&source, 1_700_000_000, 1_700_000_123)?;
+    let xattrs = try_set_xattr(&source, "user.tdnext-note", b"pinned")?;
+    let target = paste(&source, &dest_dir, false)?;
+    // Times first: reading the copy for the content check below would
+    // refresh its access time under relatime.
+    if times_of(&target)? != times_of(&source)? {
+        return Err("pasted times were not preserved".to_string());
+    }
+    if mode_of(&target)? != 0o640 {
+        return Err("pasted mode was not preserved".to_string());
+    }
+    if read(&target)? != b"hello" {
+        return Err("pasted content differs".to_string());
+    }
+    if xattrs && get_xattr(&target, "user.tdnext-note")? != b"pinned" {
+        return Err("pasted xattr value differs".to_string());
+    }
+    Ok(())
+}
+
+#[test]
+fn paste_preserves_nested_tree_metadata_and_xattrs() -> Result<(), String> {
+    let root = dir()?;
+    let source = root.path().join("tree");
+    std::fs::create_dir(&source).map_err(|error| error.to_string())?;
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o750))
+        .map_err(|error| error.to_string())?;
+    let nested = source.join("nested");
+    std::fs::create_dir(&nested).map_err(|error| error.to_string())?;
+    std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o750))
+        .map_err(|error| error.to_string())?;
+    let inner = nested.join("b.txt");
+    write(&inner, b"b")?;
+    std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o640))
+        .map_err(|error| error.to_string())?;
+    set_times(&inner, 1_700_000_010, 1_700_000_020)?;
+    set_times(&nested, 1_700_000_030, 1_700_000_040)?;
+    let file_xattrs = try_set_xattr(&inner, "user.tdnext-inner", b"inner")?;
+    let dir_xattrs = try_set_xattr(&nested, "user.tdnext-nested", b"nested")?;
+    let parent = root.path().join("copy");
+    std::fs::create_dir(&parent).map_err(|error| error.to_string())?;
+    let copied = paste(&source, &parent, false)?;
+    // Times before any read: reading a copy refreshes its access time
+    // under relatime, and walking the source refreshes the source dirs.
+    // The outermost directory keeps source mode/times too (deliberate
+    // divergence recorded in `copy-root-metadata.adr.md`).
+    if times_of(&copied)? != times_of(&source)? {
+        return Err("copied root times were not preserved".to_string());
+    }
+    if times_of(&copied.join("nested"))? != times_of(&nested)? {
+        return Err("nested dir times were not preserved".to_string());
+    }
+    let copied_nested = copied.join("nested");
+    if mode_of(&copied)? != 0o750 {
+        return Err("copied root mode was not preserved".to_string());
+    }
+    if mode_of(&copied_nested)? != 0o750 {
+        return Err("nested dir mode was not preserved".to_string());
+    }
+    let copied_inner = copied_nested.join("b.txt");
+    if times_of(&copied_inner)? != times_of(&inner)? {
+        return Err("nested file times were not preserved".to_string());
+    }
+    if read(&copied_inner)? != b"b" || mode_of(&copied_inner)? != 0o640 {
+        return Err("nested file content or mode differs".to_string());
+    }
+    if file_xattrs && get_xattr(&copied_inner, "user.tdnext-inner")? != b"inner" {
+        return Err("nested file xattr was not preserved".to_string());
+    }
+    if dir_xattrs && get_xattr(&copied_nested, "user.tdnext-nested")? != b"nested" {
+        return Err("nested dir xattr was not preserved".to_string());
+    }
+    Ok(())
+}
+
+#[test]
 fn paste_copies_symlink_as_symlink() -> Result<(), String> {
     let root = dir()?;
     let dest_dir = root.path().join("dst");
@@ -304,6 +433,85 @@ fn paste_moves_and_copies_trees() -> Result<(), String> {
 }
 
 #[test]
+fn copy_creation_is_private_before_final_metadata() -> Result<(), String> {
+    let root = dir()?;
+    let folder = root.path().join("private");
+    create_private_dir(&folder)?;
+    let file = folder.join("file");
+    let opened = create_private_file(&file)?;
+    assert_eq!(mode_of(&folder)? & 0o077, 0);
+    assert_eq!(
+        opened.metadata().map_err(|error| error.to_string())?.mode() & 0o177,
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn copied_tree_cleanup_removes_only_unchanged_entries() -> Result<(), String> {
+    let root = dir()?;
+    let source = root.path().join("source");
+    std::fs::create_dir(&source).map_err(|error| error.to_string())?;
+    let nested = source.join("nested");
+    std::fs::create_dir(&nested).map_err(|error| error.to_string())?;
+    write(&source.join("a"), b"copied")?;
+    write(&nested.join("changed"), b"before")?;
+    let target = root.path().join("target");
+    let copied = copy_dir_noreplace(&source, &target)?;
+    write(&nested.join("changed"), b"after change")?;
+    assert!(cleanup_copied(&copied).is_err());
+    assert!(!source.join("a").exists());
+    assert_eq!(read(&nested.join("changed"))?, b"after change");
+    assert_eq!(read(&target.join("nested/changed"))?, b"before");
+    Ok(())
+}
+
+#[test]
+fn copied_tree_cleanup_preserves_new_subtrees() -> Result<(), String> {
+    let root = dir()?;
+    let source = root.path().join("source");
+    std::fs::create_dir(&source).map_err(|error| error.to_string())?;
+    let nested = source.join("nested");
+    std::fs::create_dir(&nested).map_err(|error| error.to_string())?;
+    write(&nested.join("copied"), b"copied")?;
+    let copied = copy_dir_noreplace(&source, &root.path().join("target"))?;
+    let added = nested.join("new");
+    std::fs::create_dir(&added).map_err(|error| error.to_string())?;
+    write(&added.join("data"), b"new")?;
+    assert!(cleanup_copied(&copied).is_err());
+    assert_eq!(read(&added.join("data"))?, b"new");
+    assert_eq!(read(&nested.join("copied"))?, b"copied");
+    Ok(())
+}
+
+#[test]
+fn copied_entries_cleanup_handles_files_symlinks_and_unchanged_tree() -> Result<(), String> {
+    let root = dir()?;
+    let source = root.path().join("source");
+    write(&source, b"before")?;
+    let copied = copy_file_noreplace(&source, &root.path().join("file-copy"))?;
+    write(&source, b"changed")?;
+    assert!(cleanup_copied(&copied).is_err());
+    assert_eq!(read(&source)?, b"changed");
+
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink("source", &link).map_err(|error| error.to_string())?;
+    let copied = copy_file_noreplace(&link, &root.path().join("link-copy"))?;
+    cleanup_copied(&copied)?;
+    assert!(!link.is_symlink());
+    assert_eq!(read(&source)?, b"changed");
+
+    let tree = root.path().join("tree");
+    std::fs::create_dir(&tree).map_err(|error| error.to_string())?;
+    std::fs::create_dir(tree.join("nested")).map_err(|error| error.to_string())?;
+    write(&tree.join("nested/file"), b"data")?;
+    let copied = copy_dir_noreplace(&tree, &root.path().join("tree-copy"))?;
+    cleanup_copied(&copied)?;
+    assert!(!tree.exists());
+    Ok(())
+}
+
+#[test]
 fn paste_missing_source_reports_gone() -> Result<(), String> {
     let root = dir()?;
     let missing = root.path().join("gone.txt");
@@ -361,7 +569,6 @@ fn editor_choice_parsing() -> Result<(), String> {
     let cases: &[(&str, EditorChoice)] = &[
         ("{}", EditorChoice::Environment),
         ("{\"editor\": \"environment\"}", EditorChoice::Environment),
-        ("{\"editor\": null}", EditorChoice::Environment),
         ("{\"editor\": \"nvim\"}", EditorChoice::Nvim),
         ("{\"editor\": \"vi\"}", EditorChoice::Vi),
     ];
@@ -375,6 +582,8 @@ fn editor_choice_parsing() -> Result<(), String> {
         "[1, 2]",
         "{\"editor\": \"emacs\"}",
         "{\"editor\": 42}",
+        // Explicit null is rejected; only an absent key means the default.
+        "{\"editor\": null}",
         "{\"editor\": \"vi\", \"other\": true}",
     ] {
         match parse_editor_choice(bad, path) {

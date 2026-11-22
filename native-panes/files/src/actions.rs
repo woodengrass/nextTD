@@ -34,7 +34,10 @@
 //!   unlinked on failure, and a partially copied tree is removed.
 //! - Metadata: regular files and directories keep their permission bits and
 //!   access/modification times (the `shutil.copystat(..., follow_symlinks=
-//!   False)` equivalent for links is recreating the link itself).
+//!   False)` equivalent for links is recreating the link itself), and on
+//!   Linux regular-file and directory copies also carry extended attributes
+//!   best-effort (`shutil._copyxattr` semantics: unsupported filesystems or
+//!   attributes never fail the copy). Symlinks never gain metadata.
 //! - Cross-device moves (`EXDEV`) fall back to exclusive copy + delete, so
 //!   the destination is still never overwritten and the source is removed
 //!   only after a successful copy. Plain [`rename`] does not fall back,
@@ -66,12 +69,14 @@
 //!   only a leading `~` / `~/` is.
 
 use std::ffi::OsStr;
+use std::os::fd::AsFd as _;
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use rustix::fs::{Access, AtFlags, CWD, Mode, OFlags, RenameFlags, Timespec, Timestamps};
+use rustix::fs::{Access, CWD, Mode, OFlags, RenameFlags, Timespec, Timestamps};
 use rustix::io::Errno;
 
 const INTO_ITSELF: &str = "Cannot copy or move a directory into itself.";
@@ -249,12 +254,51 @@ fn copy_symlink_noreplace(source: &Path, target: &Path) -> Result<(), String> {
     }
 }
 
-/// Copy permission bits and access/modification times; failures are ignored.
-fn copy_metadata(source: &Path, target: &Path) {
-    let Ok(meta) = std::fs::metadata(source) else {
-        return;
+/// Best-effort extended-attribute copy mirroring `shutil._copyxattr`:
+/// attribute-list failures and per-attribute failures are swallowed so an
+/// unsupported filesystem never fails a normal copy. Only ever called for
+/// regular files and directories, never for symlinks.
+fn copy_xattrs_fd(source: impl rustix::fd::AsFd, target: impl rustix::fd::AsFd) {
+    let list_len = match rustix::fs::flistxattr_query(&source) {
+        Ok(len) => len,
+        Err(_) => return,
     };
-    let _ = rustix::fs::chmod(target, Mode::from_bits_truncate(meta.mode() & 0o7777));
+    if list_len == 0 {
+        return;
+    }
+    let mut list = Vec::with_capacity(list_len.saturating_add(1));
+    if rustix::fs::flistxattr(&source, rustix::buffer::spare_capacity(&mut list)).is_err() {
+        return;
+    }
+    for name in list.split(|byte| *byte == 0) {
+        if name.is_empty() {
+            continue;
+        }
+        let value_len = match rustix::fs::fgetxattr_query(&source, name) {
+            Ok(len) => len,
+            Err(_) => continue,
+        };
+        let mut value = Vec::with_capacity(value_len.saturating_add(1));
+        if rustix::fs::fgetxattr(&source, name, rustix::buffer::spare_capacity(&mut value)).is_err()
+        {
+            continue;
+        }
+        let _ = rustix::fs::fsetxattr(&target, name, &value, rustix::fs::XattrFlags::empty());
+    }
+}
+
+fn open_dir_nofollow(path: &Path) -> Result<rustix::fd::OwnedFd, String> {
+    rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn copy_metadata(meta: &std::fs::Metadata, target: impl rustix::fd::AsFd) -> Result<(), String> {
+    rustix::fs::fchmod(&target, Mode::from_bits_truncate(meta.mode() & 0o7777))
+        .map_err(|error| error.to_string())?;
     let times = Timestamps {
         last_access: Timespec {
             tv_sec: meta.atime() as _,
@@ -265,22 +309,106 @@ fn copy_metadata(source: &Path, target: &Path) {
             tv_nsec: meta.mtime_nsec() as _,
         },
     };
-    let _ = rustix::fs::utimensat(CWD, target, &times, AtFlags::empty());
+    let _ = rustix::fs::futimens(target, &times);
+    Ok(())
 }
 
-/// Copy a single file/symlink to a path that must not exist, atomically.
-fn copy_file_noreplace(source: &Path, target: &Path) -> Result<(), String> {
-    let file_type = std::fs::symlink_metadata(source)
+#[derive(Debug)]
+pub(crate) struct CopiedEntry {
+    path: PathBuf,
+    metadata: std::fs::Metadata,
+    children: Vec<CopiedEntry>,
+}
+
+fn same_entry(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    a.dev() == b.dev()
+        && a.ino() == b.ino()
+        && a.mode() == b.mode()
+        && a.len() == b.len()
+        && a.mtime() == b.mtime()
+        && a.mtime_nsec() == b.mtime_nsec()
+        && a.ctime() == b.ctime()
+        && a.ctime_nsec() == b.ctime_nsec()
+}
+
+fn unchanged(path: &Path, metadata: &std::fs::Metadata) -> Result<(), String> {
+    let current = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if same_entry(metadata, &current) {
+        Ok(())
+    } else {
+        Err(format!("Source changed: {}", path.display()))
+    }
+}
+
+pub(crate) fn cleanup_copied(entry: &CopiedEntry) -> Result<(), String> {
+    unchanged(&entry.path, &entry.metadata)?;
+    if entry.metadata.is_dir() {
+        for child in &entry.children {
+            cleanup_copied(child)?;
+        }
+        let current = std::fs::symlink_metadata(&entry.path).map_err(|error| error.to_string())?;
+        if current.dev() != entry.metadata.dev()
+            || current.ino() != entry.metadata.ino()
+            || !current.is_dir()
+        {
+            return Err(format!("Source changed: {}", entry.path.display()));
+        }
+        std::fs::remove_dir(&entry.path).map_err(|error| error.to_string())
+    } else {
+        std::fs::remove_file(&entry.path).map_err(|error| error.to_string())
+    }
+}
+
+pub(crate) fn create_private_dir(target: &Path) -> Result<(), String> {
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(target)
         .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                source_gone(&display_name(source))
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                already_exists(&display_name(target))
             } else {
                 error.to_string()
             }
-        })?
-        .file_type();
+        })
+}
+
+pub(crate) fn create_private_file(target: &Path) -> Result<std::fs::File, String> {
+    rustix::fs::open(
+        target,
+        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map(Into::into)
+    .map_err(|error| {
+        if error == Errno::EXIST {
+            already_exists(&display_name(target))
+        } else {
+            error.to_string()
+        }
+    })
+}
+
+/// Copy a single file/symlink to a path that must not exist, atomically.
+pub(crate) fn copy_file_noreplace(source: &Path, target: &Path) -> Result<CopiedEntry, String> {
+    let metadata = std::fs::symlink_metadata(source).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            source_gone(&display_name(source))
+        } else {
+            error.to_string()
+        }
+    })?;
+    let file_type = metadata.file_type();
     if file_type.is_symlink() {
-        return copy_symlink_noreplace(source, target);
+        copy_symlink_noreplace(source, target)?;
+        if let Err(error) = unchanged(source, &metadata) {
+            let _ = std::fs::remove_file(target);
+            return Err(error);
+        }
+        return Ok(CopiedEntry {
+            path: source.to_path_buf(),
+            metadata,
+            children: Vec::new(),
+        });
     }
     if !file_type.is_file() {
         return Err(special(&display_name(source)));
@@ -292,7 +420,7 @@ fn copy_file_noreplace(source: &Path, target: &Path) -> Result<(), String> {
     ) {
         Ok(fd) => fd,
         Err(error) if error == Errno::LOOP => {
-            return copy_symlink_noreplace(source, target);
+            return Err(format!("Source changed: {}", source.display()));
         }
         Err(error) if error == Errno::NOENT => {
             return Err(source_gone(&display_name(source)));
@@ -303,34 +431,34 @@ fn copy_file_noreplace(source: &Path, target: &Path) -> Result<(), String> {
         Err(error) => return Err(error.to_string()),
     };
     let mut incoming: std::fs::File = source_fd.into();
-    if !incoming
-        .metadata()
-        .map(|meta| meta.is_file())
-        .unwrap_or(false)
-    {
+    let opened = incoming.metadata().map_err(|error| error.to_string())?;
+    if !opened.is_file() {
         return Err(special(&display_name(source)));
     }
-    let target_fd = match rustix::fs::open(
-        target,
-        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY,
-        Mode::from_bits_truncate(0o666),
-    ) {
-        Ok(fd) => fd,
-        Err(error) if error == Errno::EXIST => {
-            return Err(already_exists(&display_name(target)));
+    if !same_entry(&metadata, &opened) {
+        return Err(format!("Source changed: {}", source.display()));
+    }
+    let mut outgoing = create_private_file(target)?;
+    let result = (|| {
+        std::io::copy(&mut incoming, &mut outgoing).map_err(|error| error.to_string())?;
+        let copied = incoming.metadata().map_err(|error| error.to_string())?;
+        if !same_entry(&opened, &copied) {
+            return Err(format!("Source changed: {}", source.display()));
         }
-        Err(error) => return Err(error.to_string()),
-    };
-    let mut outgoing: std::fs::File = target_fd.into();
-    if let Err(error) = std::io::copy(&mut incoming, &mut outgoing) {
+        unchanged(source, &copied)?;
+        copy_xattrs_fd(incoming.as_fd(), outgoing.as_fd());
+        copy_metadata(&copied, outgoing.as_fd())?;
+        Ok(CopiedEntry {
+            path: source.to_path_buf(),
+            metadata: copied,
+            children: Vec::new(),
+        })
+    })();
+    if result.is_err() {
         drop(outgoing);
         let _ = std::fs::remove_file(target);
-        return Err(error.to_string());
     }
-    drop(incoming);
-    drop(outgoing);
-    copy_metadata(source, target);
-    Ok(())
+    result
 }
 
 /// Refuse trees containing special files before copying or moving them.
@@ -378,7 +506,7 @@ fn ensure_tree_copyable(source: &Path) -> Result<(), String> {
 }
 
 /// Copy one tree entry without following symlinks or opening FIFOs.
-fn copy_tree_entry(source: &Path, target: &Path) -> Result<(), String> {
+fn copy_tree_entry(source: &Path, target: &Path) -> Result<CopiedEntry, String> {
     let file_type = std::fs::symlink_metadata(source)
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -388,68 +516,48 @@ fn copy_tree_entry(source: &Path, target: &Path) -> Result<(), String> {
             }
         })?
         .file_type();
-    if file_type.is_symlink() {
-        copy_symlink_noreplace(source, target)
-    } else if file_type.is_dir() {
-        match std::fs::create_dir(target) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(already_exists(&display_name(target)));
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-        let mut names = Vec::new();
-        match std::fs::read_dir(source) {
-            Ok(entries) => {
-                for entry in entries {
-                    match entry {
-                        Ok(entry) => names.push(entry.file_name()),
-                        Err(error) => return Err(error.to_string()),
-                    }
-                }
-            }
-            Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound
-                    || error.kind() == std::io::ErrorKind::NotADirectory =>
-            {
-                return Err(source_gone(&display_name(source)));
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-        names.sort();
-        for name in names {
-            copy_tree_entry(&source.join(&name), &target.join(&name))?;
-        }
-        copy_metadata(source, target);
-        Ok(())
-    } else if file_type.is_file() {
+    if file_type.is_dir() {
+        create_private_dir(target)?;
+        copy_dir_contents(source, target)
+    } else if file_type.is_file() || file_type.is_symlink() {
         copy_file_noreplace(source, target)
     } else {
         Err(special(&display_name(source)))
     }
 }
 
-/// Copy a directory tree; fails if the destination exists (atomic mkdir).
-fn copy_dir_noreplace(source: &Path, target: &Path) -> Result<(), String> {
-    ensure_tree_copyable(source)?;
-    if let Err(error) = std::fs::create_dir(target) {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            return Err(already_exists(&display_name(target)));
-        }
-        return Err(error.to_string());
+fn copy_dir_contents(source: &Path, target: &Path) -> Result<CopiedEntry, String> {
+    let source_fd: std::fs::File = open_dir_nofollow(source)?.into();
+    let target_fd = open_dir_nofollow(target)?;
+    let metadata = source_fd.metadata().map_err(|error| error.to_string())?;
+    unchanged(source, &metadata)?;
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(source).map_err(|error| error.to_string())? {
+        names.push(entry.map_err(|error| error.to_string())?.file_name());
     }
-    let result = (|| {
-        let mut names = Vec::new();
-        for entry in std::fs::read_dir(source).map_err(|error| error.to_string())? {
-            names.push(entry.map_err(|error| error.to_string())?.file_name());
-        }
-        names.sort();
-        for name in names {
-            copy_tree_entry(&source.join(&name), &target.join(&name))?;
-        }
-        copy_metadata(source, target);
-        Ok(())
-    })();
+    names.sort();
+    let mut children = Vec::new();
+    for name in names {
+        children.push(copy_tree_entry(&source.join(&name), &target.join(&name))?);
+    }
+    let copied = source_fd.metadata().map_err(|error| error.to_string())?;
+    if !same_entry(&metadata, &copied) {
+        return Err(format!("Source changed: {}", source.display()));
+    }
+    unchanged(source, &copied)?;
+    copy_xattrs_fd(source_fd.as_fd(), &target_fd);
+    copy_metadata(&copied, &target_fd)?;
+    Ok(CopiedEntry {
+        path: source.to_path_buf(),
+        metadata: copied,
+        children,
+    })
+}
+
+pub(crate) fn copy_dir_noreplace(source: &Path, target: &Path) -> Result<CopiedEntry, String> {
+    ensure_tree_copyable(source)?;
+    create_private_dir(target)?;
+    let result = copy_dir_contents(source, target);
     if result.is_err() {
         let _ = std::fs::remove_dir_all(target);
     }
@@ -466,14 +574,14 @@ fn move_noreplace(source: &Path, target: &Path) -> Result<(), String> {
     match rename_noreplace(source, target) {
         Ok(()) => Ok(()),
         Err(RenameError::Exdev) => {
-            if is_real_dir(source) {
-                copy_dir_noreplace(source, target)?;
-                std::fs::remove_dir_all(source).map_err(|error| error.to_string())?;
+            let copied = if is_real_dir(source) {
+                copy_dir_noreplace(source, target)?
             } else {
-                copy_file_noreplace(source, target)?;
-                std::fs::remove_file(source).map_err(|error| error.to_string())?;
-            }
-            Ok(())
+                copy_file_noreplace(source, target)?
+            };
+            cleanup_copied(&copied).map_err(|error| {
+                format!("Partial move: destination copied, source cleanup incomplete: {error}")
+            })
         }
         Err(error) => Err(error.into_message()),
     }
@@ -640,7 +748,9 @@ pub(crate) fn parse_editor_choice(text: &str, path: &Path) -> Result<EditorChoic
         }
     }
     match object.get("editor") {
-        None | Some(serde_json::Value::Null) => Ok(EditorChoice::Environment),
+        // Absent means the default; an explicit null is rejected so a
+        // half-written preferences file cannot silently reset the choice.
+        None => Ok(EditorChoice::Environment),
         Some(serde_json::Value::String(name)) => EditorChoice::from_name(name)
             .ok_or_else(|| preferences_error(path, &format!("unknown editor '{name}'"))),
         Some(_) => Err(preferences_error(path, "'editor' must be a string")),
