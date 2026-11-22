@@ -195,10 +195,12 @@ def test_required_executable_is_installed_before_entrypoint_import_and_construct
     module.write_text(
         "import os\nfrom pathlib import Path\n"
         "if not Path(os.environ['TDNEXT_TEST_BINARY']).is_file(): raise RuntimeError('missing at import')\n"
-        "from tdnext.plugins.files.plugin import FilesPlugin\n"
-        "class RequiredPlugin(FilesPlugin):\n"
+        "class RequiredPlugin:\n"
+        "    shortcuts = ''\n"
         "    def __init__(self):\n"
-        "        if not Path(os.environ['TDNEXT_TEST_BINARY']).is_file(): raise RuntimeError('missing at init')\n",
+        "        if not Path(os.environ['TDNEXT_TEST_BINARY']).is_file(): raise RuntimeError('missing at init')\n"
+        "    def run_pane(self, context):\n"
+        "        return None\n",
         encoding="utf-8",
     )
     monkeypatch.syspath_prepend(str(tmp_path))

@@ -38,7 +38,7 @@ def test_duplicate_discovered_ids_are_rejected(tmp_path: Path) -> None:
         'id = "same"\nname = "Same"\nversion = "1"\ndescription = "Same"\n'
         "manifest_version = 1\napi_version = 1\n"
         'view_interfaces = ["tdnext.textual-view.v1"]\n'
-        'entrypoint = "tdnext.plugins.files.plugin:FilesPlugin"\n'
+        'entrypoint = "tdnext.plugins.settings.plugin:SettingsPlugin"\n'
         'capabilities = ["desktop.view", "files.browse"]\n'
     )
     for name in ("first", "second"):
@@ -148,7 +148,10 @@ def test_native_external_program_does_not_inherit_session_snapshot(
     session = SessionSnapshot(views=(SessionView(manifest=manifest, icon="[F]"),))
     observed: list[str | None] = []
     monkeypatch.setattr(pane, "manager", lambda: manager)
-    monkeypatch.setattr("tdnext.plugins.files.plugin.FilesPlugin.run_pane", lambda _self, _context: observed.append(
+    from tdnext.core.discovery import load_entrypoint as _load_entrypoint
+
+    _plugin_cls = _load_entrypoint(manager.manifests["files"])
+    monkeypatch.setattr(_plugin_cls, "run_pane", lambda _self, _context: observed.append(
         os.environ.get(SESSION_ENV)
     ))
     monkeypatch.setenv("TDNEXT_DIRECTORY", str(tmp_path))

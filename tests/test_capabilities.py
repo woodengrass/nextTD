@@ -20,7 +20,7 @@ def manifest_data(plugin_id: str) -> dict[str, str]:
         "name": plugin_id,
         "version": "1",
         "description": plugin_id,
-        "entrypoint": "tdnext.plugins.files.plugin:FilesPlugin",
+        "entrypoint": "tdnext.plugins.settings.plugin:SettingsPlugin",
     }
 
 

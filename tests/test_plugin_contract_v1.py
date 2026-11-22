@@ -110,14 +110,14 @@ def test_enabled_compatible_host_is_used_when_other_hosts_exist(tmp_path: Path) 
 
 def test_old_native_snapshot_decodes_without_new_manifest_fields() -> None:
     old_manifest = {
-        "id": "files", "name": "Files", "version": "1", "description": "files",
-        "entrypoint": "tdnext.plugins.files.plugin:FilesPlugin", "capabilities": ["desktop.view"],
+        "id": "settings", "name": "Settings", "version": "1", "description": "settings",
+        "entrypoint": "tdnext.plugins.settings.plugin:SettingsPlugin", "capabilities": ["desktop.view"],
     }
     raw = json.dumps({"views": [{"manifest": old_manifest, "icon": "[]"}]}).encode()
     token = base64.urlsafe_b64encode(raw).decode()
     session = current_session(token)
     assert session is not None
-    assert session.views[0].manifest.id == "files"
+    assert session.views[0].manifest.id == "settings"
     assert session.views[0].icon == "[]"
 
 

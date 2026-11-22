@@ -11,7 +11,6 @@ from tdnext.core.manager import PluginManager
 from tdnext.core.models import PluginState
 from tdnext.core.state import StateStore
 from tdnext.plugins.desktop.tool import ToolPane
-from tdnext.plugins.files.plugin import FilesPlugin
 from tdnext.plugins.monitor.plugin import MonitorPlugin
 from tdnext.plugins.settings.plugin import SettingsPlugin
 from tdnext.plugins.settings.view import SettingsView
@@ -32,7 +31,7 @@ def make_app(tmp_path: Path, *, monitor: bool = False, plugin: str = "settings")
     manager = PluginManager(manifests, StateStore(tmp_path / "plugins.json"), tmp_path / "bin")
     installed = frozenset({"desktop", "files", "settings"} | ({"monitor"} if monitor else set()))
     manager.store.write(PluginState(installed=installed, enabled=installed))
-    plugins: dict[str, ViewPlugin] = {"files": FilesPlugin(), "settings": SettingsPlugin()}
+    plugins: dict[str, ViewPlugin] = {"settings": SettingsPlugin()}
     if monitor:
         plugins["monitor"] = MonitorPlugin()
     return ToolPane(plugins[plugin], PluginContext(tmp_path, manager)), manager

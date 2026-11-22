@@ -14,7 +14,6 @@ from tdnext.core.models import PluginManifest, PluginState
 from tdnext.core.state import StateStore
 from tdnext.core.views import enabled_views
 from tdnext.plugins.desktop.contract import textual_views
-from tdnext.plugins.files.plugin import FilesPlugin
 
 
 @runtime_checkable
@@ -103,24 +102,24 @@ def test_native_pane_reports_textual_host_contract_error(tmp_path: Path) -> None
         textual_views(enabled_views(manager))
 
 
+class SnapshotTerminalView:
+    def run_pane(self, context: PluginContext) -> None:
+        assert context.session is not None
+        (context.directory / "pane.txt").write_text(context.session.icon_for("files") or "", encoding="utf-8")
+
+
 def test_old_snapshot_runs_native_view_pane_without_current_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     old_manifest = {
         "id": "files", "name": "Files", "version": "1", "description": "files",
-        "entrypoint": "tdnext.plugins.files.plugin:FilesPlugin", "capabilities": ["desktop.view"],
+        "entrypoint": f"{__name__}:SnapshotTerminalView", "capabilities": ["desktop.view"],
     }
     raw = json.dumps({"views": [{"manifest": old_manifest, "icon": "[]"}]}).encode()
     token = base64.urlsafe_b64encode(raw).decode()
     manager = PluginManager({}, StateStore(tmp_path / "plugins.json"), tmp_path / "bin")
     monkeypatch.setattr(pane, "manager", lambda: manager)
     monkeypatch.setenv("TDNEXT_DIRECTORY", str(tmp_path))
-
-    def run_pane(_plugin: FilesPlugin, context: PluginContext) -> None:
-        assert context.session is not None
-        (context.directory / "pane.txt").write_text(context.session.icon_for("files") or "", encoding="utf-8")
-
-    monkeypatch.setattr(FilesPlugin, "run_pane", run_pane)
     result = CliRunner().invoke(pane.cli, ["view", "files", "--snapshot", token])
     assert result.exit_code == 0, result.output
     assert (tmp_path / "pane.txt").read_text(encoding="utf-8") == "[]"
