@@ -60,7 +60,7 @@ def test_native_header_clicks_only_activate_actions(tmp_path: Path, native_env: 
     try:
         session.switch("Files")
         panes = json.loads(session.action("list-panes", "--all", "--json"))
-        files = next(pane for pane in panes if "tdnext.pane view files" in (pane.get("pane_command") or ""))
+        files = next(pane for pane in panes if "tdnext-files" in (pane.get("pane_command") or ""))
         files_id = f"terminal_{files['id']}"
         wait_for(lambda: files_id in session.action("list-clients"))
         # Blank header area focuses nothing away: no tab switch, focus stays.

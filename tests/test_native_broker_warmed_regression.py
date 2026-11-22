@@ -1,10 +1,8 @@
 """Core navigation regression: genuine first Alt+o and hybrid mouse->keyboard.
 
-The broker permission cache, the ``TDNEXT_NAVIGATOR_BROKER`` launcher flag,
-and the Python fallback rename (``tdnext-header:settings@<tab>:<pane>``)
-were removed with the Python host. Navigation is the core's
-``OpenTabWithReturn`` / ``return-to-origin`` on the supported Rust desktop,
-which keeps the bare header name on every route.
+Navigation is the core's ``OpenTabWithReturn`` / ``return-to-origin``
+on the supported Rust desktop, which keeps the bare header name on
+every route.
 
 Behavior asserted on an isolated session (private ``tmp_path`` state dir,
 unique Zellij socket dir, unique tagged tmux socket) with bounded waits:
@@ -77,7 +75,7 @@ def header_tab_name(session: NativeSession) -> str:
     return next(str(tab["name"]) for tab in tabs if str(tab["name"]).startswith("tdnext-header:settings"))
 
 
-def test_warmed_broker_first_shortcut_and_hybrid_mouse_keyboard(
+def test_core_first_shortcut_and_hybrid_mouse_keyboard(
     tmp_path: Path, isolated_native: tuple[dict[str, str], str]
 ) -> None:
     env, binary = isolated_native

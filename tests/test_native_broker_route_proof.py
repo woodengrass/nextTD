@@ -1,9 +1,7 @@
-"""Core-route proof: genuine Alt+o uses the Rust core, not a Python fallback.
+"""Core-route proof: genuine Alt+o uses the Rust core, not a fallback.
 
-The WASM broker and the Python ``tdnext.plugins.desktop.shortcut``
-fallback were removed with the Python host. Navigation is now the core's
-``OpenTabWithReturn`` (``Alt+o``) and ``return-to-origin`` (``Escape``)
-through the supported Rust desktop.
+Navigation is the core's ``OpenTabWithReturn`` (``Alt+o``) and
+``return-to-origin`` (``Escape``) through the supported Rust desktop.
 
 Route signals (observed on this test's own isolated session, bounded
 ``wait_for`` only, no sleeps):
@@ -97,7 +95,7 @@ def opened_via_settings(session: NativeSession, dest: int, sightings: list[str])
     return all(part in capture(session) for part in SETTINGS_PARTS)
 
 
-def test_warmed_alt_o_uses_wasm_broker_not_python_fallback(
+def test_core_alt_o_uses_core_route_without_fallback(
     tmp_path: Path, isolated_native: tuple[dict[str, str], str]
 ) -> None:
     env, binary = isolated_native

@@ -81,7 +81,7 @@ def settings_pane(session: NativeSession) -> str:
 def files_pane(session: NativeSession) -> str:
     """Return the terminal id of the Files view pane."""
     panes = json.loads(session.action("list-panes", "--all", "--json"))
-    pane = next(item for item in panes if "tdnext.pane view files" in (item.get("pane_command") or ""))
+    pane = next(item for item in panes if "tdnext-files" in (item.get("pane_command") or ""))
     return f"terminal_{pane['id']}"
 
 

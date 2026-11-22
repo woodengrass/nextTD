@@ -19,7 +19,7 @@ def native_desktop(tmp_path: Path, native_env: tuple[dict[str, str], str]) -> It
     session = NativeSession(tmp_path, env, binary)
     try:
         panes = json.loads(session.action("list-panes", "--all", "--json"))
-        files = next(pane for pane in panes if "tdnext.pane view files" in (pane.get("pane_command") or ""))
+        files = next(pane for pane in panes if "tdnext-files" in (pane.get("pane_command") or ""))
         wait_for(lambda: "Files" in session.action("dump-screen", "--pane-id", f"terminal_{files['id']}"))
         yield session
     finally:
@@ -28,7 +28,7 @@ def native_desktop(tmp_path: Path, native_env: tuple[dict[str, str], str]) -> It
 
 def files_pane(session: NativeSession) -> str:
     panes = json.loads(session.action("list-panes", "--all", "--json"))
-    files = next(pane for pane in panes if "tdnext.pane view files" in (pane.get("pane_command") or ""))
+    files = next(pane for pane in panes if "tdnext-files" in (pane.get("pane_command") or ""))
     return f"terminal_{files['id']}"
 
 

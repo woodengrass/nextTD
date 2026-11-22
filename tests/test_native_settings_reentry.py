@@ -58,7 +58,7 @@ def test_native_settings_refreshes_on_reentry_after_another_session_changes_appe
             )) and "Style: Codicons" in text else ""), timeout=3)
             assert "Provider: Codicons" in screen and "Style: Codicons" in screen
             assert first.btop_pid() == monitor
-            content = next(item for item in panes if "tdnext.pane view files" in (item.get("pane_command") or ""))
+            content = next(item for item in panes if "tdnext-files" in (item.get("pane_command") or ""))
             assert "FOLDERS" in first.action("dump-screen", "--pane-id", f"terminal_{content['id']}")
         finally:
             second.close()

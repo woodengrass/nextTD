@@ -75,7 +75,7 @@ def content_pane(session: NativeSession, tab: str) -> str:
     pane = next(
         item for item in panes
         if not item.get("is_plugin") and not item.get("is_floating") and item.get("tab_name") == tab
-        and (item.get("pane_command") or "").startswith(session.env["TDNEXT_PYTHON"])
+        and "tdnext-files" in (item.get("pane_command") or "")
     )
     return f"terminal_{pane['id']}"
 

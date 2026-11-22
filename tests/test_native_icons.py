@@ -56,7 +56,7 @@ def test_native_panes_keep_their_own_icon_snapshot_after_settings_change(
     first = NativeSession(tmp_path, env, binary)
     try:
         panes = json.loads(first.action("list-panes", "--all", "--json"))
-        content = next(p for p in panes if "tdnext.pane view files" in (p.get("pane_command") or ""))
+        content = next(p for p in panes if "tdnext-files" in (p.get("pane_command") or ""))
         wait_for(lambda: "Files" in first.action("dump-screen", "--pane-id", f"terminal_{content['id']}"))
         monitor = wait_for(first.btop_pid)
         appearance.write(Appearance(provider_id="icons", icon_mode="compatibility"))

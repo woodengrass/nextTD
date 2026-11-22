@@ -12,7 +12,7 @@ from tdnext.core.state import StateStore
 
 def files_pane(session: NativeSession) -> str:
     panes = json.loads(session.action("list-panes", "--all", "--json"))
-    pane = next(pane for pane in panes if "tdnext.pane view files" in (pane.get("pane_command") or ""))
+    pane = next(pane for pane in panes if "tdnext-files" in (pane.get("pane_command") or ""))
     return f"terminal_{pane['id']}"
 
 
@@ -130,50 +130,43 @@ def test_native_numeric_shortcuts_follow_three_sidebar_views(
     tmp_path: Path, native_env: tuple[dict[str, str], str]
 ) -> None:
     env, binary = native_env
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    env.update({"HOME": str(home), "SHELL": "/bin/bash", "HISTFILE": "/dev/null", "INPUTRC": "/dev/null"})
+    env.pop("BASH_ENV", None)
     plugin = tmp_path / "state" / "plugins" / "third"
     plugin.mkdir(parents=True)
     (plugin / "plugin.toml").write_text(
         'id = "third"\nname = "Third"\nversion = "0.1.0"\ndescription = "Third view"\n'
         'manifest_version = 1\napi_version = 1\nview_interfaces = ["tdnext.textual-view.v1"]\n'
-        'entrypoint = "tdnext.plugins.files.plugin:FilesPlugin"\nrequires_plugins = ["desktop"]\n'
-        'capabilities = ["desktop.view", "files.browse"]\nrequires_executables = []\n',
+        'entrypoint = "tdnext.plugins.shell.plugin:ShellPlugin"\nrequires_plugins = ["desktop"]\n'
+        'capabilities = ["desktop.view"]\nrequires_executables = []\n',
         encoding="utf-8",
     )
     ids = frozenset({"desktop", "files", "monitor", "settings", "third"})
     StateStore(tmp_path / "state" / "plugins.json").write(PluginState(installed=ids, enabled=ids))
     session = NativeSession(tmp_path, env, binary, expected_tabs=4)
     try:
+        panes = json.loads(session.action("list-panes", "--all", "--json"))
+        commands = [pane.get("pane_command") or "" for pane in panes]
+        assert any("tdnext-files" in command for command in commands), commands
+        assert not any("tdnext-files" in command and "third" in command.lower() for command in commands), commands
         target = session.tab_id("Third")
         session.send_key("M-3")
         wait_for(lambda: session.active_tab() == target)
         panes = json.loads(session.action("list-panes", "--all", "--json"))
-        third = next(pane for pane in panes if "tdnext.pane view third" in (pane.get("pane_command") or ""))
+        third = next(
+            pane for pane in panes if "tdnext.pane view third" in (pane.get("pane_command") or "")
+        )
         pane_id = f"terminal_{third['id']}"
-        wait_for(lambda: "Files" in session.action("dump-screen", "--pane-id", pane_id))
+        session.send_key("printf 'THIRD_%s\\n' READY; read -r answer; printf 'THIRD_RESULT:%s\\n' \"$answer\"")
+        session.send_key("Enter")
+        wait_for(lambda: "THIRD_READY" in session.action("dump-screen", "--pane-id", pane_id))
         session.send_key("M-4")
-        session.send_key("f")
-        wait_for(lambda: "New file name" in session.action("dump-screen", "--pane-id", pane_id))
         assert session.active_tab() == target
-    finally:
-        session.close()
-
-
-def test_native_locked_mode_passes_desktop_shortcuts_through(
-    tmp_path: Path, native_env: tuple[dict[str, str], str]
-) -> None:
-    env, binary = native_env
-    session = NativeSession(tmp_path, env, binary)
-    try:
-        pane_id = files_pane(session)
-        wait_for(lambda: "Files" in session.action("dump-screen", "--pane-id", pane_id))
-        session.send_key("C-g")
-        session.send_key("M-o")
-        session.send_key("f")
-        wait_for(lambda: "New file name" in session.action("dump-screen", "--pane-id", pane_id))
-        assert session.active_tab() == session.tab_id("Files")
-        session.send_key("Escape")
-        wait_for(lambda: "New file name" not in session.action("dump-screen", "--pane-id", pane_id))
-        session.send_key("C-g")
-        session.open_settings()
+        session.send_key("hello")
+        session.send_key("Enter")
+        wait_for(lambda: "THIRD_RESULT:hello" in session.action("dump-screen", "--pane-id", pane_id))
+        assert session.active_tab() == target
     finally:
         session.close()

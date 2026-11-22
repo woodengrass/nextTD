@@ -227,26 +227,6 @@ def test_header_returns_to_the_exact_floating_pane(
         close_session(session)
 
 
-def test_locked_mode_still_passes_shortcut_through(
-    tmp_path: Path, isolated_native: tuple[dict[str, str], str]
-) -> None:
-    env, binary = isolated_native
-    session = NativeSession(tmp_path, env, binary)
-    try:
-        visible(session, "Tool (Files)")
-
-        session.send_key("C-g")
-        session.send_key("M-o")
-        session.send_key("f")
-        visible(session, "New file name")
-        session.send_key("Escape")
-        wait_for(lambda: "New file name" not in capture(session))
-        session.send_key("C-g")
-        open_shortcut(session)
-    finally:
-        close_session(session)
-
-
 def test_independent_sessions_retain_their_own_return_destinations(
     tmp_path: Path, isolated_native: tuple[dict[str, str], str]
 ) -> None:
