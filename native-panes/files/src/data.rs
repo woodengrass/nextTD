@@ -162,6 +162,13 @@ fn os_error(e: &io::Error, path: &Path) -> String {
         path.display()
     )
 }
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_PREVIEW_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
 pub fn preview(path: &Path) -> Preview {
     let name = single_line(&path.file_name().unwrap_or_default().to_string_lossy());
     let make = |kind: &str,
@@ -212,6 +219,12 @@ pub fn preview(path: &Path) -> Preview {
                 vec!["Preview unavailable.".into()],
             ));
         }
+        #[cfg(test)]
+        BEFORE_PREVIEW_OPEN.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         let file = fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -310,4 +323,164 @@ pub fn preview(path: &Path) -> Preview {
             ))],
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{list, preview};
+    use std::{fs, os::unix::fs::symlink, path::Path};
+
+    #[test]
+    fn listing_sorts_directories_before_files_and_filters_hidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("z-folder")).unwrap();
+        fs::write(tmp.path().join("a-file"), "a").unwrap();
+        fs::write(tmp.path().join(".hidden"), "h").unwrap();
+        let names = |hidden| {
+            list(tmp.path(), hidden)
+                .entries
+                .into_iter()
+                .map(|entry| {
+                    entry
+                        .path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(false), ["z-folder", "a-file"]);
+        assert_eq!(names(true), ["z-folder", ".hidden", "a-file"]);
+    }
+
+    #[test]
+    fn root_listing_has_only_root_as_neighbour() {
+        let result = list(Path::new("/"), false);
+        assert!(result.error.is_empty());
+        assert_eq!(result.neighbours, [Path::new("/")]);
+    }
+
+    #[test]
+    fn listing_formats_real_file_sizes_without_losing_units() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, size) in [("a", 999_999), ("b", 1_000_000), ("c", 1_234_567)] {
+            fs::File::create(tmp.path().join(name))
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+        }
+        let entries = list(tmp.path(), false).entries;
+        let sizes: Vec<_> = entries.iter().map(|entry| entry.size.as_str()).collect();
+        assert_eq!(sizes, ["999,999 B", "977 KiB", "1.2 MiB"]);
+    }
+
+    #[test]
+    fn preview_shows_utf8_lines_and_byte_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("notes.txt");
+        fs::write(&path, "first\n第二行\nlast\n").unwrap();
+        let result = preview(&path);
+        assert_eq!(result.lines, ["  1 │ first", "  2 │ 第二行", "  3 │ last"]);
+        assert!(result.meta[1].contains("21 B"));
+        assert!(!result.meta[1].contains("truncated"));
+    }
+
+    #[test]
+    fn preview_rejects_binary_and_terminal_controls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("binary");
+        for bytes in [
+            &b"text\0binary"[..],
+            &b"\xff\xfe"[..],
+            &b"hello\x1b[31m"[..],
+        ] {
+            fs::write(&path, bytes).unwrap();
+            let result = preview(&path);
+            assert!(result.meta[1].starts_with("Binary file"));
+            assert!(!result.lines.iter().any(|line| line.contains('\x1b')));
+        }
+    }
+
+    #[test]
+    fn preview_limits_lines_and_long_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("long");
+        fs::write(&path, "x".repeat(513)).unwrap();
+        let long = preview(&path);
+        assert!(long.meta[1].contains("truncated"));
+        assert_eq!(
+            long.lines[0].split_once("│ ").unwrap().1.chars().count(),
+            512
+        );
+        assert!(long.lines[0].ends_with('…'));
+        fs::write(&path, "line\n".repeat(301)).unwrap();
+        let many = preview(&path);
+        assert!(many.meta[1].contains("truncated"));
+        assert_eq!(many.lines.len(), 301);
+        assert!(many.lines[299].starts_with("300 │ "));
+    }
+
+    #[test]
+    fn preview_truncates_bytes_at_utf8_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("large");
+        let mut bytes = format!("{}\n", "a".repeat(511)).repeat(127).into_bytes();
+        bytes.extend_from_slice(&[b'a'; 511]);
+        bytes.extend_from_slice("界more".as_bytes());
+        fs::write(&path, bytes).unwrap();
+        let result = preview(&path);
+        assert!(result.meta[1].starts_with("Text file"));
+        assert!(result.meta[1].contains("truncated"));
+        assert_eq!(result.lines[127], format!("128 │ {}", "a".repeat(511)));
+    }
+
+    #[test]
+    fn preview_symlink_and_missing_path_do_not_expose_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("secret");
+        fs::write(&target, "not shown").unwrap();
+        let link = tmp.path().join("link");
+        symlink(&target, &link).unwrap();
+        let result = preview(&link);
+        assert!(result.meta[1].starts_with("Link"));
+        assert!(result.lines[0].contains(target.to_str().unwrap()));
+        assert!(!result.lines.iter().any(|line| line.contains("not shown")));
+        let missing = preview(&tmp.path().join("missing"));
+        assert!(missing.meta[1].starts_with("Unavailable"));
+        assert!(missing.lines[0].starts_with("Cannot preview:"));
+    }
+
+    #[test]
+    fn preview_fifo_returns_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("pipe");
+        rustix::fs::mkfifoat(rustix::fs::CWD, &fifo, rustix::fs::Mode::RUSR).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(preview(&fifo)).unwrap());
+        let result = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(result.meta[1].starts_with("Special file"));
+    }
+
+    #[test]
+    fn preview_rejects_file_swapped_to_fifo_before_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("changing");
+        fs::write(&path, "ordinary").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let swapped = path.clone();
+            super::BEFORE_PREVIEW_OPEN.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    fs::remove_file(&swapped).unwrap();
+                    rustix::fs::mkfifoat(rustix::fs::CWD, &swapped, rustix::fs::Mode::RUSR)
+                        .unwrap();
+                }));
+            });
+            tx.send(preview(&path)).unwrap();
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(result.meta[1].starts_with("Unavailable"));
+        assert!(!result.lines.iter().any(|line| line.contains("ordinary")));
+    }
 }

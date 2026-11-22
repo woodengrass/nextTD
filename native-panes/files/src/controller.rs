@@ -56,6 +56,39 @@ enum Mutation {
         result: Result<(), String>,
     },
 }
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct MutationGate {
+    open: std::sync::Mutex<bool>,
+    arrived: std::sync::atomic::AtomicBool,
+    cvar: std::sync::Condvar,
+}
+#[cfg(test)]
+impl MutationGate {
+    fn new_closed() -> Self {
+        Self {
+            open: std::sync::Mutex::new(false),
+            arrived: std::sync::atomic::AtomicBool::new(false),
+            cvar: std::sync::Condvar::new(),
+        }
+    }
+    fn arrive_and_wait(&self) {
+        self.arrived
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let guard = self.open.lock().expect("gate lock");
+        let _ = self
+            .cvar
+            .wait_timeout_while(guard, std::time::Duration::from_secs(5), |open| !*open)
+            .expect("gate wait");
+    }
+    fn open(&self) {
+        *self.open.lock().expect("gate lock") = true;
+        self.cvar.notify_all();
+    }
+    fn has_arrived(&self) -> bool {
+        self.arrived.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
 pub struct Controller {
     pub ui: Ui,
     hidden: bool,
@@ -63,6 +96,8 @@ pub struct Controller {
     name: Option<Name>,
     delete: Option<PathBuf>,
     mutation: Option<Receiver<Mutation>>,
+    #[cfg(test)]
+    test_gate: Option<std::sync::Arc<MutationGate>>,
     /// Latest requested (directory, selection): preserves the desired path
     /// across rapid reloads while loading, scoped per directory.
     want: Option<(PathBuf, Option<PathBuf>)>,
@@ -101,6 +136,8 @@ impl Controller {
             name: None,
             delete: None,
             mutation: None,
+            #[cfg(test)]
+            test_gate: None,
             want: None,
             list_rev: 0,
             list_worker: None,
@@ -311,7 +348,13 @@ impl Controller {
         self.mutation = Some(rx);
         self.ui.loading = true;
         self.notify(working, Severity::Info);
+        #[cfg(test)]
+        let gate = self.test_gate.clone();
         std::thread::spawn(move || {
+            #[cfg(test)]
+            if let Some(g) = gate.as_ref() {
+                g.arrive_and_wait();
+            }
             let done = match op {
                 MutRequest::Paste { src, dir, moving } => {
                     let result = actions::paste(&src, &dir, moving);
@@ -1212,6 +1255,25 @@ mod controller_tests {
     }
 
     #[test]
+    fn late_preview_cannot_replace_newer_selection() {
+        let tmp = test_dir(&[("a.txt", "old"), ("b.txt", "middle"), ("c.txt", "new")]);
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        settle(&mut c);
+        let old = tmp.path().join("a.txt");
+        let (tx, rx) = mpsc::channel::<Reply>();
+        c.preview_worker = Some((c.preview_rev, rx));
+        c.handle(key(K::Down, M::empty()), 80, 24);
+        c.handle(key(K::Down, M::empty()), 80, 24);
+        assert_eq!(c.selected(), Some(tmp.path().join("c.txt")));
+        tx.send(Reply::Preview(crate::data::preview(&old), old))
+            .unwrap();
+        settle(&mut c);
+        let preview = c.ui.preview.as_ref().expect("new preview");
+        assert!(preview.lines.iter().any(|line| line.contains("new")));
+        assert!(!preview.lines.iter().any(|line| line.contains("old")));
+    }
+
+    #[test]
     fn wheel_scroll_keeps_selection() {
         let (_tmp, _) = many_files(40);
         let mut c = Controller::new(_tmp.path().to_path_buf());
@@ -1491,5 +1553,1268 @@ mod controller_tests {
                 .map_or(0, |p| p.lines.len())
                 .saturating_sub(rows);
         assert_eq!(c.ui.preview_y, max);
+    }
+
+    fn wait_gate(gate: &super::MutationGate) {
+        for _ in 0..10_000_000 {
+            if gate.has_arrived() {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("mutation worker never reached the gate");
+    }
+
+    fn help_is_rendered(c: &Controller) -> bool {
+        if !matches!(c.ui.dialog, Some(crate::ui::Dialog::Help)) {
+            return false;
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("backend");
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &c.ui))
+            .expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .contains("File shortcuts")
+    }
+
+    #[test]
+    fn paste_shows_help_before_completion() {
+        use std::sync::Arc as _Arc;
+        let tmp = test_dir(&[("a.txt", "a")]);
+        std::fs::create_dir(tmp.path().join("sub")).expect("mkdir");
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        settle(&mut c);
+        c.handle(key(K::Down, M::empty()), 80, 24);
+        settle(&mut c);
+        c.handle(key(K::Char('y'), M::empty()), 80, 24);
+        c.handle(key(K::Up, M::empty()), 80, 24);
+        settle(&mut c);
+        c.handle(key(K::Enter, M::empty()), 80, 24);
+        assert_eq!(c.ui.directory, tmp.path().join("sub"));
+        let target = tmp.path().join("sub").join("a.txt");
+        assert!(!target.exists());
+
+        let gate = _Arc::new(super::MutationGate::new_closed());
+        c.test_gate = Some(gate.clone());
+        c.handle(key(K::Char('p'), M::empty()), 80, 24);
+        assert!(c.mutation.is_some(), "paste must leave a pending mutation");
+        wait_gate(&gate);
+        // B1: help is served while the worker is paused ahead of real work.
+        assert!(
+            !target.exists(),
+            "paste must not complete while the worker is paused"
+        );
+        c.handle(key(K::Char('?'), M::empty()), 80, 24);
+        assert!(
+            matches!(c.ui.dialog, Some(crate::ui::Dialog::Help)),
+            "pressing ? must show help while paste is pending"
+        );
+        assert!(help_is_rendered(&c), "help must be user-visible");
+        assert!(
+            !target.exists(),
+            "filesystem result must still be pending while help is shown"
+        );
+        assert!(c.mutation.is_some(), "mutation must still be pending");
+        // B3: releasing the gate completes the real copy.
+        gate.open();
+        settle(&mut c);
+        assert!(target.exists(), "paste must copy the file after release");
+        assert_eq!(std::fs::read(&target).expect("copied file"), b"a");
+    }
+
+    #[test]
+    fn confirmed_delete_shows_help_before_completion() {
+        use std::sync::Arc as _Arc;
+        let tmp = test_dir(&[("a.txt", "a"), ("b.txt", "b")]);
+        std::fs::create_dir(tmp.path().join("sub")).expect("mkdir");
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        settle(&mut c);
+        c.handle(key(K::Down, M::empty()), 80, 24);
+        settle(&mut c);
+        assert_eq!(c.selected(), Some(tmp.path().join("a.txt")));
+        let victim = tmp.path().join("a.txt");
+
+        let gate = _Arc::new(super::MutationGate::new_closed());
+        c.test_gate = Some(gate.clone());
+        c.handle(key(K::Char('d'), M::empty()), 80, 24);
+        c.handle(key(K::Tab, M::empty()), 80, 24);
+        c.handle(key(K::Char(' '), M::empty()), 80, 24);
+        assert!(c.mutation.is_some(), "delete must leave a pending mutation");
+        wait_gate(&gate);
+        // B2: help is served while the worker is paused ahead of real work.
+        assert!(
+            victim.exists(),
+            "delete must not complete while the worker is paused"
+        );
+        c.handle(key(K::Char('?'), M::empty()), 80, 24);
+        assert!(
+            matches!(c.ui.dialog, Some(crate::ui::Dialog::Help)),
+            "pressing ? must show help while delete is pending"
+        );
+        assert!(help_is_rendered(&c), "help must be user-visible");
+        assert!(
+            victim.exists(),
+            "filesystem target must still exist while help is shown"
+        );
+        assert!(c.mutation.is_some(), "mutation must still be pending");
+        // B3: releasing the gate completes the real delete.
+        gate.open();
+        settle(&mut c);
+        assert!(
+            !victim.exists(),
+            "delete must remove the file after release"
+        );
+        assert!(tmp.path().join("b.txt").exists());
+    }
+
+    fn cross_device_dirs() -> (tempfile::TempDir, tempfile::TempDir) {
+        use std::os::unix::fs::MetadataExt as _;
+        // Two genuine devices: the default tempdir and a tmpfs one. A
+        // missing second device fails loudly, never as a silent same-device
+        // pass.
+        let src_tmp = tempfile::TempDir::new().expect("tempdir");
+        let dst_tmp = tempfile::TempDir::new_in("/dev/shm")
+            .expect("needs a second writable device at /dev/shm for the cross-device move check");
+        let src_dev = std::fs::metadata(src_tmp.path()).expect("stat src").dev();
+        let dst_dev = std::fs::metadata(dst_tmp.path()).expect("stat dst").dev();
+        assert!(
+            src_dev != dst_dev,
+            "cross-device check needs two distinct devices, got same dev {src_dev}"
+        );
+        (src_tmp, dst_tmp)
+    }
+
+    fn go_to(c: &mut Controller, dest: &std::path::Path) {
+        c.handle(key(K::Char('g'), M::empty()), 80, 24);
+        for ch in dest.to_string_lossy().chars() {
+            c.handle(key(K::Char(ch), M::empty()), 80, 24);
+        }
+        c.handle(key(K::Enter, M::empty()), 80, 24);
+        settle(c);
+        assert_eq!(c.ui.directory, dest);
+    }
+
+    #[test]
+    fn cut_paste_across_devices_modified_source_reports_partial_move() {
+        let (src_tmp, dst_tmp) = cross_device_dirs();
+        let tree = src_tmp.path().join("tree");
+        std::fs::create_dir(&tree).expect("mkdir");
+        std::fs::create_dir(tree.join("nested")).expect("mkdir");
+        std::fs::write(tree.join("a.txt"), "old-a").expect("write");
+        std::fs::write(tree.join("nested").join("b.txt"), "old-b").expect("write");
+
+        let mut c = Controller::new(src_tmp.path().to_path_buf());
+        settle(&mut c);
+        assert_eq!(c.selected(), Some(tree.clone()));
+
+        // Keys: cut, go-to-folder with a typed cross-device path, paste.
+        c.handle(key(K::Char('x'), M::empty()), 80, 24);
+        let dest = dst_tmp.path().canonicalize().expect("canonicalize dest");
+        go_to(&mut c, &dest);
+
+        // Benign injection after the exclusive copy, before guarded cleanup:
+        // the nested file gains new bytes while the destination already
+        // holds the old ones.
+        let hook_tree = tree.clone();
+        crate::actions::stash_between_note(&tree, move || {
+            std::fs::write(hook_tree.join("nested").join("b.txt"), "new-bytes")
+                .expect("inject modification");
+        });
+        c.handle(key(K::Char('p'), M::empty()), 80, 24);
+        assert!(c.mutation.is_some(), "paste must leave a pending mutation");
+        settle(&mut c);
+
+        // The partial move is user-visible.
+        let (toast, _) =
+            c.ui.toast
+                .clone()
+                .expect("partial-move error must be visible");
+        assert!(toast.contains("Partial move"), "unexpected toast: {toast}");
+        // The background worker copied to the accept-time (correct) target
+        // with the old bytes.
+        let target = dest.join("tree");
+        assert_eq!(
+            std::fs::read(target.join("a.txt")).expect("dest a"),
+            b"old-a"
+        );
+        assert_eq!(
+            std::fs::read(target.join("nested").join("b.txt")).expect("dest b"),
+            b"old-b"
+        );
+        // The source keeps the new bytes: the changed file stays, while the
+        // unchanged entry already completed the move.
+        assert!(
+            !tree.join("a.txt").exists(),
+            "unchanged source entry must have completed the move"
+        );
+        assert_eq!(
+            std::fs::read(tree.join("nested").join("b.txt")).expect("src b"),
+            b"new-bytes"
+        );
+    }
+
+    #[test]
+    fn cut_paste_across_devices_added_source_entry_reports_partial_move() {
+        let (src_tmp, dst_tmp) = cross_device_dirs();
+        let tree = src_tmp.path().join("tree");
+        std::fs::create_dir(&tree).expect("mkdir");
+        std::fs::create_dir(tree.join("nested")).expect("mkdir");
+        std::fs::write(tree.join("a.txt"), "old-a").expect("write");
+        std::fs::write(tree.join("nested").join("b.txt"), "old-b").expect("write");
+
+        let mut c = Controller::new(src_tmp.path().to_path_buf());
+        settle(&mut c);
+        assert_eq!(c.selected(), Some(tree.clone()));
+
+        // Keys: cut, go-to-folder with a typed cross-device path, paste.
+        c.handle(key(K::Char('x'), M::empty()), 80, 24);
+        let dest = dst_tmp.path().canonicalize().expect("canonicalize dest");
+        go_to(&mut c, &dest);
+
+        // Benign injection after the exclusive copy, before guarded cleanup:
+        // a newly created entry in the source tree, independent of any
+        // modification to existing files.
+        let hook_tree = tree.clone();
+        crate::actions::stash_between_note(&tree, move || {
+            std::fs::write(hook_tree.join("new.txt"), "new").expect("inject new file");
+        });
+        c.handle(key(K::Char('p'), M::empty()), 80, 24);
+        assert!(c.mutation.is_some(), "paste must leave a pending mutation");
+        settle(&mut c);
+
+        // The partial move is user-visible.
+        let (toast, _) =
+            c.ui.toast
+                .clone()
+                .expect("partial-move error must be visible");
+        assert!(toast.contains("Partial move"), "unexpected toast: {toast}");
+        // The background worker copied to the accept-time (correct) target
+        // with the old bytes, before the new entry existed.
+        let target = dest.join("tree");
+        assert_eq!(
+            std::fs::read(target.join("a.txt")).expect("dest a"),
+            b"old-a"
+        );
+        assert_eq!(
+            std::fs::read(target.join("nested").join("b.txt")).expect("dest b"),
+            b"old-b"
+        );
+        assert!(
+            !target.join("new.txt").exists(),
+            "destination must not contain the entry created after the copy"
+        );
+        // The source tree is intact and keeps the new entry.
+        assert_eq!(std::fs::read(tree.join("a.txt")).expect("src a"), b"old-a");
+        assert_eq!(
+            std::fs::read(tree.join("nested").join("b.txt")).expect("src b"),
+            b"old-b"
+        );
+        assert_eq!(
+            std::fs::read(tree.join("new.txt")).expect("src new"),
+            b"new"
+        );
+    }
+
+    #[test]
+    fn copy_tree_via_keys_creates_private_modes_before_final_metadata() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let src_tmp = tempfile::TempDir::new().expect("tempdir");
+        let dst_tmp = tempfile::TempDir::new().expect("tempdir");
+        let tree = src_tmp.path().join("tree");
+        std::fs::create_dir(&tree).expect("mkdir");
+        let nested = tree.join("nested");
+        std::fs::create_dir(&nested).expect("mkdir");
+        let inner = nested.join("b.txt");
+        std::fs::write(&inner, "b").expect("write");
+        // The transferred source stays private; creation privacy is observed
+        // at the caller checkpoint, final preservation afterwards.
+        for dir in [&tree, &nested] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        let mut c = Controller::new(src_tmp.path().to_path_buf());
+        settle(&mut c);
+        assert_eq!(c.selected(), Some(tree.clone()));
+
+        // Keys: copy, go-to-folder with a typed path, paste.
+        c.handle(key(K::Char('y'), M::empty()), 80, 24);
+        let dest = dst_tmp.path().canonicalize().expect("canonicalize dest");
+        go_to(&mut c, &dest);
+        c.handle(key(K::Char('p'), M::empty()), 80, 24);
+        assert!(c.mutation.is_some(), "paste must leave a pending mutation");
+        settle(&mut c);
+
+        // Creation-time evidence for root, nested dir, and file, taken from
+        // the keyboard-originated copy through the worker.
+        let taken = crate::actions::take_initial_modes_under(&dest);
+        let root_target = dest.join("tree");
+        let nested_target = root_target.join("nested");
+        let file_target = nested_target.join("b.txt");
+        let at = |path: &std::path::Path| {
+            taken
+                .iter()
+                .find(|entry| entry.path == *path)
+                .unwrap_or_else(|| panic!("no creation record for {}", path.display()))
+        };
+        assert_eq!(taken.len(), 3, "unexpected creation records: {taken:?}");
+        assert_eq!(at(&root_target).mode & 0o077, 0, "root not created private");
+        assert_eq!(
+            at(&nested_target).mode & 0o077,
+            0,
+            "nested dir not created private"
+        );
+        assert_eq!(at(&file_target).mode & 0o177, 0, "file not created private");
+        assert_eq!(
+            at(&file_target).len,
+            0,
+            "creation record must precede any written bytes"
+        );
+        // Final state still preserves the private source modes and content.
+        let mode_of =
+            |path: &std::path::Path| std::fs::metadata(path).expect("stat").mode() & 0o777;
+        assert_eq!(mode_of(&root_target), 0o700);
+        assert_eq!(mode_of(&nested_target), 0o700);
+        assert_eq!(mode_of(&file_target), 0o600);
+        assert_eq!(std::fs::read(&file_target).expect("read"), b"b");
+    }
+
+    #[test]
+    fn copy_file_via_keys_is_private_before_first_write() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let src_tmp = tempfile::TempDir::new().expect("tempdir");
+        let dst_tmp = tempfile::TempDir::new().expect("tempdir");
+        let source = src_tmp.path().join("note.txt");
+        std::fs::write(&source, "hello").expect("write");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        let mut c = Controller::new(src_tmp.path().to_path_buf());
+        settle(&mut c);
+        assert_eq!(c.selected(), Some(source.clone()));
+
+        // Keys: copy, go-to-folder with a typed path, paste.
+        c.handle(key(K::Char('y'), M::empty()), 80, 24);
+        let dest = dst_tmp.path().canonicalize().expect("canonicalize dest");
+        go_to(&mut c, &dest);
+        c.handle(key(K::Char('p'), M::empty()), 80, 24);
+        assert!(c.mutation.is_some(), "paste must leave a pending mutation");
+        settle(&mut c);
+
+        // Creation-time evidence: private mode with no bytes yet, before the
+        // copy and the final chmod.
+        let taken = crate::actions::take_initial_modes_under(&dest);
+        assert_eq!(taken.len(), 1, "unexpected creation records: {taken:?}");
+        assert_eq!(taken[0].path, dest.join("note.txt"));
+        assert_eq!(taken[0].mode & 0o177, 0, "file not created private");
+        assert_eq!(
+            taken[0].len, 0,
+            "creation record must precede any written bytes"
+        );
+        // Final state still preserves the private source mode and content.
+        let target = dest.join("note.txt");
+        assert_eq!(
+            std::fs::metadata(&target).expect("stat").mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read(&target).expect("read"), b"hello");
+    }
+
+    #[test]
+    fn buffered_enter_then_down_opens_original_directory() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir(tmp.path().join("a-first")).expect("mkdir");
+        std::fs::create_dir(tmp.path().join("b-second")).expect("mkdir");
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        settle(&mut c);
+        assert_eq!(c.selected(), Some(tmp.path().join("a-first")));
+        // Keys arrive buffered with no settle between them: Enter opens the
+        // row selected at press time, Down then moves inside the new folder.
+        c.handle(key(K::Enter, M::empty()), 80, 24);
+        c.handle(key(K::Down, M::empty()), 80, 24);
+        settle(&mut c);
+        assert_eq!(c.ui.directory, tmp.path().join("a-first"));
+    }
+
+    #[test]
+    fn cursor_move_before_enter_opens_moved_row() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir(tmp.path().join("a-first")).expect("mkdir");
+        std::fs::create_dir(tmp.path().join("b-second")).expect("mkdir");
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        settle(&mut c);
+        assert_eq!(c.selected(), Some(tmp.path().join("a-first")));
+        c.handle(key(K::Down, M::empty()), 80, 24);
+        assert_eq!(c.selected(), Some(tmp.path().join("b-second")));
+        c.handle(key(K::Enter, M::empty()), 80, 24);
+        settle(&mut c);
+        assert_eq!(c.ui.directory, tmp.path().join("b-second"));
+    }
+
+    #[test]
+    fn parent_navigation_selects_previously_open_folder() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let child = tmp.path().join("child");
+        std::fs::create_dir(&child).expect("mkdir");
+        let mut c = Controller::new(child.clone());
+        settle(&mut c);
+        assert_eq!(c.ui.directory, child);
+        c.handle(key(K::Char('h'), M::empty()), 80, 24);
+        settle(&mut c);
+        assert_eq!(c.ui.directory, tmp.path().to_path_buf());
+        assert_eq!(c.selected(), Some(child));
+    }
+
+    #[test]
+    fn go_to_dialog_navigates_to_real_directory() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let dest = tmp.path().join("destination");
+        std::fs::create_dir(&dest).expect("mkdir");
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        settle(&mut c);
+        go_to(&mut c, &dest.canonicalize().expect("canonicalize dest"));
+        assert_eq!(
+            c.ui.directory,
+            dest.canonicalize().expect("canonicalize dest")
+        );
+        assert!(
+            c.ui.dialog.is_none(),
+            "goto dialog must close after navigation"
+        );
+        assert!(!c.ui.loading);
+    }
+
+    #[test]
+    fn go_to_invalid_path_keeps_directory_and_shows_error() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        settle(&mut c);
+        let before = c.ui.directory.clone();
+        c.handle(key(K::Char('g'), M::empty()), 80, 24);
+        assert!(
+            matches!(c.ui.dialog, Some(Dialog::Name { .. })),
+            "g must open goto dialog"
+        );
+        for ch in "no-such-dir-xyz".chars() {
+            c.handle(key(K::Char(ch), M::empty()), 80, 24);
+        }
+        c.handle(key(K::Enter, M::empty()), 80, 24);
+        assert_eq!(c.ui.directory, before, "invalid goto must not navigate");
+        let (toast, severity) =
+            c.ui.toast
+                .clone()
+                .expect("invalid goto must be user-visible");
+        assert!(
+            toast.contains("Not a directory"),
+            "unexpected toast: {toast}"
+        );
+        assert!(matches!(severity, Severity::Error));
+    }
+
+    #[test]
+    fn escape_cancels_delete_dialog_without_deleting() {
+        let tmp = test_dir(&[("a.txt", "a"), ("b.txt", "b")]);
+        std::fs::create_dir(tmp.path().join("sub")).expect("mkdir");
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        settle(&mut c);
+        c.handle(key(K::Down, M::empty()), 80, 24);
+        settle(&mut c);
+        let victim = tmp.path().join("a.txt");
+        assert_eq!(c.selected(), Some(victim.clone()));
+        c.handle(key(K::Char('d'), M::empty()), 80, 24);
+        assert!(
+            matches!(c.ui.dialog, Some(Dialog::Delete { ready: true, .. })),
+            "delete dialog must open"
+        );
+        c.handle(key(K::Esc, M::empty()), 80, 24);
+        assert!(c.ui.dialog.is_none(), "escape must close the delete dialog");
+        assert!(c.delete.is_none(), "escape must clear the pending target");
+        assert!(
+            c.mutation.is_none(),
+            "cancelled delete must not start a mutation"
+        );
+        assert!(victim.exists(), "cancelled delete must keep the file");
+        settle(&mut c);
+        assert!(victim.exists(), "file must still exist after settle");
+        assert!(tmp.path().join("b.txt").exists());
+    }
+
+    #[test]
+    fn selection_changed_cancels_confirmed_delete() {
+        let tmp = test_dir(&[("a.txt", "a"), ("b.txt", "b")]);
+        std::fs::create_dir(tmp.path().join("sub")).expect("mkdir");
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        settle(&mut c);
+        c.handle(key(K::Down, M::empty()), 80, 24);
+        settle(&mut c);
+        let victim = tmp.path().join("a.txt");
+        let other = tmp.path().join("b.txt");
+        assert_eq!(c.selected(), Some(victim.clone()));
+        c.handle(key(K::Char('d'), M::empty()), 80, 24);
+        assert!(
+            matches!(c.ui.dialog, Some(Dialog::Delete { ready: true, .. })),
+            "delete dialog must open"
+        );
+        // Keys are modal-blocked while the dialog is open, so drive the guard
+        // directly the way a list refresh would: the row now points elsewhere.
+        c.ui.row += 1;
+        assert_eq!(c.selected(), Some(other.clone()));
+        c.handle(key(K::Tab, M::empty()), 80, 24);
+        c.handle(key(K::Char(' '), M::empty()), 80, 24);
+        assert!(
+            c.mutation.is_none(),
+            "stale confirm must not start a mutation"
+        );
+        let (toast, severity) = c.ui.toast.clone().expect("cancel must be user-visible");
+        assert!(
+            toast.contains("Selection changed"),
+            "unexpected toast: {toast}"
+        );
+        assert!(matches!(severity, Severity::Warning));
+        assert!(victim.exists(), "stale confirm must keep the original file");
+        assert!(other.exists());
+        settle(&mut c);
+        assert!(victim.exists());
+        assert!(other.exists());
+    }
+
+    #[test]
+    fn folder_focus_blocks_copy_and_cut_via_keys() {
+        for shortcut in ['x', 'y'] {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let current = tmp.path().join("current");
+            std::fs::create_dir(&current).expect("mkdir");
+            std::fs::create_dir(tmp.path().join("neighbour")).expect("mkdir");
+            let target = current.join("important.txt");
+            std::fs::write(&target, "keep").expect("write");
+            let mut c = Controller::new(current.clone());
+            settle(&mut c);
+            assert_eq!(c.selected(), Some(target.clone()));
+            c.handle(key(K::Char('b'), M::empty()), 130, 30);
+            assert!(
+                c.ui.focus == Focus::Folders,
+                "b must focus folders at wide width"
+            );
+            c.handle(key(K::Char(shortcut), M::empty()), 130, 30);
+            assert!(
+                c.clip.is_none(),
+                "{shortcut} from folder focus must not set clipboard"
+            );
+            assert!(
+                c.mutation.is_none(),
+                "{shortcut} from folder focus must not start a mutation"
+            );
+            assert!(
+                c.ui.dialog.is_none(),
+                "{shortcut} from folder focus must not open a dialog"
+            );
+            let (toast, severity) = c.ui.toast.clone().expect("warning must be user-visible");
+            assert!(
+                toast.contains("Focus the file list"),
+                "unexpected toast for {shortcut}: {toast}"
+            );
+            assert!(matches!(severity, Severity::Warning));
+            assert_eq!(
+                std::fs::read(&target).expect("read"),
+                b"keep",
+                "{shortcut} from folder focus must leave the file alone"
+            );
+            settle(&mut c);
+            assert_eq!(std::fs::read(&target).expect("read"), b"keep");
+        }
+    }
+
+    #[test]
+    fn folder_focus_blocks_delete_via_keys() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let current = tmp.path().join("current");
+        std::fs::create_dir(&current).expect("mkdir");
+        std::fs::create_dir(tmp.path().join("neighbour")).expect("mkdir");
+        let target = current.join("important.txt");
+        std::fs::write(&target, "keep").expect("write");
+        let mut c = Controller::new(current.clone());
+        settle(&mut c);
+        assert_eq!(c.selected(), Some(target.clone()));
+        c.handle(key(K::Char('b'), M::empty()), 130, 30);
+        assert!(c.ui.focus == Focus::Folders);
+        c.handle(key(K::Char('d'), M::empty()), 130, 30);
+        assert!(
+            c.ui.dialog.is_none(),
+            "delete from folder focus must not open a confirm dialog"
+        );
+        assert!(
+            c.delete.is_none(),
+            "delete from folder focus must not stage a target"
+        );
+        assert!(
+            c.mutation.is_none(),
+            "delete from folder focus must not start a mutation"
+        );
+        let (toast, severity) = c.ui.toast.clone().expect("warning must be user-visible");
+        assert!(
+            toast.contains("Focus the file list"),
+            "unexpected toast: {toast}"
+        );
+        assert!(matches!(severity, Severity::Warning));
+        assert_eq!(std::fs::read(&target).expect("read"), b"keep");
+        settle(&mut c);
+        assert!(target.exists(), "blocked delete must keep the file");
+    }
+
+    #[test]
+    fn folder_focus_blocks_other_file_actions_via_keys() {
+        // `n` / `f`: blocked create dialogs leave no dialog and no new path.
+        for shortcut in ['n', 'f'] {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let current = tmp.path().join("current");
+            std::fs::create_dir(&current).expect("mkdir");
+            std::fs::write(current.join("selected.txt"), "keep").expect("write");
+            let mut c = Controller::new(current.clone());
+            settle(&mut c);
+            c.handle(key(K::Char('b'), M::empty()), 130, 30);
+            assert!(c.ui.focus == Focus::Folders);
+            c.handle(key(K::Char(shortcut), M::empty()), 130, 30);
+            assert!(
+                c.ui.dialog.is_none(),
+                "{shortcut} from folder focus must not open a dialog"
+            );
+            assert!(c.mutation.is_none());
+            let (toast, severity) = c.ui.toast.clone().expect("warning must be user-visible");
+            assert!(
+                toast.contains("Focus the file list"),
+                "unexpected toast for {shortcut}: {toast}"
+            );
+            assert!(matches!(severity, Severity::Warning));
+            assert_eq!(
+                std::fs::read(current.join("selected.txt")).expect("read"),
+                b"keep"
+            );
+            settle(&mut c);
+            let names: Vec<_> = std::fs::read_dir(&current)
+                .expect("readdir")
+                .map(|e| e.expect("entry").file_name())
+                .collect();
+            assert_eq!(names.len(), 1, "blocked {shortcut} must not create a path");
+        }
+
+        // `r`: blocked rename leaves no dialog and the file untouched.
+        {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let current = tmp.path().join("current");
+            std::fs::create_dir(&current).expect("mkdir");
+            let target = current.join("selected.txt");
+            std::fs::write(&target, "keep").expect("write");
+            let mut c = Controller::new(current.clone());
+            settle(&mut c);
+            c.handle(key(K::Char('b'), M::empty()), 130, 30);
+            c.handle(key(K::Char('r'), M::empty()), 130, 30);
+            assert!(
+                c.ui.dialog.is_none(),
+                "rename from folder focus must not open a dialog"
+            );
+            let (toast, severity) = c.ui.toast.clone().expect("warning must be user-visible");
+            assert!(
+                toast.contains("Focus the file list"),
+                "unexpected toast: {toast}"
+            );
+            assert!(matches!(severity, Severity::Warning));
+            assert_eq!(std::fs::read(&target).expect("read"), b"keep");
+            settle(&mut c);
+            assert!(target.exists());
+        }
+
+        // `e`: blocked edit returns no effect and leaves the file alone.
+        {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let current = tmp.path().join("current");
+            std::fs::create_dir(&current).expect("mkdir");
+            let target = current.join("selected.txt");
+            std::fs::write(&target, "keep").expect("write");
+            let mut c = Controller::new(current.clone());
+            settle(&mut c);
+            c.handle(key(K::Char('b'), M::empty()), 130, 30);
+            let effect = c.handle(key(K::Char('e'), M::empty()), 130, 30);
+            assert!(
+                matches!(effect, Effect::None),
+                "edit from folder focus must not launch an editor"
+            );
+            assert!(c.ui.dialog.is_none());
+            let (toast, severity) = c.ui.toast.clone().expect("warning must be user-visible");
+            assert!(
+                toast.contains("Focus the file list"),
+                "unexpected toast: {toast}"
+            );
+            assert!(matches!(severity, Severity::Warning));
+            assert_eq!(std::fs::read(&target).expect("read"), b"keep");
+        }
+
+        // `p`: blocked paste with a staged clipboard starts no mutation.
+        {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let current = tmp.path().join("current");
+            std::fs::create_dir(&current).expect("mkdir");
+            std::fs::write(current.join("selected.txt"), "keep").expect("write");
+            let source = tmp.path().join("source.txt");
+            std::fs::write(&source, "keep").expect("write");
+            let mut c = Controller::new(current.clone());
+            settle(&mut c);
+            c.clip = Some((source.clone(), false));
+            c.handle(key(K::Char('b'), M::empty()), 130, 30);
+            assert!(c.ui.focus == Focus::Folders);
+            c.handle(key(K::Char('p'), M::empty()), 130, 30);
+            assert!(
+                c.mutation.is_none(),
+                "paste from folder focus must not start a mutation"
+            );
+            assert_eq!(c.clip, Some((source.clone(), false)));
+            assert!(
+                c.ui.dialog.is_none(),
+                "paste from folder focus must not open a dialog"
+            );
+            let (toast, severity) = c.ui.toast.clone().expect("warning must be user-visible");
+            assert!(
+                toast.contains("Focus the file list"),
+                "unexpected toast: {toast}"
+            );
+            assert!(matches!(severity, Severity::Warning));
+            assert!(
+                !current.join("source.txt").exists(),
+                "blocked paste must not copy the file"
+            );
+            assert_eq!(std::fs::read(&source).expect("read"), b"keep");
+            settle(&mut c);
+            assert!(!current.join("source.txt").exists());
+        }
+    }
+
+    #[test]
+    fn resize_preserves_selection_when_folder_column_hides() {
+        let tmp = test_dir(&[("a.txt", "a"), ("b.txt", "b")]);
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        settle(&mut c);
+        c.handle(key(K::Down, M::empty()), 130, 30);
+        settle(&mut c);
+        let before = tmp.path().join("b.txt");
+        assert_eq!(c.selected(), Some(before.clone()));
+        c.handle(key(K::Char('b'), M::empty()), 130, 30);
+        assert!(c.ui.focus == Focus::Folders);
+        let focused_selection = c.selected().expect("selection under folder focus");
+        assert_eq!(focused_selection, before);
+        c.handle(Event::Resize(80, 24), 80, 24);
+        assert!(
+            c.ui.focus == Focus::Table,
+            "hiding the folder column must fall back to the file list"
+        );
+        assert_eq!(c.selected(), Some(before.clone()));
+        assert_eq!(c.ui.listing.entries.len(), 2);
+        c.handle(Event::Resize(130, 30), 130, 30);
+        assert_eq!(c.selected(), Some(before.clone()));
+        assert_eq!(c.ui.listing.entries.len(), 2);
+        settle(&mut c);
+        assert_eq!(c.selected(), Some(before));
+    }
+
+    #[test]
+    fn preview_focus_remains_reachable_after_resize_round_trip() {
+        let tmp = test_dir(&[("notes.txt", "hello")]);
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        settle(&mut c);
+        c.handle(Event::Resize(50, 24), 50, 24);
+        c.handle(key(K::Char('v'), M::empty()), 50, 24);
+        assert!(c.ui.focus == Focus::Preview);
+        c.handle(Event::Resize(130, 30), 130, 30);
+        c.handle(key(K::Char('v'), M::empty()), 130, 30);
+        assert!(c.ui.focus == Focus::Table);
+        c.handle(Event::Resize(50, 24), 50, 24);
+        assert!(c.ui.focus == Focus::Preview);
+        c.handle(key(K::Char('v'), M::empty()), 50, 24);
+        assert!(c.ui.focus == Focus::Table);
+        assert_eq!(c.selected(), Some(tmp.path().join("notes.txt")));
+    }
+
+    #[test]
+    fn delete_during_slow_scan_becomes_ready_with_selected_name() {
+        let tmp = test_dir(&[("remove.txt", "x")]);
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        // Hold the initial scan on a test-controlled channel instead of
+        // sleeping: the real worker reply is discarded with its receiver.
+        let (hold_tx, hold_rx) = mpsc::channel::<Reply>();
+        c.list_worker = Some((c.list_rev, hold_rx));
+        assert!(c.ui.loading);
+        assert!(c.ui.listing.entries.is_empty());
+        c.handle(key(K::Char('d'), M::empty()), 80, 24);
+        assert!(
+            matches!(c.ui.dialog, Some(Dialog::Delete { ready: false, .. })),
+            "delete during slow scan must show a pending confirmation"
+        );
+        if let Some(Dialog::Delete { name, .. }) = &c.ui.dialog {
+            assert!(
+                name.contains("Loading"),
+                "pending detail must say loading, got {name:?}"
+            );
+        } else {
+            panic!("delete dialog missing");
+        }
+        assert!(c.delete.is_none());
+        assert!(c.mutation.is_none());
+        // Complete the held scan with the real listing; no sleeps, the
+        // channel rendezvous is the only synchronization.
+        let listing = crate::data::list(tmp.path(), false);
+        hold_tx
+            .send(Reply::List(listing, None))
+            .expect("send held listing");
+        settle(&mut c);
+        let target = tmp.path().join("remove.txt");
+        assert_eq!(c.selected(), Some(target.clone()));
+        assert_eq!(c.delete, Some(target.clone()));
+        if let Some(Dialog::Delete { name, ready, .. }) = &c.ui.dialog {
+            assert!(ready, "scan completion must enable the delete button");
+            assert_eq!(name, "remove.txt");
+        } else {
+            panic!("delete dialog must stay open after scan");
+        }
+        c.handle(key(K::Tab, M::empty()), 80, 24);
+        c.handle(key(K::Char(' '), M::empty()), 80, 24);
+        assert!(c.mutation.is_some(), "ready confirm must start a mutation");
+        settle(&mut c);
+        assert!(!target.exists(), "confirmed delete must remove the file");
+    }
+
+    #[test]
+    fn escape_cancels_pending_delete_without_waiting_for_scan() {
+        let tmp = test_dir(&[("keep.txt", "keep")]);
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        let (hold_tx, hold_rx) = mpsc::channel::<Reply>();
+        c.list_worker = Some((c.list_rev, hold_rx));
+        c.handle(key(K::Char('d'), M::empty()), 80, 24);
+        assert!(
+            matches!(c.ui.dialog, Some(Dialog::Delete { ready: false, .. })),
+            "slow-scan delete must be pending"
+        );
+        c.handle(key(K::Esc, M::empty()), 80, 24);
+        assert!(c.ui.dialog.is_none(), "escape must close the dialog");
+        assert!(c.delete.is_none(), "escape must clear the pending target");
+        assert!(c.mutation.is_none(), "escape must not start a mutation");
+        assert!(
+            c.list_worker.is_some(),
+            "escape must not wait for the slow scan"
+        );
+        assert!(tmp.path().join("keep.txt").exists());
+        let listing = crate::data::list(tmp.path(), false);
+        hold_tx
+            .send(Reply::List(listing, None))
+            .expect("send held listing");
+        settle(&mut c);
+        assert!(c.ui.dialog.is_none());
+        assert!(c.delete.is_none());
+        assert!(c.mutation.is_none());
+        assert!(tmp.path().join("keep.txt").exists());
+    }
+
+    #[test]
+    fn mouse_cancels_pending_delete_without_waiting_for_scan() {
+        let tmp = test_dir(&[("keep.txt", "keep")]);
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        let (hold_tx, hold_rx) = mpsc::channel::<Reply>();
+        c.list_worker = Some((c.list_rev, hold_rx));
+        c.handle(key(K::Char('d'), M::empty()), 80, 24);
+        assert!(matches!(
+            c.ui.dialog,
+            Some(Dialog::Delete { ready: false, .. })
+        ));
+        let cancel = (0..24)
+            .flat_map(|y| (0..80).map(move |x| (x, y)))
+            .find(|&(x, y)| matches!(ui::hit(&c.ui, 80, 24, x, y), Hit::Cancel))
+            .expect("cancel button");
+        c.handle(
+            mouse(Mouse::Down(MouseButton::Left), cancel.0, cancel.1),
+            80,
+            24,
+        );
+        assert!(c.ui.dialog.is_none());
+        assert!(c.list_worker.is_some());
+        assert!(c.mutation.is_none());
+        assert_eq!(std::fs::read(tmp.path().join("keep.txt")).unwrap(), b"keep");
+        hold_tx
+            .send(Reply::List(crate::data::list(tmp.path(), false), None))
+            .unwrap();
+        settle(&mut c);
+        assert_eq!(std::fs::read(tmp.path().join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn pending_delete_blocks_navigation_until_scan_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("old");
+        let new = tmp.path().join("new");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::create_dir(&new).unwrap();
+        std::fs::write(old.join("old.txt"), "old").unwrap();
+        std::fs::write(new.join("new.txt"), "new").unwrap();
+        let mut c = Controller::new(old.clone());
+        let (hold_tx, hold_rx) = mpsc::channel::<Reply>();
+        c.list_worker = Some((c.list_rev, hold_rx));
+        c.handle(key(K::Char('d'), M::empty()), 80, 24);
+        assert!(matches!(
+            c.ui.dialog,
+            Some(Dialog::Delete { ready: false, .. })
+        ));
+        c.handle(key(K::Char('h'), M::empty()), 80, 24);
+        c.handle(key(K::Char('g'), M::empty()), 80, 24);
+        assert_eq!(c.ui.directory, old);
+        assert!(c.delete.is_none());
+        hold_tx
+            .send(Reply::List(crate::data::list(&old, false), None))
+            .unwrap();
+        settle(&mut c);
+        assert_eq!(c.delete, Some(old.join("old.txt")));
+        assert_eq!(std::fs::read(new.join("new.txt")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn late_listing_cannot_replace_directory_opened_during_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("old");
+        let new = tmp.path().join("new");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::create_dir(&new).unwrap();
+        std::fs::write(old.join("old.txt"), "old").unwrap();
+        std::fs::write(new.join("new.txt"), "new").unwrap();
+        let mut c = Controller::new(old.clone());
+        let (hold_tx, hold_rx) = mpsc::channel::<Reply>();
+        c.list_worker = Some((c.list_rev, hold_rx));
+        c.handle(key(K::Char('g'), M::empty()), 80, 24);
+        for ch in new.to_str().unwrap().chars() {
+            c.handle(key(K::Char(ch), M::empty()), 80, 24);
+        }
+        c.handle(key(K::Enter, M::empty()), 80, 24);
+        assert_eq!(c.ui.directory, new);
+        hold_tx
+            .send(Reply::List(crate::data::list(&old, false), None))
+            .unwrap();
+        settle(&mut c);
+        assert_eq!(c.ui.directory, new);
+        assert_eq!(c.selected(), Some(new.join("new.txt")));
+        assert_eq!(c.ui.listing.entries.len(), 1);
+    }
+
+    #[test]
+    fn confirmed_delete_after_navigation_cancels_without_deleting() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let old = tmp.path().join("old");
+        let new = tmp.path().join("new");
+        std::fs::create_dir(&old).expect("mkdir");
+        std::fs::create_dir(&new).expect("mkdir");
+        let old_file = old.join("old.txt");
+        let new_file = new.join("new.txt");
+        std::fs::write(&old_file, "old").expect("write");
+        std::fs::write(&new_file, "new").expect("write");
+        let mut c = Controller::new(old.clone());
+        settle(&mut c);
+        assert_eq!(c.selected(), Some(old_file.clone()));
+        c.handle(key(K::Char('d'), M::empty()), 80, 24);
+        assert!(
+            matches!(c.ui.dialog, Some(Dialog::Delete { ready: true, .. })),
+            "delete dialog must open when ready"
+        );
+        // Navigate to the newer directory; the dialog stays open but the
+        // captured target must go stale.
+        c.ui.directory = new.clone();
+        c.reload(None);
+        settle(&mut c);
+        assert_eq!(c.ui.directory, new);
+        assert_eq!(c.selected(), Some(new_file.clone()));
+        assert_eq!(c.delete, Some(old_file.clone()));
+        c.handle(key(K::Tab, M::empty()), 80, 24);
+        c.handle(key(K::Char(' '), M::empty()), 80, 24);
+        assert!(
+            c.mutation.is_none(),
+            "stale confirm after navigation must not start a mutation"
+        );
+        let (toast, severity) = c.ui.toast.clone().expect("cancel must be visible");
+        assert!(
+            toast.contains("Selection changed"),
+            "unexpected toast: {toast}"
+        );
+        assert!(matches!(severity, Severity::Warning));
+        assert!(old_file.exists(), "stale confirm must keep the old file");
+        assert!(new_file.exists(), "stale confirm must keep the new file");
+        settle(&mut c);
+        assert!(old_file.exists());
+        assert!(new_file.exists());
+    }
+
+    #[test]
+    fn empty_folder_pending_delete_never_enables() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        let (hold_tx, hold_rx) = mpsc::channel::<Reply>();
+        c.list_worker = Some((c.list_rev, hold_rx));
+        c.handle(key(K::Char('d'), M::empty()), 80, 24);
+        assert!(
+            matches!(c.ui.dialog, Some(Dialog::Delete { ready: false, .. })),
+            "empty folder must show pending delete"
+        );
+        assert!(c.delete.is_none());
+        let listing = crate::data::list(tmp.path(), false);
+        assert!(listing.entries.is_empty());
+        hold_tx
+            .send(Reply::List(listing, None))
+            .expect("send held listing");
+        settle(&mut c);
+        assert!(
+            matches!(c.ui.dialog, Some(Dialog::Delete { ready: false, .. })),
+            "empty folder must never enable delete"
+        );
+        assert!(c.delete.is_none());
+        assert!(c.mutation.is_none());
+        if let Some(Dialog::Delete { name, .. }) = &c.ui.dialog {
+            assert!(
+                name.contains("No current selection"),
+                "empty detail must say no selection, got {name:?}"
+            );
+        } else {
+            panic!("delete dialog missing");
+        }
+        c.handle(key(K::Esc, M::empty()), 80, 24);
+        assert!(c.ui.dialog.is_none());
+    }
+
+    #[test]
+    fn empty_listing_finishes_loading_when_restore_target_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        c.reload(Some(tmp.path().join("already-gone.txt")));
+        settle(&mut c);
+        assert!(!c.ui.loading);
+        assert_eq!(c.selected(), None);
+        assert!(c.ui.listing.entries.is_empty());
+        c.handle(key(K::Char('d'), M::empty()), 80, 24);
+        assert!(c.ui.dialog.is_none());
+        assert!(c.delete.is_none());
+    }
+
+    #[test]
+    fn cut_during_slow_scan_returns_without_waiting() {
+        let tmp = test_dir(&[("keep.txt", "keep")]);
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        let (hold_tx, hold_rx) = mpsc::channel::<Reply>();
+        c.list_worker = Some((c.list_rev, hold_rx));
+        c.handle(key(K::Char('x'), M::empty()), 80, 24);
+        assert!(
+            c.clip.is_none(),
+            "cut during slow scan must not set clipboard"
+        );
+        assert!(c.mutation.is_none());
+        assert!(
+            c.list_worker.is_some(),
+            "cut must not wait for the slow scan"
+        );
+        let (toast, severity) = c.ui.toast.clone().expect("warning must be visible");
+        assert!(toast.contains("still loading"), "unexpected toast: {toast}");
+        assert!(matches!(severity, Severity::Warning));
+        assert!(tmp.path().join("keep.txt").exists());
+        let listing = crate::data::list(tmp.path(), false);
+        hold_tx
+            .send(Reply::List(listing, None))
+            .expect("send held listing");
+        settle(&mut c);
+        assert!(c.clip.is_none());
+        assert!(tmp.path().join("keep.txt").exists());
+    }
+
+    #[test]
+    fn quit_during_pending_delete_does_not_wait_for_scan() {
+        let tmp = test_dir(&[("keep.txt", "keep")]);
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        let (hold_tx, hold_rx) = mpsc::channel::<Reply>();
+        c.list_worker = Some((c.list_rev, hold_rx));
+        c.handle(key(K::Char('d'), M::empty()), 80, 24);
+        assert!(
+            matches!(c.ui.dialog, Some(Dialog::Delete { ready: false, .. })),
+            "slow-scan delete must be pending"
+        );
+        assert!(
+            matches!(
+                c.handle(key(K::Char('q'), M::CONTROL), 80, 24),
+                Effect::Quit
+            ),
+            "quit during pending delete must quit immediately"
+        );
+        assert!(
+            c.list_worker.is_some(),
+            "quit must not wait for the slow scan"
+        );
+        assert!(tmp.path().join("keep.txt").exists());
+        let listing = crate::data::list(tmp.path(), false);
+        hold_tx
+            .send(Reply::List(listing, None))
+            .expect("send held listing");
+        settle(&mut c);
+        assert!(tmp.path().join("keep.txt").exists());
+    }
+
+    #[test]
+    fn slow_listing_keeps_create_dialog_responsive() {
+        let tmp = test_dir(&[("keep.txt", "keep")]);
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        let (hold_tx, hold_rx) = mpsc::channel::<Reply>();
+        c.list_worker = Some((c.list_rev, hold_rx));
+        assert!(c.ui.loading);
+        c.handle(key(K::Char('n'), M::empty()), 80, 24);
+        assert!(
+            matches!(c.ui.dialog, Some(Dialog::Name { .. })),
+            "n during slow scan must open create dialog"
+        );
+        c.handle(key(K::Char('x'), M::empty()), 80, 24);
+        if let Some(Dialog::Name { value, .. }) = &c.ui.dialog {
+            assert!(
+                value.contains('x'),
+                "typed char must appear while scan pending, got {value:?}"
+            );
+        } else {
+            panic!("create dialog missing");
+        }
+        c.handle(key(K::Esc, M::empty()), 80, 24);
+        assert!(c.ui.dialog.is_none(), "escape must close create dialog");
+        assert!(c.list_worker.is_some(), "escape must not wait for scan");
+        assert!(c.mutation.is_none());
+        let listing = crate::data::list(tmp.path(), false);
+        hold_tx
+            .send(Reply::List(listing, None))
+            .expect("send held listing");
+        settle(&mut c);
+        assert!(!c.ui.loading);
+        assert_eq!(c.ui.listing.entries.len(), 1);
+        c.handle(key(K::Char('n'), M::empty()), 80, 24);
+        for ch in "newdir".chars() {
+            c.handle(key(K::Char(ch), M::empty()), 80, 24);
+        }
+        c.handle(key(K::Enter, M::empty()), 80, 24);
+        settle(&mut c);
+        assert!(tmp.path().join("newdir").is_dir());
+    }
+
+    #[test]
+    fn keyboard_rename_changes_real_file() {
+        let tmp = test_dir(&[("before.txt", "unchanged content")]);
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        settle(&mut c);
+        let source = tmp.path().join("before.txt");
+        assert_eq!(c.selected(), Some(source.clone()));
+        c.handle(key(K::Char('r'), M::empty()), 80, 24);
+        assert!(
+            matches!(c.ui.dialog, Some(Dialog::Name { .. })),
+            "r must open rename dialog"
+        );
+        for ch in "after.txt".chars() {
+            c.handle(key(K::Char(ch), M::empty()), 80, 24);
+        }
+        c.handle(key(K::Enter, M::empty()), 80, 24);
+        settle(&mut c);
+        let target = tmp.path().join("after.txt");
+        assert_eq!(
+            std::fs::read(&target).expect("renamed file"),
+            b"unchanged content"
+        );
+        assert!(!source.exists(), "rename must move the real file");
+        assert!(c.ui.dialog.is_none());
+        assert_eq!(c.selected(), Some(target));
+    }
+
+    #[test]
+    fn keyboard_horizontal_preview_scroll() {
+        let body = format!("first {} last", "x".repeat(120));
+        let tmp = test_dir(&[("long.txt", &body)]);
+        let mut c = Controller::new(tmp.path().to_path_buf());
+        settle(&mut c);
+        assert!(c.ui.preview.is_some());
+        assert_eq!(c.ui.preview_x, 0);
+        c.handle(key(K::Char('v'), M::empty()), 80, 24);
+        assert!(c.ui.focus == Focus::Preview, "v must focus preview");
+        c.handle(key(K::Right, M::empty()), 80, 24);
+        c.handle(key(K::Right, M::empty()), 80, 24);
+        c.handle(key(K::Right, M::empty()), 80, 24);
+        assert!(
+            c.ui.preview_x > 0,
+            "right in preview must scroll horizontally, got {}",
+            c.ui.preview_x
+        );
+        assert!(c.ui.focus == Focus::Preview, "focus must stay in preview");
+    }
+
+    #[test]
+    fn folder_shortcut_focuses_folders() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let current = tmp.path().join("current");
+        std::fs::create_dir(&current).expect("mkdir");
+        std::fs::create_dir(tmp.path().join("neighbour")).expect("mkdir");
+        std::fs::write(current.join("a.txt"), "a").expect("write");
+        let mut c = Controller::new(current.clone());
+        settle(&mut c);
+        assert!(c.ui.focus == Focus::Table, "starts in file list");
+        c.handle(key(K::Char('b'), M::empty()), 130, 30);
+        assert!(c.ui.focus == Focus::Folders, "b must focus folders");
+        settle(&mut c);
+        assert!(c.ui.focus == Focus::Folders, "folder focus must persist");
+    }
+
+    #[test]
+    fn keyboard_copy_and_cut_paste_real_file() {
+        for moving in [false, true] {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let source_dir = tmp.path().join("source");
+            let destination = tmp.path().join("destination");
+            std::fs::create_dir(&source_dir).expect("mkdir");
+            std::fs::create_dir(&destination).expect("mkdir");
+            std::fs::write(source_dir.join("notes.txt"), "actual content").expect("write");
+            let mut c = Controller::new(source_dir.clone());
+            settle(&mut c);
+            assert_eq!(c.selected(), Some(source_dir.join("notes.txt")));
+            c.handle(
+                key(K::Char(if moving { 'x' } else { 'y' }), M::empty()),
+                80,
+                24,
+            );
+            assert!(c.clip.is_some());
+            c.handle(key(K::Char('h'), M::empty()), 80, 24);
+            settle(&mut c);
+            assert_eq!(c.ui.directory, tmp.path().to_path_buf());
+            let idx =
+                c.ui.listing
+                    .entries
+                    .iter()
+                    .position(|e| e.path == destination)
+                    .expect("destination row");
+            while c.selected().as_ref() != Some(&destination) {
+                let cur = c.ui.row;
+                if cur < idx {
+                    c.handle(key(K::Down, M::empty()), 80, 24);
+                } else {
+                    c.handle(key(K::Up, M::empty()), 80, 24);
+                }
+            }
+            c.handle(key(K::Enter, M::empty()), 80, 24);
+            settle(&mut c);
+            assert_eq!(c.ui.directory, destination);
+            c.handle(key(K::Char('p'), M::empty()), 80, 24);
+            assert!(c.mutation.is_some(), "paste must start a mutation");
+            settle(&mut c);
+            assert_eq!(
+                std::fs::read(destination.join("notes.txt")).expect("pasted"),
+                b"actual content"
+            );
+            assert_eq!(
+                source_dir.join("notes.txt").exists(),
+                !moving,
+                "cut must move, copy must keep"
+            );
+        }
     }
 }

@@ -743,4 +743,462 @@ mod tests {
                 .contains(Modifier::BOLD)
         );
     }
+    fn buffer_row(buffer: &ratatui::buffer::Buffer, y: u16, x0: u16, x1: u16) -> String {
+        (x0..x1)
+            .map(|x| buffer[(x, y)].symbol().to_owned())
+            .collect()
+    }
+    fn rows_rect(ui: &Ui, w: u16, h: u16) -> Rect {
+        let table = panes(w, h, ui)[1];
+        let shrink = u16::from(table_scrollbar(ui, w, h).is_some()) * 2;
+        Rect::new(
+            table.x,
+            table.y,
+            table.width.saturating_sub(shrink),
+            table.height,
+        )
+    }
+    fn find_text_x(
+        buffer: &ratatui::buffer::Buffer,
+        y: u16,
+        x0: u16,
+        x1: u16,
+        needle: &str,
+    ) -> Option<u16> {
+        // Cell-exact search: each ASCII glyph occupies exactly one cell, so a
+        // preceding CJK name cannot skew the column offset the way a
+        // string `find` on joined symbols would.
+        let want: Vec<String> = needle.chars().map(|c| c.to_string()).collect();
+        if want.is_empty() || (x1 - x0) < want.len() as u16 {
+            return None;
+        }
+        for start in x0..=x1 - want.len() as u16 {
+            let mut ok = true;
+            for (i, w) in want.iter().enumerate() {
+                if buffer[(start + i as u16, y)].symbol() != *w {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return Some(start);
+            }
+        }
+        None
+    }
+    fn entry_with(name: &str, size: &str, modified: &str) -> crate::data::Entry {
+        crate::data::Entry {
+            path: std::path::PathBuf::from(name),
+            directory: false,
+            size: size.into(),
+            modified: modified.into(),
+        }
+    }
+
+    #[test]
+    fn filename_with_markup_is_rendered_literally() {
+        let tmp = tempfile::tempdir().unwrap();
+        let filename = "[bold]literal.txt";
+        std::fs::write(tmp.path().join(filename), b"contents").unwrap();
+        let mut ui = ui();
+        ui.listing = crate::data::list(tmp.path(), false);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &ui)).unwrap();
+        let rows = rows_rect(&ui, 120, 30);
+        let row = buffer_row(
+            terminal.backend().buffer(),
+            rows.y + 3,
+            rows.x,
+            rows.right(),
+        );
+        assert!(row.contains(filename), "filename was altered: {row:?}");
+    }
+
+    #[test]
+    fn horizontal_preview_offset_reveals_hidden_file_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("long.txt");
+        std::fs::write(&file, format!("{}ENDMARK", "x".repeat(60))).unwrap();
+        let mut ui = ui();
+        ui.preview = Some(crate::data::preview(&file));
+        let pane = panes(80, 24, &ui)[2];
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &ui)).unwrap();
+        let row = buffer_row(
+            terminal.backend().buffer(),
+            pane.y + 5,
+            pane.x,
+            pane.right(),
+        );
+        assert!(!row.contains("ENDMARK"));
+        ui.preview_x = 50;
+        terminal.draw(|frame| draw(frame, &ui)).unwrap();
+        let row = buffer_row(
+            terminal.backend().buffer(),
+            pane.y + 5,
+            pane.x,
+            pane.right(),
+        );
+        assert!(row.contains("ENDMARK"), "scrolled preview: {row:?}");
+    }
+
+    #[test]
+    fn truncated_file_preview_discloses_status_on_screen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("long.txt");
+        std::fs::write(&file, "x".repeat(513)).unwrap();
+        let mut ui = ui();
+        ui.preview = Some(crate::data::preview(&file));
+        let pane = panes(120, 30, &ui)[2];
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &ui)).unwrap();
+        let meta = buffer_row(
+            terminal.backend().buffer(),
+            pane.y + 3,
+            pane.x,
+            pane.right(),
+        );
+        assert!(meta.contains("truncated"), "preview metadata: {meta:?}");
+    }
+
+    #[test]
+    fn preview_displays_numbered_file_contents_on_screen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("note.txt");
+        std::fs::write(&file, "first\nsecond\n").unwrap();
+        let mut ui = ui();
+        ui.preview = Some(crate::data::preview(&file));
+        let pane = panes(80, 24, &ui)[2];
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &ui)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let first = buffer_row(buffer, pane.y + 5, pane.x, pane.right());
+        let second = buffer_row(buffer, pane.y + 6, pane.x, pane.right());
+        assert!(first.contains("1 │ first"), "{first}");
+        assert!(second.contains("2 │ second"), "{second}");
+    }
+
+    #[test]
+    fn missing_directory_error_is_visible_in_narrow_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing");
+        let mut ui = ui();
+        ui.directory = missing.clone();
+        ui.listing = crate::data::list(&missing, false);
+        let mut terminal = Terminal::new(TestBackend::new(50, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &ui)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen = (0..24)
+            .map(|y| buffer_row(buffer, y, 0, 50))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Cannot read directory"), "{screen}");
+    }
+
+    #[test]
+    fn long_names_and_full_metadata_share_row_without_overlap() {
+        for name in [
+            "a-very-long-filename-with-room-to-spare.txt",
+            "資料報告書-完整的檔案名稱-2026.txt",
+        ] {
+            let mut ui = ui();
+            ui.listing.entries = vec![entry_with(name, "12,345 B", "2023-11-14 22:13")];
+            let (w, h) = (200, 30);
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|frame| draw(frame, &ui)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let rows = rows_rect(&ui, w, h);
+            let header = buffer_row(&buffer, rows.y + 2, rows.x, rows.right());
+            let row = buffer_row(&buffer, rows.y + 3, rows.x, rows.right());
+            assert!(header.contains("Name"), "header {header:?} for {name}");
+            assert!(header.contains("Size"), "header {header:?}");
+            assert!(header.contains("Modified"), "header {header:?}");
+            assert!(row.contains("12,345 B"), "row {row:?}");
+            // Full-name presence is checked spaceless below for CJK correctness.
+            assert!(row.contains("2023-11-14 22:13"), "row {row:?}");
+            // NOTE: TestBackend stores one symbol per cell, so wide CJK glyphs read
+            // back with a padding cell between graphemes; compare spaceless.
+            let flat: String = row.chars().filter(|c| *c != ' ').collect();
+            assert!(
+                flat.contains(&name.replace(' ', "")),
+                "row {row:?} should show {name}"
+            );
+            assert!(
+                !row.contains('…'),
+                "wide table must not ellipsis {name:?}: {row:?}"
+            );
+            let size_header =
+                find_text_x(&buffer, rows.y + 2, rows.x, rows.right(), "Size").unwrap();
+            let size_value =
+                find_text_x(&buffer, rows.y + 3, rows.x, rows.right(), "12,345 B").unwrap();
+            assert_eq!(size_header, size_value, "size column starts under header");
+            let date_header =
+                find_text_x(&buffer, rows.y + 2, rows.x, rows.right(), "Modified").unwrap();
+            let date_value = find_text_x(
+                &buffer,
+                rows.y + 3,
+                rows.x,
+                rows.right(),
+                "2023-11-14 22:13",
+            )
+            .unwrap();
+            assert_eq!(date_header, date_value, "date column starts under header");
+            assert_eq!(date_header - size_header, 11, "size field keeps 9 + 2 gap");
+            // Overlap check on display cells: name area ends before size starts.
+            // For CJK use display width rather than byte length.
+            let name_width: usize = unicode_width::UnicodeWidthStr::width(name);
+            // spaceless flat check already proves full name fits; here only the
+            // ASCII name has a byte-exact end offset worth asserting.
+            if name.is_ascii() {
+                let name_end = row.find(name).unwrap() + name.len();
+                assert!(name_end as u16 + 1 < size_value, "name must not touch size");
+            } else {
+                assert!(
+                    (name_width as u16) < size_value - rows.x,
+                    "CJK name width {name_width} must fit before size at {size_value}"
+                );
+            }
+            assert!(
+                size_value + "12,345 B".len() as u16 + 1 < date_value,
+                "size must not touch date"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_widths_give_remaining_cells_to_filename() {
+        for (w, name) in [(30u16, "a".repeat(22)), (50u16, "b".repeat(27))] {
+            let mut ui = ui();
+            ui.listing.entries = vec![entry_with(&name, "5 B", "2023-11-14 22:13")];
+            let h = 24u16;
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|frame| draw(frame, &ui)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let rows = rows_rect(&ui, w, h);
+            let header = buffer_row(&buffer, rows.y + 2, rows.x, rows.right());
+            let row = buffer_row(&buffer, rows.y + 3, rows.x, rows.right());
+            assert!(header.contains("Name"), "compact header {header:?} at {w}");
+            assert!(
+                !header.contains("Modified"),
+                "date hidden at {w}: {header:?}"
+            );
+            assert!(row.contains(&name), "name fits at {w}: {row:?}");
+            assert!(!row.contains("2023-11-14"), "date hidden at {w}: {row:?}");
+            if w == 50 {
+                assert!(header.contains("Size"), "size shown at 50: {header:?}");
+                assert!(row.contains("5 B"), "size shown at 50: {row:?}");
+            } else {
+                assert!(!header.contains("Size"), "size hidden at 30: {header:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn resize_moves_modified_column_right_and_keeps_selection() {
+        let mut ui = ui();
+        ui.listing.entries = vec![
+            entry_with("a-first.txt", "1 B", "2023-11-14 22:13"),
+            entry_with("b-second-longer-than-twenty.txt", "2 B", "2023-11-14 22:13"),
+        ];
+        ui.row = 1;
+        ui.focus = Focus::Table;
+        let h = 30u16;
+        let mut before = Terminal::new(TestBackend::new(160, h)).unwrap();
+        before.draw(|frame| draw(frame, &ui)).unwrap();
+        let before_buf = before.backend().buffer().clone();
+        let before_rows = rows_rect(&ui, 160, h);
+        let before_header = buffer_row(
+            &before_buf,
+            before_rows.y + 2,
+            before_rows.x,
+            before_rows.right(),
+        );
+        let before_row = buffer_row(
+            &before_buf,
+            before_rows.y + 4,
+            before_rows.x,
+            before_rows.right(),
+        );
+        let mut after = Terminal::new(TestBackend::new(200, h)).unwrap();
+        after.draw(|frame| draw(frame, &ui)).unwrap();
+        let after_buf = after.backend().buffer().clone();
+        let after_rows = rows_rect(&ui, 200, h);
+        let after_header = buffer_row(
+            &after_buf,
+            after_rows.y + 2,
+            after_rows.x,
+            after_rows.right(),
+        );
+        let after_row = buffer_row(
+            &after_buf,
+            after_rows.y + 4,
+            after_rows.x,
+            after_rows.right(),
+        );
+        let before_date = before_header.find("Modified").unwrap();
+        let after_date = after_header.find("Modified").unwrap();
+        assert!(after_date > before_date, "date moves right on widen");
+        assert!(after_row.contains("b-second-longer-than-twenty.txt"));
+        assert!(before_row.contains("b-second-longer-than-twenty.txt"));
+        assert_ne!(before_row, after_row, "wider table reflows spacing");
+        for (term_rows, buf) in [(before_rows, &before_buf), (after_rows, &after_buf)] {
+            let selected = &buf[(term_rows.x + 1, term_rows.y + 4)];
+            assert!(
+                selected.modifier.contains(Modifier::REVERSED),
+                "selected row keeps focus style"
+            );
+            let unselected = &buf[(term_rows.x + 1, term_rows.y + 3)];
+            assert!(!unselected.modifier.contains(Modifier::REVERSED));
+        }
+    }
+
+    #[test]
+    fn scrollbar_leaves_complete_modified_date_visible() {
+        let mut ui = ui();
+        ui.listing.entries = (0..40)
+            .map(|i| entry_with(&format!("file-{i:02}.txt"), "4 B", "2023-11-14 22:13"))
+            .collect();
+        let (w, h) = (180, 24);
+        let bar = table_scrollbar(&ui, w, h).expect("40 rows must scroll at h=24");
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|frame| draw(frame, &ui)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows = rows_rect(&ui, w, h);
+        let header = buffer_row(&buffer, rows.y + 2, rows.x, rows.right());
+        let row = buffer_row(&buffer, rows.y + 3, rows.x, rows.right());
+        assert!(
+            header.contains("Modified"),
+            "date header survives scrollbar"
+        );
+        assert!(
+            row.contains("2023-11-14 22:13"),
+            "first date not clipped by scrollbar: {row:?}"
+        );
+        let date_x = rows.x as usize + row.find("2023-11-14 22:13").unwrap();
+        assert!(
+            date_x + "2023-11-14 22:13".len() <= bar.track.x as usize,
+            "date ends before scrollbar track"
+        );
+        let size_x = rows.x as usize + row.find("4 B").unwrap();
+        let date_start = rows.x as usize + row.find("2023-11-14 22:13").unwrap();
+        assert!(size_x + "4 B".len() < date_start);
+    }
+
+    #[test]
+    fn scrollbar_appearance_shrinks_name_column_and_keeps_selection() {
+        let mut ui = ui();
+        ui.listing.entries = (0..40)
+            .map(|i| entry_with(&format!("file-{i:02}.txt"), "4 B", "2023-11-14 22:13"))
+            .collect();
+        ui.row = 1;
+        ui.focus = Focus::Table;
+        let w = 180u16;
+        assert!(
+            table_scrollbar(&ui, w, 80).is_none(),
+            "tall pane has no scrollbar"
+        );
+        assert!(
+            table_scrollbar(&ui, w, 24).is_some(),
+            "short pane must scroll"
+        );
+        let tall_rows = rows_rect(&ui, w, 80);
+        let short_rows = rows_rect(&ui, w, 24);
+        assert_eq!(
+            tall_rows.width,
+            short_rows.width + 2,
+            "track steals two cells from name area"
+        );
+        let mut tall = Terminal::new(TestBackend::new(w, 80)).unwrap();
+        tall.draw(|frame| draw(frame, &ui)).unwrap();
+        let tall_buf = tall.backend().buffer().clone();
+        let tall_header = buffer_row(&tall_buf, tall_rows.y + 2, tall_rows.x, tall_rows.right());
+        let mut short = Terminal::new(TestBackend::new(w, 24)).unwrap();
+        short.draw(|frame| draw(frame, &ui)).unwrap();
+        let short_buf = short.backend().buffer().clone();
+        let short_header = buffer_row(
+            &short_buf,
+            short_rows.y + 2,
+            short_rows.x,
+            short_rows.right(),
+        );
+        let short_row = buffer_row(
+            &short_buf,
+            short_rows.y + 4,
+            short_rows.x,
+            short_rows.right(),
+        );
+        assert_eq!(
+            tall_header.find("Modified").unwrap(),
+            short_header.find("Modified").unwrap() + 2,
+            "date shifts left by scrollbar width"
+        );
+        assert!(short_header.contains("Modified"));
+        assert!(short_row.contains("2023-11-14 22:13"));
+        assert!(short_row.contains("file-01.txt"));
+        let selected = &short_buf[(short_rows.x + 1, short_rows.y + 4)];
+        assert!(
+            selected.modifier.contains(Modifier::REVERSED),
+            "selection survives scrollbar change"
+        );
+    }
+
+    #[test]
+    fn size_units_fit_inside_size_column_without_clipping() {
+        for visible in ["999,999 B", "977 KiB", "1.2 MiB"] {
+            let mut ui = ui();
+            ui.listing.entries = vec![entry_with("sparse-file", visible, "2023-11-14 22:13")];
+            let (w, h) = (180, 24);
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|frame| draw(frame, &ui)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let rows = rows_rect(&ui, w, h);
+            let row = buffer_row(&buffer, rows.y + 3, rows.x, rows.right());
+            assert!(row.contains(visible), "size {visible} visible in {row:?}");
+            assert!(
+                row.contains("2023-11-14 22:13"),
+                "date still visible with {visible}"
+            );
+            let start = row.find(visible).unwrap();
+            assert!(
+                row[start + visible.len()..].starts_with(' '),
+                "unit not cut off in {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn separator_lines_stay_static_across_focus() {
+        for w in [50u16, 180u16] {
+            let h = 24u16;
+            let mut snapshots = Vec::new();
+            for focus in [Focus::Table, Focus::Folders, Focus::Preview] {
+                let mut ui = ui();
+                ui.listing.entries = vec![entry_with("file.txt", "4 B", "2023-11-14 22:13")];
+                ui.focus = focus;
+                let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+                terminal.draw(|frame| draw(frame, &ui)).unwrap();
+                let buffer = terminal.backend().buffer().clone();
+                let mut separators = Vec::new();
+                for pane in panes(w, h, &ui) {
+                    if pane.width == 0 {
+                        continue;
+                    }
+                    let line = buffer_row(&buffer, pane.y + 1, pane.x, pane.right());
+                    assert!(line.contains("────────"), "pane separator at {w}: {line:?}");
+                    assert!(
+                        line.chars().all(|c| c == '─'),
+                        "separator is only dashes: {line:?}"
+                    );
+                    for x in pane.x..pane.right() {
+                        assert!(buffer[(x, pane.y + 1)].modifier.contains(Modifier::DIM));
+                    }
+                    separators.push(line);
+                }
+                assert!(!separators.is_empty());
+                snapshots.push(separators);
+            }
+            assert_eq!(snapshots[0], snapshots[1]);
+            assert_eq!(snapshots[1], snapshots[2]);
+        }
+    }
 }
