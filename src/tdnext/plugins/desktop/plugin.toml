@@ -1,7 +1,7 @@
 id = "desktop"
 manifest_version = 1
 api_version = 1
-host_interfaces = ["tdnext.textual-view.v1"]
+host_interfaces = ["tdnext.textual-view.v1", "tdnext.terminal-view.v1"]
 name = "Desktop"
 version = "0.1.0"
 description = "Native terminal desktop host"

@@ -25,7 +25,10 @@ def pane_commands() -> None:
 def tool(active: str, snapshot: str | None = None) -> None:
     plugins = manager()
     session = current_session(snapshot)
-    views = textual_views(enabled_views(plugins, session))
+    views = textual_views([
+        (manifest, plugin) for manifest, plugin in enabled_views(plugins, session)
+        if manifest.id == active and manifest.placement == "header"
+    ])
     os.environ.pop(SESSION_ENV, None)
     for manifest, plugin in views:
         if manifest.id == active and manifest.placement == "header":

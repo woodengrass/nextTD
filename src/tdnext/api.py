@@ -45,6 +45,11 @@ class ViewPlugin(Protocol):
 
 
 @runtime_checkable
+class TerminalViewPlugin(Protocol):
+    def run_pane(self, context: PluginContext) -> None: ...
+
+
+@runtime_checkable
 class IconProvider(Protocol):
     """Resolve a semantic icon name in either explicitly selected display mode."""
 
