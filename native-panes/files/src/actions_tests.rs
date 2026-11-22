@@ -15,8 +15,8 @@ use std::path::Path;
 use crate::actions::{
     EditorChoice, RestoredPath, cleanup_copied, copy_dir_noreplace, copy_file_noreplace, create,
     create_private_dir, create_private_file, editor, expanduser, find_executable_in,
-    parse_editor_choice, paste, remove, rename, resolve_editor_argv_with, resolve_state_dir_from,
-    restored_path_plan,
+    move_noreplace, parse_editor_choice, paste, remove, rename, rename_noreplace,
+    resolve_editor_argv_with, resolve_state_dir_from, restored_path_plan,
 };
 
 fn dir() -> Result<tempfile::TempDir, String> {
@@ -732,4 +732,393 @@ fn error_surface_stays_strings() -> Result<(), String> {
         Err(_) => Err("error message must not be empty".to_string()),
         Ok(_) => Err("renaming a missing file should fail".to_string()),
     }
+}
+#[test]
+fn atomic_rename_and_move_reject_preexisting_targets() -> Result<(), String> {
+    // Shared owner of the no-overwrite matrix at the atomic boundary.
+    // The deleted per-operation public matrices (`create_collision_matrix`,
+    // `rename_collision_matrix`, `paste_copy_collision_matrix`,
+    // `paste_move_collision_matrix`) all pre-created the rival before calling
+    // the public API, so they exercised only the `child_path` pre-check, never
+    // the atomic layer. The public smoke tests kept below prove the wiring
+    // (`create_never_overwrites`, `rename_moves_without_replacing`,
+    // `paste_copies_file_with_metadata` re-copy, and the re-move check in
+    // `paste_moves_single_file_and_symlink`); this test bypasses the
+    // pre-check and calls the primitives directly with real pre-existing
+    // targets, so `RENAME_NOREPLACE` / `O_EXCL` / `mkdir EEXIST` is what
+    // rejects. Deterministic: no threads, no timing, no TOCTOU harness.
+    let root = dir()?;
+
+    // Folder-over-folder and folder-over-symlink at the primitive: the
+    // public `create` pre-check is kind-agnostic, so one primitive case per
+    // kind owns the matrix here.
+    let docs = root.path().join("docs");
+    std::fs::create_dir(&docs).map_err(|error| error.to_string())?;
+    match create_private_dir(&docs) {
+        Err(message) if message == "Already exists: docs" => {}
+        other => {
+            return Err(format!(
+                "dir over dir: expected Already exists, got {other:?}"
+            ));
+        }
+    }
+    write(&root.path().join("real.txt"), b"real")?;
+    std::os::unix::fs::symlink("real.txt", root.path().join("link-dir"))
+        .map_err(|error| error.to_string())?;
+    match create_private_dir(&root.path().join("link-dir")) {
+        Err(message) if message == "Already exists: link-dir" => {}
+        other => {
+            return Err(format!(
+                "dir over symlink: expected Already exists, got {other:?}"
+            ));
+        }
+    }
+    if !root.path().join("link-dir").is_symlink() {
+        return Err("dir creation clobbered a symlink rival".to_string());
+    }
+
+    // Rename primitive: every rival kind, source and rival untouched.
+    let src_file = root.path().join("rsrc.txt");
+    write(&src_file, b"src")?;
+    let rival_file = root.path().join("rrival.txt");
+    write(&rival_file, b"keep")?;
+    match rename_noreplace(&src_file, &rival_file).map_err(|error| error.into_message()) {
+        Err(message) if message == "Already exists: rrival.txt" => {}
+        other => {
+            return Err(format!(
+                "rename file over file: expected Already exists, got {other:?}"
+            ));
+        }
+    }
+    let rival_dir = root.path().join("rrivaldir");
+    std::fs::create_dir(&rival_dir).map_err(|error| error.to_string())?;
+    write(&rival_dir.join("keep.txt"), b"keep")?;
+    match rename_noreplace(&src_file, &rival_dir).map_err(|error| error.into_message()) {
+        Err(message) if message == "Already exists: rrivaldir" => {}
+        other => {
+            return Err(format!(
+                "rename file over dir: expected Already exists, got {other:?}"
+            ));
+        }
+    }
+    std::os::unix::fs::symlink("real.txt", root.path().join("rrivallink"))
+        .map_err(|error| error.to_string())?;
+    match rename_noreplace(&src_file, &root.path().join("rrivallink"))
+        .map_err(|error| error.into_message())
+    {
+        Err(message) if message == "Already exists: rrivallink" => {}
+        other => {
+            return Err(format!(
+                "rename file over symlink: expected Already exists, got {other:?}"
+            ));
+        }
+    }
+    if read(&src_file)? != b"src" {
+        return Err("failed atomic rename lost the source".to_string());
+    }
+    let src_dir = root.path().join("rsrcdir");
+    std::fs::create_dir(&src_dir).map_err(|error| error.to_string())?;
+    write(&src_dir.join("inner.txt"), b"inner")?;
+    let rival_dir2 = root.path().join("rrivaldir2");
+    std::fs::create_dir(&rival_dir2).map_err(|error| error.to_string())?;
+    write(&rival_dir2.join("keep.txt"), b"keep")?;
+    match rename_noreplace(&src_dir, &rival_dir2).map_err(|error| error.into_message()) {
+        Err(message) if message == "Already exists: rrivaldir2" => {}
+        other => {
+            return Err(format!(
+                "rename dir over dir: expected Already exists, got {other:?}"
+            ));
+        }
+    }
+    write(&root.path().join("rrivalfile"), b"keep")?;
+    match rename_noreplace(&src_dir, &root.path().join("rrivalfile"))
+        .map_err(|error| error.into_message())
+    {
+        Err(message) if message == "Already exists: rrivalfile" => {}
+        other => {
+            return Err(format!(
+                "rename dir over file: expected Already exists, got {other:?}"
+            ));
+        }
+    }
+    if read(&src_dir.join("inner.txt"))? != b"inner"
+        || read(&rival_dir.join("keep.txt"))? != b"keep"
+        || read(&rival_dir2.join("keep.txt"))? != b"keep"
+    {
+        return Err("atomic rename altered source or rival".to_string());
+    }
+
+    // Move primitive (same-device `RENAME_NOREPLACE` path): refused moves
+    // keep both sides.
+    let msrc = root.path().join("msrc.txt");
+    write(&msrc, b"src")?;
+    let mdst = root.path().join("mdst.txt");
+    write(&mdst, b"keep")?;
+    match move_noreplace(&msrc, &mdst) {
+        Err(message) if message == "Already exists: mdst.txt" => {}
+        other => {
+            return Err(format!(
+                "move file over file: expected Already exists, got {other:?}"
+            ));
+        }
+    }
+    if read(&msrc)? != b"src" || read(&mdst)? != b"keep" {
+        return Err("atomic move altered source or rival".to_string());
+    }
+    let msrcdir = root.path().join("msrcdir");
+    std::fs::create_dir(&msrcdir).map_err(|error| error.to_string())?;
+    write(&msrcdir.join("a.txt"), b"src")?;
+    let mdstdir = root.path().join("mdstdir");
+    std::fs::create_dir(&mdstdir).map_err(|error| error.to_string())?;
+    write(&mdstdir.join("keep.txt"), b"keep")?;
+    match move_noreplace(&msrcdir, &mdstdir) {
+        Err(message) if message == "Already exists: mdstdir" => {}
+        other => {
+            return Err(format!(
+                "move dir over dir: expected Already exists, got {other:?}"
+            ));
+        }
+    }
+    if read(&msrcdir.join("a.txt"))? != b"src" || read(&mdstdir.join("keep.txt"))? != b"keep" {
+        return Err("atomic dir move altered source or rival".to_string());
+    }
+    std::os::unix::fs::symlink("real.txt", root.path().join("mlink"))
+        .map_err(|error| error.to_string())?;
+    write(&root.path().join("mkeep"), b"keep")?;
+    match move_noreplace(&root.path().join("mlink"), &root.path().join("mkeep")) {
+        Err(message) if message == "Already exists: mkeep" => {}
+        other => {
+            return Err(format!(
+                "move symlink over file: expected Already exists, got {other:?}"
+            ));
+        }
+    }
+    if std::fs::read_link(root.path().join("mlink")).map_err(|error| error.to_string())?
+        != Path::new("real.txt")
+        || read(&root.path().join("mkeep"))? != b"keep"
+    {
+        return Err("atomic symlink move altered source or rival".to_string());
+    }
+    Ok(())
+}
+
+#[test]
+fn paste_moves_single_file_and_symlink() -> Result<(), String> {
+    // `paste_moves_and_copies_trees` covers tree moves; Python
+    // `test_copy_and_move_real_files` also covers single-file moves, which
+    // take the same-device `RENAME_NOREPLACE` path and must preserve content
+    // and remove the source. Symlink moves rename the link itself.
+    let root = dir()?;
+    let src_dir = root.path().join("src");
+    let dst_dir = root.path().join("dst");
+    std::fs::create_dir(&src_dir).map_err(|error| error.to_string())?;
+    std::fs::create_dir(&dst_dir).map_err(|error| error.to_string())?;
+    let source = src_dir.join("note.txt");
+    write(&source, b"hello")?;
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640))
+        .map_err(|error| error.to_string())?;
+    let target = paste(&source, &dst_dir, true)?;
+    if target != dst_dir.join("note.txt") {
+        return Err(format!("move returned an unexpected target: {target:?}"));
+    }
+    if source.exists() || source.is_symlink() {
+        return Err("move left the source behind".to_string());
+    }
+    if read(&target)? != b"hello" {
+        return Err("moved content differs".to_string());
+    }
+    if mode_of(&target)? != 0o640 {
+        return Err("moved mode was not preserved".to_string());
+    }
+    write(&src_dir.join("real.txt"), b"real")?;
+    let link = src_dir.join("link");
+    std::os::unix::fs::symlink("real.txt", &link).map_err(|error| error.to_string())?;
+    let moved_link = paste(&link, &dst_dir, true)?;
+    if std::fs::read_link(&moved_link).map_err(|error| error.to_string())? != Path::new("real.txt")
+    {
+        return Err("moved symlink target differs".to_string());
+    }
+    if link.exists() || link.is_symlink() {
+        return Err("symlink move left the source behind".to_string());
+    }
+    if !moved_link.is_symlink() {
+        return Err("moved symlink is not a symlink".to_string());
+    }
+    write(&src_dir.join("second.txt"), b"second")?;
+    write(&dst_dir.join("second.txt"), b"keep")?;
+    match paste(&src_dir.join("second.txt"), &dst_dir, true) {
+        Err(message) if message == "Already exists: second.txt" => {}
+        other => {
+            return Err(format!(
+                "move file over file: expected Already exists, got {other:?}"
+            ));
+        }
+    }
+    if read(&src_dir.join("second.txt"))? != b"second"
+        || read(&dst_dir.join("second.txt"))? != b"keep"
+    {
+        return Err("public move collision altered source or rival".to_string());
+    }
+    Ok(())
+}
+
+#[test]
+fn paste_special_files_socket_and_move_tree() -> Result<(), String> {
+    use std::os::unix::fs::FileTypeExt as _;
+    // Sockets are special files like FIFOs (Python `_ensure_tree_copyable`
+    // and `_copy_file_noreplace` refuse both). The existing
+    // `paste_refuses_special_files_without_hanging` covers FIFO copy; this
+    // covers sockets plus the move-side tree pre-check that Python tests in
+    // `test_paste_move_directory_with_fifo_keeps_source`.
+    let root = dir()?;
+    let dst_dir = root.path().join("dst");
+    std::fs::create_dir(&dst_dir).map_err(|error| error.to_string())?;
+    let sock = root.path().join("sock");
+    let _listener =
+        std::os::unix::net::UnixListener::bind(&sock).map_err(|error| error.to_string())?;
+    match paste(&sock, &dst_dir, false) {
+        Err(message) if message == "Cannot copy special file: sock" => {}
+        other => {
+            return Err(format!(
+                "socket copy: expected special-file error, got {other:?}"
+            ));
+        }
+    }
+    if dst_dir.join("sock").exists()
+        || dst_dir.join("sock").is_symlink()
+        || std::fs::symlink_metadata(dst_dir.join("sock")).is_ok()
+    {
+        return Err("failed socket paste left a destination behind".to_string());
+    }
+    // Moving a tree that contains a FIFO is refused before anything is
+    // copied or renamed; the source tree stays intact.
+    let tree = root.path().join("srcdir");
+    std::fs::create_dir(&tree).map_err(|error| error.to_string())?;
+    write(&tree.join("ok.txt"), b"ok")?;
+    make_fifo(&tree.join("pipe"))?;
+    match paste(&tree, &dst_dir, true) {
+        Err(message) if message == "Cannot copy special file: pipe" => {}
+        other => {
+            return Err(format!(
+                "move tree with fifo: expected special-file error, got {other:?}"
+            ));
+        }
+    }
+    if dst_dir.join("srcdir").exists() {
+        return Err("failed tree move left a destination behind".to_string());
+    }
+    if read(&tree.join("ok.txt"))? != b"ok" {
+        return Err("failed tree move altered the source".to_string());
+    }
+    // A lone FIFO moved on the same filesystem renames without opening it,
+    // so it cannot hang; cross-device copies of the same source are refused
+    // by the copy path (Python `test_paste_move_fifo_cross_device_fails_safe`
+    // forces `EXDEV` to reach that path, which has no public-API trigger
+    // here and stays covered by the copy refusal above).
+    let fifo = root.path().join("lone-pipe");
+    make_fifo(&fifo)?;
+    let moved = paste(&fifo, &dst_dir, true)?;
+    if fifo.exists() || std::fs::symlink_metadata(&fifo).is_ok() {
+        return Err("fifo move left the source behind".to_string());
+    }
+    let moved_type = std::fs::symlink_metadata(&moved)
+        .map_err(|error| error.to_string())?
+        .file_type();
+    if !moved_type.is_fifo() {
+        return Err("moved fifo is not a fifo".to_string());
+    }
+    Ok(())
+}
+
+#[test]
+fn cross_device_fifo_move_preserves_source_and_creates_no_destination() -> Result<(), String> {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let source_dir = dir()?;
+    let destination = tempfile::TempDir::new_in("/dev/shm").map_err(|error| error.to_string())?;
+    let source_device = source_dir
+        .path()
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .dev();
+    let destination_device = destination
+        .path()
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .dev();
+    assert_ne!(
+        source_device, destination_device,
+        "test requires distinct devices"
+    );
+    let fifo = source_dir.path().join("pipe");
+    make_fifo(&fifo)?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let source = fifo.clone();
+    let dest = destination.path().to_path_buf();
+    std::thread::spawn(move || tx.send(paste(&source, &dest, true)).unwrap());
+    let result = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .map_err(|e| e.to_string())?;
+    assert!(result.is_err(), "cross-device FIFO move must fail");
+    assert!(
+        std::fs::symlink_metadata(&fifo)
+            .map_err(|e| e.to_string())?
+            .file_type()
+            .is_fifo()
+    );
+    assert!(std::fs::symlink_metadata(destination.path().join("pipe")).is_err());
+    Ok(())
+}
+
+#[test]
+fn atomic_create_file_rejects_existing_file_and_symlinks() -> Result<(), String> {
+    let root = dir()?;
+    let real = root.path().join("real");
+    write(&real, b"keep")?;
+    let link = root.path().join("link");
+    let dangling = root.path().join("dangling");
+    std::os::unix::fs::symlink("real", &link).map_err(|e| e.to_string())?;
+    std::os::unix::fs::symlink("missing", &dangling).map_err(|e| e.to_string())?;
+    for rival in [&real, &link, &dangling] {
+        assert!(create_private_file(rival).is_err());
+    }
+    assert_eq!(read(&real)?, b"keep");
+    assert_eq!(
+        std::fs::read_link(&link).map_err(|e| e.to_string())?,
+        Path::new("real")
+    );
+    assert_eq!(
+        std::fs::read_link(&dangling).map_err(|e| e.to_string())?,
+        Path::new("missing")
+    );
+    Ok(())
+}
+
+#[test]
+fn atomic_copy_rejects_existing_file_directory_and_symlink_destinations() -> Result<(), String> {
+    let root = dir()?;
+    let source = root.path().join("source");
+    write(&source, b"source")?;
+    let rival = root.path().join("rival");
+    write(&rival, b"keep")?;
+    assert!(copy_file_noreplace(&source, &rival).is_err());
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink("rival", &link).map_err(|e| e.to_string())?;
+    assert!(copy_file_noreplace(&source, &link).is_err());
+    let source_tree = root.path().join("tree");
+    std::fs::create_dir(&source_tree).map_err(|e| e.to_string())?;
+    write(&source_tree.join("source"), b"tree")?;
+    let rival_tree = root.path().join("existing-tree");
+    std::fs::create_dir(&rival_tree).map_err(|e| e.to_string())?;
+    write(&rival_tree.join("keep"), b"rival")?;
+    assert!(copy_dir_noreplace(&source_tree, &rival_tree).is_err());
+    assert_eq!(read(&source)?, b"source");
+    assert_eq!(read(&rival)?, b"keep");
+    assert_eq!(
+        std::fs::read_link(&link).map_err(|e| e.to_string())?,
+        Path::new("rival")
+    );
+    assert_eq!(read(&source_tree.join("source"))?, b"tree");
+    assert_eq!(read(&rival_tree.join("keep"))?, b"rival");
+    Ok(())
 }

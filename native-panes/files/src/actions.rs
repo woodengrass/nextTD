@@ -143,7 +143,7 @@ fn is_real_dir(path: &Path) -> bool {
             .unwrap_or(false)
 }
 
-enum RenameError {
+pub(crate) enum RenameError {
     Exists(String),
     Unsupported(String),
     Exdev,
@@ -151,7 +151,7 @@ enum RenameError {
 }
 
 impl RenameError {
-    fn into_message(self) -> String {
+    pub(crate) fn into_message(self) -> String {
         match self {
             RenameError::Exists(message)
             | RenameError::Unsupported(message)
@@ -162,7 +162,7 @@ impl RenameError {
 }
 
 /// Atomically rename without replacing an existing destination.
-fn rename_noreplace(source: &Path, target: &Path) -> Result<(), RenameError> {
+pub(crate) fn rename_noreplace(source: &Path, target: &Path) -> Result<(), RenameError> {
     match rustix::fs::renameat_with(CWD, source, CWD, target, RenameFlags::NOREPLACE) {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -388,6 +388,74 @@ pub(crate) fn create_private_file(target: &Path) -> Result<std::fs::File, String
     })
 }
 
+/// Test-only observation of destination creation, compiled out of production.
+/// [`note_initial`] is called by the copy callers right after a destination
+/// is created and before any bytes, children, xattrs, or final metadata are
+/// written, so the record holds even if the private helpers above are
+/// bypassed. Records accumulate in one log; tests take only the entries
+/// under their own fixture path, so parallel tests never interfere.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct InitialMode {
+    pub path: PathBuf,
+    pub mode: u32,
+    pub len: u64,
+}
+
+#[cfg(test)]
+static INITIAL_MODES: std::sync::Mutex<Vec<InitialMode>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn note_initial(target: &Path) {
+    if let Ok(meta) = std::fs::symlink_metadata(target) {
+        INITIAL_MODES
+            .lock()
+            .expect("initial-mode lock")
+            .push(InitialMode {
+                path: target.to_path_buf(),
+                mode: meta.mode() & 0o777,
+                len: meta.len(),
+            });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn take_initial_modes_under(root: &Path) -> Vec<InitialMode> {
+    INITIAL_MODES
+        .lock()
+        .expect("initial-mode lock")
+        .extract_if(.., |entry| entry.path.starts_with(root))
+        .collect()
+}
+
+#[cfg(test)]
+type BetweenNote = Vec<(PathBuf, Box<dyn FnOnce() + Send>)>;
+
+#[cfg(test)]
+static BETWEEN_NOTE: std::sync::Mutex<BetweenNote> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn stash_between_note(source: &Path, note: impl FnOnce() + Send + 'static) {
+    BETWEEN_NOTE
+        .lock()
+        .expect("between-note lock")
+        .push((source.to_path_buf(), Box::new(note)));
+}
+
+#[cfg(test)]
+fn fire_between_note(source: &Path) {
+    let note = {
+        let mut notes = BETWEEN_NOTE.lock().expect("between-note lock");
+        notes
+            .iter()
+            .position(|(path, _)| path == source)
+            .map(|index| notes.swap_remove(index).1)
+    };
+    if let Some(note) = note {
+        note();
+    }
+}
+
 /// Copy a single file/symlink to a path that must not exist, atomically.
 pub(crate) fn copy_file_noreplace(source: &Path, target: &Path) -> Result<CopiedEntry, String> {
     let metadata = std::fs::symlink_metadata(source).map_err(|error| {
@@ -439,6 +507,8 @@ pub(crate) fn copy_file_noreplace(source: &Path, target: &Path) -> Result<Copied
         return Err(format!("Source changed: {}", source.display()));
     }
     let mut outgoing = create_private_file(target)?;
+    #[cfg(test)]
+    note_initial(target);
     let result = (|| {
         std::io::copy(&mut incoming, &mut outgoing).map_err(|error| error.to_string())?;
         let copied = incoming.metadata().map_err(|error| error.to_string())?;
@@ -518,6 +588,8 @@ fn copy_tree_entry(source: &Path, target: &Path) -> Result<CopiedEntry, String> 
         .file_type();
     if file_type.is_dir() {
         create_private_dir(target)?;
+        #[cfg(test)]
+        note_initial(target);
         copy_dir_contents(source, target)
     } else if file_type.is_file() || file_type.is_symlink() {
         copy_file_noreplace(source, target)
@@ -557,6 +629,8 @@ fn copy_dir_contents(source: &Path, target: &Path) -> Result<CopiedEntry, String
 pub(crate) fn copy_dir_noreplace(source: &Path, target: &Path) -> Result<CopiedEntry, String> {
     ensure_tree_copyable(source)?;
     create_private_dir(target)?;
+    #[cfg(test)]
+    note_initial(target);
     let result = copy_dir_contents(source, target);
     if result.is_err() {
         let _ = std::fs::remove_dir_all(target);
@@ -567,7 +641,7 @@ pub(crate) fn copy_dir_noreplace(source: &Path, target: &Path) -> Result<CopiedE
 /// Move without ever replacing an existing destination. Cross-device moves
 /// fall back to exclusive copy + delete so the destination is still never
 /// overwritten; the source is removed only after a successful copy.
-fn move_noreplace(source: &Path, target: &Path) -> Result<(), String> {
+pub(crate) fn move_noreplace(source: &Path, target: &Path) -> Result<(), String> {
     if is_real_dir(source) {
         ensure_tree_copyable(source)?;
     }
@@ -579,6 +653,8 @@ fn move_noreplace(source: &Path, target: &Path) -> Result<(), String> {
             } else {
                 copy_file_noreplace(source, target)?
             };
+            #[cfg(test)]
+            fire_between_note(source);
             cleanup_copied(&copied).map_err(|error| {
                 format!("Partial move: destination copied, source cleanup incomplete: {error}")
             })
