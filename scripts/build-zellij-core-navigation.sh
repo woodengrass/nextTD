@@ -19,11 +19,21 @@
 #   3. Applies the navigation patch followed by the native chrome patch.
 #   4. Builds `cargo build --locked --release --no-default-features
 #      --bin zellij` inside the exported source.
-#   5. Checks navigation commands and the native chrome version probe.
-#   6. Atomically installs the requested destination ONLY if absent (never
+#   5. When TDNEXT_TEST_PATCHED_CORE=1, runs the navigation test suites
+#      inside the SAME exported patched source (zellij-server navigation +
+#      fixed-width tests, then the full zellij-utils lib suite) and refuses
+#      to treat a filter that matched no tests as a pass.
+#   6. Checks navigation commands and the native chrome version probe.
+#   7. Atomically installs the requested destination ONLY if absent (never
 #      overwrites).
 #
 # Environment:
+#   TDNEXT_TEST_PATCHED_CORE=1 runs the patched-core test suites inside the
+#     same exported patched source before the probes/install step (default 0,
+#     production build path unchanged): the zellij-server navigation and
+#     fixed-width tests plus the full zellij-utils lib suite, per
+#     patches/zellij-0.45.1-core-navigation.md. Test failures, or a server
+#     filter that matched no passing tests, abort before install.
 #   PATH and CARGO_HOME are used as inherited from the caller's
 #   environment and are never overridden here. Install the Rust 1.95
 #   toolchain (e.g. `rustup toolchain install 1.95`) plus the upstream
@@ -131,6 +141,20 @@ BUILT_BIN="${TARGET_DIR}/release/zellij"
 if [ ! -x "${BUILT_BIN}" ]; then
   echo "error: expected build output missing: ${BUILT_BIN}" >&2
   exit 1
+fi
+
+if [ "${TDNEXT_TEST_PATCHED_CORE:-0}" = "1" ]; then
+  echo "TDNEXT_TEST_PATCHED_CORE=1: testing the exported patched source (no install until tests pass)."
+  (cd "${WORK_DIR}" && RUST_MIN_STACK=16777216 cargo test --locked --no-default-features -p zellij-utils --lib --target-dir "${TARGET_DIR}")
+  SERVER_TEST_LOG="${WORK_DIR}/zellij-server-navigation-tests.log"
+  if ! (cd "${WORK_DIR}" && RUST_MIN_STACK=16777216 cargo test --locked --no-default-features -p zellij-server --lib --target-dir "${TARGET_DIR}" -- set_pane_fixed_width navigation_ 2>&1 | tee "${SERVER_TEST_LOG}"); then
+    echo "error: zellij-server navigation/fixed-width tests failed." >&2
+    exit 1
+  fi
+  if ! grep -Eq "test result: ok\. [1-9][0-9]* passed" "${SERVER_TEST_LOG}"; then
+    echo "error: zellij-server test filter matched no passing tests; refusing to treat this as a pass." >&2
+    exit 1
+  fi
 fi
 
 ACTION_HELP="$("${BUILT_BIN}" action --help)"
