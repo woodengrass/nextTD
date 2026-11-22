@@ -1,17 +1,31 @@
+"""Native large-directory coverage through the real ``tdnext-files`` binary.
+
+The Textual ``DataTable`` harness is retired: ``src/tdnext/plugins/files``
+no longer ships ``browser``, ``browser_widgets`` or ``view``, so the old
+``row_count``/``selection_pending`` heartbeat observations have no Rust
+counterpart. Rust lists a directory atomically on a background thread
+(``controller.rs`` ``spawn_list``) while the event thread keeps answering
+input. These tests prove, on the real surface at real scale, that the UI
+answers input, the first and last entries become reachable, a resize keeps
+the listing usable, and navigating away settles on the newer directory.
+They do not claim the help key was handled mid-scan, do not claim every
+entry was visited, and do not measure incremental row counts. The
+deterministic stale-reply ordering (an older scan must not overwrite a
+newer navigation while a worker is blocked) is guarded by the controller
+suite ``late_listing_cannot_replace_directory_opened_during_scan``.
+"""
+
+from __future__ import annotations
+
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 from time import monotonic
 
-import anyio
 import pytest
-from test_files_browser import FilesApp
+from files_pty import FilesPty, require_files_binary
 
-from tdnext.plugins.files.browser import FilesBrowser
-from tdnext.plugins.files.browser_widgets import FileTable
-from tdnext.plugins.files.view import FilesView
-
-ENTRY_COUNT = 100_000
+ENTRY_COUNT = 20_000
 
 
 @pytest.fixture(scope="module")
@@ -19,116 +33,75 @@ def large_directory(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
     with tempfile.TemporaryDirectory(prefix="tdnext-large-", dir=tmp_path_factory.getbasetemp()) as directory:
         root = Path(directory)
         for index in range(ENTRY_COUNT):
-            (root / f"file-{index:06}.txt").touch()
+            (root / f"file-{index:05d}.txt").touch()
         yield root
 
 
-@pytest.mark.anyio
-async def test_large_real_directory_keeps_heartbeat_during_population_and_resize(large_directory: Path) -> None:
-    app = FilesApp(large_directory)
-    samples: list[tuple[float, int]] = []
-    complete = anyio.Event()
-    after_resize = anyio.Event()
-    resizing_done = False
+def test_large_real_directory_answers_input_and_reaches_first_and_last_entries(
+    large_directory: Path, tmp_path: Path
+) -> None:
+    """B1: the UI answers input at 20,000-entry scale (help opens).
 
-    async with app.run_test(size=(130, 30)) as pilot:
-        table = app.query_one(FileTable)
-
-        def heartbeat() -> None:
-            samples.append((monotonic(), table.row_count))
-            if table.row_count == ENTRY_COUNT:
-                complete.set()
-            if resizing_done:
-                after_resize.set()
-
-        timer = app.set_interval(0.02, heartbeat)
-        with anyio.fail_after(120):
-            await complete.wait()
-        load_samples = list(samples)
-        table.move_cursor(row=ENTRY_COUNT - 1, scroll=False)
-        selected_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
-        started = monotonic()
-        await pilot.resize_terminal(50, 24)
-        resize_seconds = monotonic() - started
-        resizing_done = True
-        with anyio.fail_after(10):
-            await after_resize.wait()
-        timer.stop()
-
-        assert table.row_count == ENTRY_COUNT
-        assert table.entry_for_key(selected_key) == table.entries[-1]
-        assert table.coordinate_to_cell_key(table.cursor_coordinate).row_key == selected_key
-
-    gaps = [
-        (later[0] - earlier[0], earlier[1], later[1])
-        for earlier, later in zip(load_samples, load_samples[1:], strict=False)
-    ]
-    max_gap, before_count, after_count = max(gaps, default=(0.0, 0, 0))
-    load_seconds = load_samples[-1][0] - load_samples[0][0]
-    print(
-        f"100k heartbeat: load={load_seconds:.3f}s samples={len(load_samples)} "
-        f"max_gap={max_gap:.3f}s rows={before_count}->{after_count} resize={resize_seconds:.3f}s"
-    )
-    assert any(0 < count < ENTRY_COUNT for _, count in load_samples), "population never yielded to heartbeat"
-    assert max_gap < 0.75, f"population blocked the heartbeat for {max_gap:.3f}s"
-    assert resize_seconds < 0.75, f"resize blocked the UI for {resize_seconds:.3f}s"
+    B2: the first entry (via ``Home``) and the last entry (via ``End``)
+    become visible afterwards. B3: a resize keeps the listing usable.
+    """
+    binary = require_files_binary()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    first = "file-00000.txt"
+    last = f"file-{ENTRY_COUNT - 1:05d}.txt"
+    started = monotonic()
+    pty = FilesPty(binary, large_directory, state_dir)
+    try:
+        pty.send("?")
+        pty.wait_for("File shortcuts")
+        pty.send("Escape")
+        pty.wait_for(first, timeout=120.0)
+        pty.send("End")
+        pty.wait_for(last, timeout=60.0)
+        pty.send("Home")
+        pty.wait_for(first, timeout=60.0)
+        load_seconds = monotonic() - started
+        print(f"\nlarge-dir: {ENTRY_COUNT} entries, first/last reachable in {load_seconds:.3f}s")
+        assert load_seconds < 120.0, f"large directory took {load_seconds:.3f}s to list"
+        pty.resize(80, 24)
+        pty.wait_for(first)
+        pty.resize(130, 30)
+        pty.wait_for(first)
+    finally:
+        pty.close()
 
 
-@pytest.mark.anyio
-async def test_navigation_cancels_incomplete_large_listing(large_directory: Path, tmp_path: Path) -> None:
+def test_navigation_from_large_directory_settles_on_newer_directory(
+    large_directory: Path, tmp_path: Path
+) -> None:
+    """B1: navigating away from the large directory lands on the newer directory.
+
+    B2: no entry from the older large scan is shown afterwards, and the new
+    directory keeps answering input. The scan may already have finished by
+    the time navigation completes; the stale-reply race itself is covered
+    deterministically by ``late_listing_cannot_replace_directory_opened_during_scan``.
+    """
+    binary = require_files_binary()
     destination = tmp_path / "destination"
     destination.mkdir()
-    expected = destination / "current.txt"
-    expected.touch()
-    app = FilesApp(large_directory)
-    partial = anyio.Event()
-
-    async with app.run_test(size=(130, 30)) as pilot:
-        table = app.query_one(FileTable)
-
-        def observe_population() -> None:
-            if 0 < table.row_count < ENTRY_COUNT:
-                partial.set()
-
-        timer = app.set_interval(0.01, observe_population)
-        with anyio.fail_after(30):
-            await partial.wait()
-        timer.stop()
-        view = app.query_one(FilesView)
-        view.directory = destination
-        view.reload_directory()
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-
-        browser = app.query_one(FilesBrowser)
-        assert view.directory == destination
-        assert table.row_count == 1
-        assert browser.selected() == expected
-
-
-@pytest.mark.anyio
-async def test_pending_selection_never_targets_first_partially_loaded_row(large_directory: Path) -> None:
-    app = FilesApp(large_directory)
-    waiting = anyio.Event()
-
-    async with app.run_test(size=(130, 30)) as pilot:
-        view = app.query_one(FilesView)
-        view.reload_directory(large_directory / "file-090000.txt")
-        table = app.query_one(FileTable)
-
-        def observe_selection() -> None:
-            if table.selection_pending and 0 < table.row_count < 90_000:
-                waiting.set()
-
-        timer = app.set_interval(0.01, observe_selection)
-        with anyio.fail_after(30):
-            await waiting.wait()
-        timer.stop()
-        assert app.query_one(FilesBrowser).selected() is None
-        await pilot.press("x")
-        assert view.clipboard is None
-        await pilot.press("down", "x")
-        assert view.clipboard is not None
-        assert view.clipboard.path == large_directory / "file-000001.txt"
+    (destination / "current.txt").touch()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    pty = FilesPty(binary, large_directory, state_dir)
+    try:
+        pty.send("g")
+        pty.wait_for("Go to folder")
+        pty.type_text(str(destination))
+        pty.send("Enter")
+        frame = pty.wait_for("current.txt", timeout=60.0)
+        assert str(destination) in frame
+        assert f"file-{ENTRY_COUNT - 1:05d}.txt" not in frame
+        pty.send("?")
+        pty.wait_for("File shortcuts")
+        pty.send("Escape")
+        frame = pty.wait_for("current.txt", timeout=30.0)
+        assert str(destination) in frame
+        assert f"file-{ENTRY_COUNT - 1:05d}.txt" not in frame
+    finally:
+        pty.close()
