@@ -1,0 +1,102 @@
+# Continuous integration for the Linux x86_64 desktop.
+#
+# Runs on pull requests and pushes to main. Setup installs toolchains from
+# the project's own files (rust-toolchain.toml, .python-version) and then
+# runs the project check entry `make check`, which owns all build, test,
+# lint, and probe logic. Tagged release smoke lives in release-smoke.yml.
+# Branch protection targets the stable `ci-required` job.
+# No step publishes anything or touches branch protection.
+#
+# Every `uses:` is pinned to a full SHA with a tag comment; see
+# github-actions-sha-pinning-fallback.adr.md.
+name: ci
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  UV_VERSION: "0.9.5"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ci:
+    name: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        working-directory: ${{ github.workspace }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            attr btop build-essential libssl-dev neovim pkg-config tmux vim
+
+      - name: Install the toolchain from rust-toolchain.toml
+        working-directory: ${{ github.workspace }}
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          test -n "${channel}"
+          rustup toolchain install --profile minimal --component rustfmt,clippy
+          case "$(rustc --version)" in
+            "rustc ${channel}."*) ;;
+            *) echo "error: expected rustc ${channel}.x, got: $(rustc --version)" >&2; exit 1 ;;
+          esac
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version-file: .python-version
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Sync locked Python environment
+        working-directory: ${{ github.workspace }}
+        run: uv sync --locked
+
+      - name: Clone the pinned upstream Zellij checkout
+        working-directory: ${{ runner.temp }}
+        run: |
+          pin="$(sed -n 's/^PINNED_HEAD="\(.*\)"/\1/p' "${GITHUB_WORKSPACE}/scripts/build-zellij-core-navigation.sh")"
+          test -n "${pin}"
+          git clone --no-checkout https://github.com/zellij-org/zellij.git zellij-ci
+          git -C zellij-ci checkout "${pin}"
+          test "$(git -C zellij-ci rev-parse HEAD)" = "${pin}"
+          echo "ZELLIJ_SRC=${RUNNER_TEMP}/zellij-ci" >> "${GITHUB_ENV}"
+
+      - name: Run the project check entry point
+        working-directory: ${{ github.workspace }}
+        run: make check
+
+  ci-required:
+    name: ci-required
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [ci]
+    if: always()
+    steps:
+      - name: Check the required results
+        working-directory: ${{ github.workspace }}
+        run: |
+          test "${{ needs.ci.result }}" = "success"
