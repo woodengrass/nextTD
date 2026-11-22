@@ -1,23 +1,7 @@
-"""Files plugin entry point."""
-
-from textual.app import App, ComposeResult
-from textual.binding import Binding
-from textual.widget import Widget
+import os
 
 from tdnext.api import PluginContext
-
-from .view import FilesView
-
-
-class FilesPane(App[None]):
-    BINDINGS = [Binding("ctrl+q", "quit", "Quit", priority=True)]
-
-    def __init__(self, context: PluginContext) -> None:
-        super().__init__()
-        self.context = context
-
-    def compose(self) -> ComposeResult:
-        yield FilesView(self.context.directory, self.context)
+from tdnext.core.errors import PluginError
 
 
 class FilesPlugin:
@@ -26,8 +10,11 @@ class FilesPlugin:
         "y/x/p copy/move   d delete"
     )
 
-    def make_view(self, context: PluginContext) -> Widget:
-        return FilesView(context.directory, context)
-
     def run_pane(self, context: PluginContext) -> None:
-        FilesPane(context).run()
+        binary = context.manager.executable("tdnext-files")
+        if binary is None:
+            raise PluginError("tdnext-files is missing; install it in state/bin or on PATH")
+        try:
+            os.execv(binary, [binary, str(context.directory)])
+        except OSError as exc:
+            raise PluginError(f"Cannot start tdnext-files: {exc}") from exc
