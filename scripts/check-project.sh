@@ -226,6 +226,9 @@ for manifest in "${CRATE_MANIFESTS[@]}"; do
   cargo test --locked --manifest-path "${manifest}" 2>&1 | tee "${TEST_LOG}"
   test "${PIPESTATUS[0]}" -eq 0 || fail "cargo test failed for ${crate_rel}."
   assert_tests_ran "${TEST_LOG}" "${crate_rel}" || fail "cargo test ran zero tests for ${crate_rel}."
+  CURRENT="cargo build --locked --release (${crate_rel})"
+  step "${CURRENT}"
+  cargo build --locked --release --manifest-path "${manifest}"
 done
 
 # 4. Pinned patched upstream core (plus its sibling suites).
