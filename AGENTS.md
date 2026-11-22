@@ -1,2 +1,3 @@
 `uv` 不在 PATH 時，可使用專案現有虛擬環境執行檢查：`.venv/bin/pytest -q`、`.venv/bin/ruff check .`、`.venv/bin/basedpyright`。
 桌面進入點為 Rust：`cargo build --locked --release --manifest-path native-desktop/Cargo.toml`；patched core：`scripts/build-zellij-core-navigation.sh <zellij-checkout> <dest>`（HEAD 須為 script 內 pinned commit，見 `patches/`）。standalone 發布須同時包含 launcher 與同版 patched core（預設為執行檔旁的 `tdnext-core`，或 `--core` 指定），不可用 stock Zellij。Python wheel 只含工具與管理 CLI，不打包 WASM/broker/core；Python 工具安裝不需 Rust/Zellij。
+獨立 Files pane：`cargo build --locked --release --manifest-path native-panes/files/Cargo.toml`；`cargo test --locked --manifest-path native-panes/files/Cargo.toml`；直接執行 `native-panes/files/target/release/tdnext-files [DIRECTORY]`。
