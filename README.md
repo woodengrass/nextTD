@@ -2,9 +2,9 @@
 
 Terminal Desktop Next is a terminal desktop entered through a native Rust
 launcher running on a patched Zellij core. The launcher draws the desktop
-chrome; content tools run as independent programs beside it. The Python
-packages in this repository provide content tools (Files, Settings) and the
-`tdnext` management CLI. They do not start the desktop.
+chrome; content tools run as independent programs beside it. Files runs as
+the Rust executable `tdnext-files`. The Python packages provide Settings,
+other content tools, and the `tdnext` management CLI.
 
 A standalone desktop distribution is the launcher plus its matching patched
 core shipped together. The launcher probes the core at startup and refuses
@@ -33,6 +33,18 @@ cargo build --locked --release --manifest-path native-desktop/Cargo.toml
 ```
 
 This produces `native-desktop/target/release/tdnext-desktop`.
+
+To include the Files view, also build its executable:
+
+```sh
+cargo build --locked --release --manifest-path native-panes/files/Cargo.toml
+```
+
+Use `native-panes/files/target/release/tdnext-files` directly, or place it
+on `PATH` and set `"command":"tdnext-files"` in the Files view of
+`desktop.json`. If migrating a hand-written view, remove the old Python
+`-m tdnext.pane view files` arguments. The desktop passes the initial
+directory through `TDNEXT_DIRECTORY`.
 
 Build the matching patched core from a local Zellij checkout. The script
 verifies the checkout HEAD is the pinned commit, applies the patches in

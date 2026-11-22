@@ -28,6 +28,7 @@ directory. Programs inherit the working directory and their arguments exactly;
 no shell is used to interpret configured commands. This core supports one
 attached client per desktop session.
 
-The launcher and shell-only desktop do not use Python. Existing Files,
-Settings and other Python content packages are not ported or bundled here;
-they can only be configured as external programs with their own dependencies.
+The launcher and shell-only desktop do not use Python. Files is the Rust
+program `tdnext-files`: use its full path as the view's `command` or install
+it on `PATH`. Settings and other Python content packages can be configured
+as external programs with their own dependencies.

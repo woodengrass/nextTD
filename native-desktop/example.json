@@ -1,5 +1,6 @@
 {
   "views": [
+    {"id":"files", "name":"Files", "icon":"F", "placement":"sidebar", "command":"tdnext-files", "shortcuts":"Enter open   Backspace up   ? help   v preview   b folders   g path   n folder   r rename   y/x/p copy/move   d delete"},
     {"id":"shell", "name":"Shell", "icon":">_", "placement":"sidebar", "command":"/bin/sh"},
     {"id":"monitor", "name":"Monitor", "icon":"M", "placement":"sidebar", "command":"top"},
     {"id":"settings", "name":"Tools", "icon":"S", "placement":"header", "command":"/bin/sh", "shortcuts":"run $TDNEXT_ZELLIJ action return-to-origin"}
