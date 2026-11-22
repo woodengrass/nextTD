@@ -5,13 +5,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from tdnext.core.errors import PluginError
-from tdnext.core.state import StateStore
-from tdnext.plugins.files.editor_preferences import (
+from tdnext.core.editor_preferences import (
     EditorChoice,
     EditorPreferences,
     EditorPreferencesStore,
 )
+from tdnext.core.errors import PluginError
+from tdnext.core.state import StateStore
 
 
 def test_default_editor_is_environment() -> None:

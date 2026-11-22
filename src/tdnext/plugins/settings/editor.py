@@ -9,8 +9,8 @@ from textual.message import Message
 from textual.widgets import Select, Static
 
 from tdnext.api import PluginContext
+from tdnext.core.editor_preferences import EditorChoice, EditorPreferences, EditorPreferencesStore
 from tdnext.core.errors import PluginError
-from tdnext.plugins.files.editor_preferences import EditorChoice, EditorPreferences, EditorPreferencesStore
 
 from .appearance import AppearanceField
 

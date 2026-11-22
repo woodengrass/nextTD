@@ -6,8 +6,8 @@ from textual.containers import VerticalScroll
 from textual.widgets import Select
 from textual.widgets._select import SelectOverlay
 
+from tdnext.core.editor_preferences import EditorPreferencesStore
 from tdnext.plugins.desktop.tool import ToolPane
-from tdnext.plugins.files.editor_preferences import EditorPreferencesStore
 from tdnext.plugins.settings.plugin import SettingsPlugin
 
 

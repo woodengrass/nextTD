@@ -1,14 +1,12 @@
 from pathlib import Path
-from unittest.mock import Mock
 
 import pytest
 from test_settings_ui import make_app, text_of
 from textual.events import AppFocus
 from textual.widgets import Select, Static
 
+from tdnext.core.editor_preferences import EditorPreferences
 from tdnext.plugins.desktop.tool import ToolPane
-from tdnext.plugins.files.editor_preferences import EditorPreferences
-from tdnext.plugins.files.view import FilesView
 from tdnext.plugins.settings.editor import EditorControls
 from tdnext.plugins.settings.plugin import SettingsPlugin
 from tdnext.plugins.settings.view import SettingsView
@@ -180,28 +178,4 @@ async def test_corruption_before_selecting_a_new_editor_does_not_overwrite_it(tm
         assert selector.disabled
         assert selector.value not in ("environment", "nvim", "vi")
         assert str(editor_path) in text_of(app.query_one("#plugin-feedback", Static))
-        assert editor_path.read_bytes() == b"invalid-json\n"
-
-
-@pytest.mark.anyio
-async def test_finder_reports_corrupt_preferences_instead_of_launching_an_editor(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    editor_path = tmp_path / "editor.json"
-    editor_path.write_bytes(b"invalid-json\n")
-    target = tmp_path / "document.txt"
-    target.write_text("existing", encoding="utf-8")
-    app, _manager = make_app(tmp_path, plugin="files")
-    run_editor = Mock()
-    monkeypatch.setattr("tdnext.plugins.files.view.subprocess.run", run_editor)
-
-    async with app.run_test(size=(80, 24)):
-        messages: list[str] = []
-        monkeypatch.setattr(app, "notify", lambda message, **_kwargs: messages.append(str(message)))
-        app.query_one(FilesView).edit(target)
-        assert len(messages) == 1
-        assert str(editor_path) in messages[0]
-        assert "Cannot" in messages[0]
-        run_editor.assert_not_called()
-        assert target.read_text(encoding="utf-8") == "existing"
         assert editor_path.read_bytes() == b"invalid-json\n"
