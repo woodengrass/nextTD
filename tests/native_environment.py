@@ -36,10 +36,24 @@ def resolve_desktop() -> str:
     raise pytest.skip.Exception(f"native test requires the built desktop at {desktop}")
 
 
+def resolve_files() -> str:
+    candidate = os.environ.get("TDNEXT_FILES_BINARY") or str(
+        ROOT / "native-panes" / "files" / "target" / "release" / "tdnext-files"
+    )
+    source = Path(candidate)
+    if source.is_file() and os.access(source, os.X_OK):
+        return str(source)
+    raise pytest.fail.Exception(
+        f"native test requires the built Files binary at {candidate}: "
+        "build with cargo build --locked --release --manifest-path native-panes/files/Cargo.toml"
+    )
+
+
 @pytest.fixture
 def native_env(tmp_path: Path) -> Iterator[tuple[dict[str, str], str]]:
     core = resolve_core()
     desktop = resolve_desktop()
+    files = resolve_files()
     python = sys.executable
     if not shutil.which("tmux"):
         pytest.skip("native test requires tmux")
@@ -54,9 +68,10 @@ def native_env(tmp_path: Path) -> Iterator[tuple[dict[str, str], str]]:
     env = {key: value for key, value in os.environ.items() if key not in excluded}
     with TemporaryDirectory(prefix="tdn-") as socket:
         env.update({
-            "TERM": "xterm-256color", "TDNEXT_STATE_DIR": str(state), "ZELLIJ_SOCKET_DIR": socket,
+            "TERM": "xterm-256-color", "TDNEXT_STATE_DIR": str(state), "ZELLIJ_SOCKET_DIR": socket,
             "TDNEXT_TEST_TMUX_SOCKET": str(Path(socket) / "tmux.sock"),
             "TDNEXT_CORE_BINARY": core, "TDNEXT_DESKTOP_BINARY": desktop, "TDNEXT_PYTHON": python,
+            "TDNEXT_FILES_BINARY": files,
             "PYTHONPATH": str(ROOT / "src"),
             "XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_CACHE_HOME": str(tmp_path / "cache"),
             "XDG_DATA_HOME": str(tmp_path / "data"),

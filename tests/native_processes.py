@@ -57,6 +57,24 @@ def terminate_tagged(tag: str) -> None:
                     raise AssertionError(f"Tagged process did not exit after SIGKILL: pidfd={handle}")
 
 
+def pane_id_of(environ: list[bytes]) -> str:
+    raw = next(
+        (entry.removeprefix(b"ZELLIJ_PANE_ID=") for entry in environ if entry.startswith(b"ZELLIJ_PANE_ID=")),
+        b"",
+    )
+    try:
+        return os.fsdecode(raw)
+    except (ValueError, OSError):
+        return ""
+
+
+def exe_matches_expected(pid: int, expected_binary: str) -> bool:
+    try:
+        return os.path.samefile(f"/proc/{pid}/exe", expected_binary)
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        return False
+
+
 def monitor_pid(name: str, tag: str) -> int | None:
     marker = f"ZELLIJ_SESSION_NAME={name}".encode()
     for pid, environ, command in tagged_processes(tag):

@@ -25,7 +25,11 @@ def attached_session(tag: str, expected_tabs: int) -> str | None:
     return _attached_session(tag, expected_tabs)
 
 
-def views_for_state(state_dir: Path, python: str) -> list[dict[str, object]]:
+def default_files_binary() -> Path:
+    return Path(__file__).parents[1] / "native-panes" / "files" / "target" / "release" / "tdnext-files"
+
+
+def views_for_state(state_dir: Path, python: str, files_binary: str) -> list[dict[str, object]]:
     try:
         import json as _json
 
@@ -44,11 +48,18 @@ def views_for_state(state_dir: Path, python: str) -> list[dict[str, object]]:
     }
     views: list[dict[str, object]] = []
     for name in sidebar:
-        views.append({
-            "id": name, "name": name.capitalize(), "icon": name[0].upper() if name else "?",
-            "placement": "sidebar", "command": python, "args": ["-m", "tdnext.pane", "view", name],
-            "shortcuts": shortcuts.get(name, ""),
-        })
+        if name == "files":
+            views.append({
+                "id": name, "name": name.capitalize(), "icon": name[0].upper() if name else "?",
+                "placement": "sidebar", "command": files_binary, "args": [],
+                "shortcuts": shortcuts.get(name, ""),
+            })
+        else:
+            views.append({
+                "id": name, "name": name.capitalize(), "icon": name[0].upper() if name else "?",
+                "placement": "sidebar", "command": python, "args": ["-m", "tdnext.pane", "view", name],
+                "shortcuts": shortcuts.get(name, ""),
+            })
     if "settings" in enabled:
         views.append({
             "id": "settings", "name": "Settings", "icon": "S", "placement": "header",
@@ -63,9 +74,10 @@ class NativeSession:
 
     Each session owns a private tmux server, a private Zellij socket dir,
     and a private state dir (from the ``native_env`` fixture). Content
-    programs are the original Python Files/Settings panes; the desktop
-    chrome and navigation (Alt+o/Esc, bare ``tdnext-header:settings`` tab)
-    come from the supported Rust core/desktop under test.
+    programs are the Rust Files pane (``tdnext-files``) and the Python
+    Settings tool; the desktop chrome and navigation (Alt+o/Esc, bare
+    ``tdnext-header:settings`` tab) come from the supported Rust
+    core/desktop under test.
     """
 
     def __init__(
@@ -75,14 +87,23 @@ class NativeSession:
         self.binary = binary
         desktop = env.get("TDNEXT_DESKTOP_BINARY", "")
         python = env.get("TDNEXT_PYTHON", sys.executable)
+        files_binary = env.get("TDNEXT_FILES_BINARY", "")
+        if not files_binary:
+            files_binary = str(default_files_binary())
         if not desktop:
             root_dir = Path(__file__).parents[1]
             desktop = str(root_dir / "native-desktop" / "target" / "release" / "tdnext-desktop")
         self.desktop = desktop
+        self.files_binary = files_binary
+        if not Path(files_binary).is_file():
+            raise RuntimeError(
+                f"Rust Files binary is missing at {files_binary}: "
+                "build with cargo build --locked --release --manifest-path native-panes/files/Cargo.toml"
+            )
         state_dir = Path(env["TDNEXT_STATE_DIR"])
         config_path = state_dir / "desktop.json"
         config_path.write_text(
-            json.dumps({"views": views_for_state(state_dir, python)}), encoding="utf-8",
+            json.dumps({"views": views_for_state(state_dir, python, files_binary)}), encoding="utf-8",
         )
         self.tmux_socket = env["TDNEXT_TEST_TMUX_SOCKET"]
         self.tmux_name = f"tdnext-{uuid.uuid4().hex}"
