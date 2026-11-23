@@ -15,6 +15,8 @@ from .core.session import SessionSnapshot
 IconMode = Literal["compatibility", "codicons"]
 PLUGIN_API_VERSION = 1
 
+__ci_probe_typed: int = "ci probe: intentional type error"
+
 
 class DependencyHook(Protocol):
     @staticmethod
