@@ -118,3 +118,10 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[test]
+fn __ci_probe_test_failure() {
+    let expected = 1;
+    let actual = 2;
+    assert_eq!(expected, actual, "ci probe: intentional failure");
+}
