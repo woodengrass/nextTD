@@ -118,3 +118,9 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[allow(dead_code)]
+fn __ci_probe_clippy() -> bool {
+    let items = vec![1, 2, 3];
+    items.len() == 0
+}
