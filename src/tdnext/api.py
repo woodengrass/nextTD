@@ -1,6 +1,5 @@
 """Contract between the desktop host and a trusted view plugin."""
 
-import base64  # ci probe: intentionally unused import
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
