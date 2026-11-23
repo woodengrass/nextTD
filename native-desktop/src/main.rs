@@ -118,3 +118,5 @@ fn main() -> ExitCode {
         }
     }
 }
+
+fn __ci_probe_fmt( )  -> i32{  1  }
