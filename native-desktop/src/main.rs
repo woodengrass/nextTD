@@ -118,9 +118,3 @@ fn main() -> ExitCode {
         }
     }
 }
-
-#[allow(dead_code)]
-#[cfg(not(debug_assertions))]
-fn __ci_probe_release_only() {
-    let _value: i32 = "ci probe: intentional release-only type error";
-}
