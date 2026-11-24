@@ -1,0 +1,39 @@
+# golden-screen v1 cols=120 rows=38
+\x1b[40m \x1b[1m\x1b[97mTERMINAL DESKTOP\x1b[0m\x1b[40m                                                                                    \x1b[1;7m\x1b[97m Settings [Alt+o] \x1b[0m\x1b[40m 
+\x1b[38;2;128;128;128m\x1b[49m─────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────
+\x1b[39m\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m$ printf 'GOLDEN_RESULT:%s\\n' hello                                                               
+\x1b[40m \x1b[97mF7: Collapse\x1b[39m        \x1b[38;2;128;128;128m\x1b[49m│\x1b[39mGOLDEN_RESULT:hello                                                                               
+\x1b[40m \x1b[1m\x1b[97mWORKSPACE\x1b[0m\x1b[40m           \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m$                                                                                                 
+\x1b[40m \x1b[1m\x1b[97m                   \x1b[0m\x1b[40m \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m \x1b[37mVIEWS\x1b[39m               \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m \x1b[37m                   \x1b[39m \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m \x1b[97m  ▤    Files\x1b[39m        \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m \x1b[97m  ▥    Monitor\x1b[39m      \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m \x1b[46m                   \x1b[40m \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m \x1b[1m\x1b[97m\x1b[46m> >_   Shell\x1b[0m\x1b[46m       \x1b[40m \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m \x1b[46m                   \x1b[40m \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m \x1b[37mAlt+1..9 switch\x1b[39m     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m                                                                                                  
+\x1b[40m \x1b[37mCtrl+q quit\x1b[39m         \x1b[38;2;128;128;128m\x1b[49m├──────────────────────────────────────────────────────────────────────────────────────────────────
+\x1b[39m\x1b[40m \x1b[37m                   \x1b[39m \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[97mTool (Shell): Shell keys   Ctrl+g Zellij lock\x1b[39m                                                    
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[97mGlobal: Ctrl+q quit Ctrl+p panes Alt+o header Alt+1..3 views\x1b[39m                                     
