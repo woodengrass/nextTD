@@ -1,10 +1,11 @@
-# Tagged release smoke for the Linux x86_64 desktop.
+# Tagged release for the Linux x86_64 desktop.
 #
-# Runs only on `v*` tags. One job builds once via the project check entry
-# `make check` (same closure as `ci`, no duplicated build) and then smokes
-# those binaries: scrubbed-runtime probes, the packaged Files view over
-# tmux, and the wheel outside the source tree. Nothing is published.
-# No step touches branch protection.
+# Runs only on `v*` tags. One job runs the project check entry `make check`
+# exactly once (the same closure as `ci`, no duplicated build); the check
+# stages, archives, and verifies the distribution itself, then exports the
+# tested archive bytes plus `<archive>.sha256` (sha256sum text format) via
+# ARCHIVE_OUT. This workflow publishes exactly those tested bytes and never
+# rebuilds, re-archives, or re-verifies. Nothing touches branch protection.
 #
 name: release-smoke
 
@@ -32,6 +33,8 @@ jobs:
     name: smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    permissions:
+      contents: write
     steps:
       - name: Check out the repository
         uses: actions/checkout@v7.0.1
@@ -39,14 +42,12 @@ jobs:
           persist-credentials: false
 
       - name: Install system dependencies
-        working-directory: ${{ github.workspace }}
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             attr btop build-essential libssl-dev neovim pkg-config tmux vim
 
       - name: Install the toolchain from rust-toolchain.toml
-        working-directory: ${{ github.workspace }}
         run: |
           channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
           test -n "${channel}"
@@ -56,19 +57,18 @@ jobs:
             *) echo "error: expected rustc ${channel}.x, got: $(rustc --version)" >&2; exit 1 ;;
           esac
 
-      - name: Set up Python
+      - name: Set up Python for developer checks
         uses: actions/setup-python@v7.1.0
         with:
           python-version-file: .python-version
 
-      - name: Set up uv
+      - name: Set up uv for developer checks
         uses: astral-sh/setup-uv@v10.4.0
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
 
       - name: Sync locked Python environment
-        working-directory: ${{ github.workspace }}
         run: uv sync --locked
 
       - name: Clone the pinned upstream Zellij checkout
@@ -81,77 +81,16 @@ jobs:
           test "$(git -C zellij-ci rev-parse HEAD)" = "${pin}"
           echo "ZELLIJ_SRC=${RUNNER_TEMP}/zellij-ci" >> "${GITHUB_ENV}"
 
-      - name: Run the project check entry point
-        working-directory: ${{ github.workspace }}
-        run: make check
+      - name: Run the project check entry point (exports the tested archive)
+        run: make check ARCHIVE_OUT="${RUNNER_TEMP}/tdnext-linux-x86_64.tar.gz"
 
-      - name: Smoke the release binaries in a scrubbed runtime
-        working-directory: ${{ github.workspace }}
+      - name: Publish the tested native archive
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          test "$(uname -m)" = "x86_64"
-          mkdir -p "${RUNNER_TEMP}/smoke-home"
-          test -s patches/LICENSE.zellij-0.45.1
-          for binary in native-desktop/target/release/tdnext-desktop native-desktop/target/release/tdnext-core native-panes/files/target/release/tdnext-files; do
-            test -x "${binary}"
-            test "$(stat -c %a "${binary}")" = 755
-            file "${binary}" | grep -q "x86-64"
-          done
-          # A bare-bones runtime: scrubbed environment, stock system PATH only,
-          # no virtualenv, no Rust/Python env vars.
-          env -i HOME="${RUNNER_TEMP}/smoke-home" PATH="/usr/bin:/bin" \
-            "${GITHUB_WORKSPACE}/native-desktop/target/release/tdnext-core" --tdnext-chrome-version | grep -qx "1"
-          env -i HOME="${RUNNER_TEMP}/smoke-home" PATH="/usr/bin:/bin" \
-            "${GITHUB_WORKSPACE}/native-desktop/target/release/tdnext-desktop" --help >/dev/null
-          # tdnext-files takes a directory, not flags, so it is not executed
-          # headless; its executable mode and architecture are checked above.
-          # The launcher must refuse anything but its matching patched core.
-          if env -i HOME="${RUNNER_TEMP}/smoke-home" PATH="/usr/bin:/bin" \
-            "${GITHUB_WORKSPACE}/native-desktop/target/release/tdnext-desktop" --core /bin/true . 2>desktop-reject.log; then
-            echo "release-smoke: error: desktop accepted an incompatible core." >&2
-            exit 1
-          fi
-          grep -q "not a compatible tdnext chrome" desktop-reject.log
-
-      - name: Open the packaged Files view without Python on PATH
-        working-directory: ${{ github.workspace }}
-        run: |
-          mkdir -p "${RUNNER_TEMP}/workspace" "${RUNNER_TEMP}/runtime-bin" "${RUNNER_TEMP}/smoke-home"
-          touch "${RUNNER_TEMP}/workspace/package-smoke-marker"
-          ln -sf /bin/sh "${RUNNER_TEMP}/runtime-bin/sh"
-          printf '{"views":[{"id":"files","name":"Files","placement":"sidebar","command":"%s/native-panes/files/target/release/tdnext-files"}]}' "$PWD" > "${RUNNER_TEMP}/desktop-smoke.json"
-          socket="${RUNNER_TEMP}/smoke.sock"
-          trap 'tmux -S "$socket" kill-server 2>/dev/null || true' EXIT
-          tmux -S "$socket" -f /dev/null new-session -d -s pkg -x 120 -y 36 \
-            /usr/bin/env -i HOME="${RUNNER_TEMP}/smoke-home" PATH="${RUNNER_TEMP}/runtime-bin" SHELL=/bin/sh TERM=xterm-256color \
-            "$PWD/native-desktop/target/release/tdnext-desktop" --config "${RUNNER_TEMP}/desktop-smoke.json" "${RUNNER_TEMP}/workspace"
-          for _ in {1..100}; do
-            tmux -S "$socket" capture-pane -p -t pkg > "${RUNNER_TEMP}/frame.txt"
-            if grep -Fq package-smoke-marker "${RUNNER_TEMP}/frame.txt"; then break; fi
-            sleep 0.2
-          done
-          grep -F package-smoke-marker "${RUNNER_TEMP}/frame.txt" || { cat "${RUNNER_TEMP}/frame.txt"; exit 1; }
-          tmux -S "$socket" send-keys -t pkg C-q
-          for _ in {1..50}; do tmux -S "$socket" has-session -t pkg 2>/dev/null || exit 0; sleep 0.2; done
-          exit 1
-
-      - name: Smoke the wheel outside the source tree with no Rust on PATH
-        working-directory: ${{ github.workspace }}
-        run: |
-          uv build --wheel --out-dir "${RUNNER_TEMP}/tdnext-wheel"
-          wheel="$(echo "${RUNNER_TEMP}"/tdnext-wheel/*.whl)"
-          test -f "${wheel}"
-          py="$(cat .python-version)"
-          test -n "${py}"
-          uv venv "${RUNNER_TEMP}/wheel-env" --python "${py}"
-          mkdir -p "${RUNNER_TEMP}/wheel-state" "${RUNNER_TEMP}/wheel-cwd"
-          cd "${RUNNER_TEMP}/wheel-cwd"
-          uv pip install --python "${RUNNER_TEMP}/wheel-env/bin/python" "${wheel}"
-          # Exercise the wheel with a PATH that sees no Rust toolchain.
-          if PATH="/usr/bin:/bin" command -v rustc || PATH="/usr/bin:/bin" command -v cargo; then
-            echo "release-smoke: error: Rust toolchain visible on the minimal smoke PATH." >&2
-            exit 1
-          fi
-          env PATH="/usr/bin:/bin" TDNEXT_STATE_DIR="${RUNNER_TEMP}/wheel-state" \
-            "${RUNNER_TEMP}/wheel-env/bin/tdnext" --help >/dev/null
-          env PATH="/usr/bin:/bin" TDNEXT_STATE_DIR="${RUNNER_TEMP}/wheel-state" \
-            "${RUNNER_TEMP}/wheel-env/bin/tdnext" list
+          test -f "${RUNNER_TEMP}/tdnext-linux-x86_64.tar.gz"
+          test -f "${RUNNER_TEMP}/tdnext-linux-x86_64.tar.gz.sha256"
+          (cd "${RUNNER_TEMP}" && sha256sum -c tdnext-linux-x86_64.tar.gz.sha256)
+          gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes \
+            "${RUNNER_TEMP}/tdnext-linux-x86_64.tar.gz" \
+            "${RUNNER_TEMP}/tdnext-linux-x86_64.tar.gz.sha256"
