@@ -18,7 +18,7 @@ new file mode 100644
 index 0000000..bfa458d
 --- /dev/null
 +++ b/zellij-server/src/desktop_chrome.rs
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,229 @@
 +use serde::Deserialize;
 +use std::collections::HashSet;
 +use std::path::Path;
@@ -97,12 +97,6 @@ index 0000000..bfa458d
 +    }).collect()
 +}
 +
-+fn padded(text: &str, width: usize) -> String {
-+    let text = clip(text, width);
-+    let padding = width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
-+    format!("{text}{}", " ".repeat(padding))
-+}
-+
 +pub(crate) enum Click<'a> {
 +    Toggle,
 +    Sidebar(&'a str),
@@ -136,23 +130,27 @@ index 0000000..bfa458d
 +    pub fn render(&self, size: Size, active_tab: &str, sidebar_tab: &str, live_tabs: &HashSet<&str>) -> Vec<String> {
 +        let viewport = content_viewport(size);
 +        if size.rows == 0 || size.cols == 0 { return Vec::new(); }
-+        let color_term = std::env::var("COLORTERM").unwrap_or_default().to_ascii_lowercase();
-+        let term = std::env::var("TERM").unwrap_or_default().to_ascii_lowercase();
-+        let (surface, selected_bg, separator_color, foreground, muted) = if color_term == "truecolor" || color_term == "24bit" {
-+            ("\x1b[48;2;25;27;29m", "\x1b[48;2;147;184;179m", "\x1b[38;2;128;128;128m", "\x1b[38;2;224;224;224m", "\x1b[38;2;128;128;128m")
-+        } else if term.ends_with("-256color") {
-+            ("\x1b[48;5;234m", "\x1b[48;5;109m", "\x1b[38;2;128;128;128m", "\x1b[38;5;253m", "\x1b[38;5;244m")
-+        } else {
-+            ("\x1b[40m", "\x1b[46m", "\x1b[38;2;128;128;128m", "\x1b[97m", "\x1b[37m")
-+        };
++        let (surface, raised, selected_bg, selected_fg, separator_color, foreground, muted) =
++            ("\x1b[40m", "\x1b[40m", "\x1b[46m", "\x1b[97m", "\x1b[38;2;128;128;128m", "\x1b[97m", "\x1b[37m");
 +        let mut output = Vec::new();
 +        if viewport.y > 0 {
-+            let header = self.items.iter().filter(|item| matches!(item.placement, Placement::Header))
-+                .enumerate().map(|(index, item)| format!(" {}{} ", item.name, if index == 0 { " [Alt+o]" } else { "" })).collect::<String>();
-+            let start = size.cols.saturating_sub(UnicodeWidthStr::width(header.as_str()).saturating_add(1));
++            let headers: Vec<_> = self.items.iter().filter(|item| matches!(item.placement, Placement::Header))
++                .enumerate().map(|(index, item)| format!(" {}{} ", item.name, if index == 0 { " [Alt+o]" } else { "" })).collect();
++            let width: usize = headers.iter().map(|label| UnicodeWidthStr::width(label.as_str()) + 2).sum();
++            let start = size.cols.saturating_sub(width);
 +            let title = clip("TERMINAL DESKTOP", start.saturating_sub(1));
 +            let title_padding = start.saturating_sub(1 + UnicodeWidthStr::width(title.as_str()));
-+            output.push(format!("\x1b[1;1H{surface}{}{foreground}\x1b[1m{title}\x1b[0m{surface}{}{foreground}\x1b[1;7m{}\x1b[0m{surface} ", if start > 0 { " " } else { "" }, " ".repeat(title_padding), clip(&header, size.cols.saturating_sub(start).saturating_sub(1))));
++            let mut header = format!("\x1b[1;1H{surface}{}{foreground}\x1b[1m{title}\x1b[0m{surface}{}", if start > 0 { " " } else { "" }, " ".repeat(title_padding));
++            let mut remaining = size.cols - start;
++            for label in headers {
++                if remaining == 0 { break; }
++                let label = clip(&label, remaining - 1);
++                let label_width = UnicodeWidthStr::width(label.as_str());
++                remaining -= 1 + label_width;
++                header.push_str(&format!("{raised} {foreground}\x1b[1;7m{label}\x1b[0m{raised}"));
++                if remaining > 0 { header.push(' '); remaining -= 1; }
++            }
++            output.push(header);
 +        }
 +        if viewport.y > 1 {
 +            let left = viewport.x.saturating_sub(1);
@@ -168,7 +166,7 @@ index 0000000..bfa458d
 +            let available = item.is_some_and(|item| live_tabs.contains(item.tab_name.as_str()));
 +            let selected = available && item.is_some_and(|item| item.tab_name == sidebar_tab);
 +            let text = if offset == 1 {
-+                if collapsed { " F7: >".to_owned() } else { " F7: Collapse".to_owned() }
++                if collapsed { " Expand".to_owned() } else { " F7: Collapse".to_owned() }
 +            } else if offset == 2 && !collapsed { " WORKSPACE".to_owned() }
 +            else if offset == 4 && !collapsed { " VIEWS".to_owned() }
 +            else if rail.hints == Some(row) { " Alt+1..9 switch".to_owned() }
@@ -177,21 +175,22 @@ index 0000000..bfa458d
 +                item.map(|item| {
 +                    let marker = if selected && item.tab_name == active_tab { ">" } else { " " };
 +                    let name = if item.name.is_empty() { &item.id } else { &item.name };
-+                    if collapsed { format!("{marker} {}", item.icon) } else { format!("{marker} {}    {name}", item.icon) }
++                    if collapsed { format!("{marker} {}", item.icon) } else { format!("{marker} {}{} {name}", item.icon, " ".repeat(4usize.saturating_sub(UnicodeWidthStr::width(item.icon.as_str())))) }
 +                }).unwrap_or_default()
 +            } else { String::new() };
 +            let tile = selected && offset >= 6 && row < viewport.y + viewport.rows;
-+            let background = if tile { selected_bg } else { surface };
++            let background = if tile { selected_bg } else if offset >= 6 && rail.hints.is_none_or(|first| row < first) { raised } else { surface };
 +            if viewport.x == 1 {
 +                output.push(format!("\x1b[{};1H\x1b[49m{separator_color}│\x1b[0m", row + 1));
 +            } else {
-+                let color = if (item.is_some() && !available) || offset == 4 && !collapsed || rail.hints.is_some_and(|first| row == first || row == first + 1) { muted } else { foreground };
++                let color = if tile && !text.is_empty() { selected_fg } else if (item.is_some() && !available) || offset == 4 && !collapsed || offset == 5 && !collapsed || rail.hints.is_some_and(|first| row >= first && row <= first + 2) { muted } else { foreground };
 +                let label = if item.is_some() { text.as_str() } else { text.strip_prefix(' ').unwrap_or(&text) };
 +                let width = viewport.x.saturating_sub(3);
-+                let weight = if !label.is_empty() && (tile || offset == 2 && !collapsed) { "\x1b[1m" } else { "" };
++                let weight = if (!label.is_empty() && tile) || (offset == 2 || offset == 3) && !collapsed { "\x1b[1m" } else { "" };
 +                let label = clip(label, width);
 +                let padding = width.saturating_sub(UnicodeWidthStr::width(label.as_str()));
-+                output.push(format!("\x1b[{};1H{surface} {background}{color}{weight}{label}\x1b[0m{background}{}{surface} \x1b[49m{separator_color}│\x1b[0m", row + 1, " ".repeat(padding)));
++                let blank_style = !collapsed && (offset == 3 || offset == 5 || rail.hints.is_some_and(|first| row == first + 2));
++                output.push(format!("\x1b[{};1H{surface} {background}{color}{weight}{label}{}{background}{}\x1b[0m{surface} \x1b[49m{separator_color}│\x1b[0m", row + 1, if blank_style { "" } else { "\x1b[0m" }, " ".repeat(padding)));
 +            }
 +        }
 +        let bottom = size.rows.saturating_sub(viewport.y + viewport.rows);
@@ -203,14 +202,18 @@ index 0000000..bfa458d
 +            let tool = self.items.iter().find(|item| item.tab_name == active_tab)
 +                .map(|item| format!("Tool ({}): {}", item.name, item.shortcuts))
 +                .unwrap_or_else(|| "No views enabled".to_owned());
-+            output.push(format!("\x1b[{};{}H{surface}{foreground}{}\x1b[0m", viewport.y + viewport.rows + separator + 1, viewport.x + 1, padded(&format!(" {tool}"), viewport.cols)));
++            let tool_width = viewport.cols.saturating_sub(2);
++            let tool_text = if UnicodeWidthStr::width(tool.as_str()) > tool_width { format!("{}…", clip(&tool, tool_width.saturating_sub(1))) } else { tool };
++            output.push(format!("\x1b[{};{}H{surface} {foreground}{tool_text}\x1b[39m{} \x1b[0m", viewport.y + viewport.rows + separator + 1, viewport.x + 1, " ".repeat(tool_width.saturating_sub(UnicodeWidthStr::width(tool_text.as_str())))));
 +            if bottom > 1 {
 +                let mut hints = String::from("Global: Ctrl+q quit Ctrl+p panes");
 +                if self.items.iter().any(|item| matches!(item.placement, Placement::Header)) { hints.push_str(" Alt+o header"); }
 +                let count = self.items.iter().filter(|item| matches!(item.placement, Placement::Sidebar)).count().min(9);
 +                if count == 1 { hints.push_str(" Alt+1 view"); }
 +                else if count > 1 { hints.push_str(&format!(" Alt+1..{count} views")); }
-+                output.push(format!("\x1b[{};{}H{surface}{foreground}{}\x1b[0m", size.rows, viewport.x + 1, padded(&format!(" {hints}"), viewport.cols)));
++                let hint_width = viewport.cols.saturating_sub(2);
++                let hint_text = if UnicodeWidthStr::width(hints.as_str()) > hint_width { format!("{}…", clip(&hints, hint_width.saturating_sub(1))) } else { hints };
++                output.push(format!("\x1b[{};{}H{surface} {foreground}{hint_text}\x1b[39m{} \x1b[0m", size.rows, viewport.x + 1, " ".repeat(hint_width.saturating_sub(UnicodeWidthStr::width(hint_text.as_str())))));
 +            }
 +        }
 +        output
@@ -220,11 +223,11 @@ index 0000000..bfa458d
 +        let viewport = content_viewport(size);
 +        if viewport.y > 0 && row == 0 {
 +            let header_width: usize = self.items.iter().filter(|item| matches!(item.placement, Placement::Header))
-+                .enumerate().map(|(index, item)| UnicodeWidthStr::width(format!(" {}{} ", item.name, if index == 0 { " [Alt+o]" } else { "" }).as_str())).sum();
-+            let mut start = size.cols.saturating_sub(header_width.saturating_add(1));
++                .enumerate().map(|(index, item)| UnicodeWidthStr::width(format!(" {}{} ", item.name, if index == 0 { " [Alt+o]" } else { "" }).as_str()) + 2).sum();
++            let mut start = size.cols.saturating_sub(header_width);
 +            for (index, item) in self.items.iter().filter(|item| matches!(item.placement, Placement::Header)).enumerate() {
 +                let label = format!(" {}{} ", item.name, if index == 0 { " [Alt+o]" } else { "" });
-+                let end = start + UnicodeWidthStr::width(clip(&label, size.cols).as_str());
++                let end = start.saturating_add(UnicodeWidthStr::width(label.as_str()) + 2).min(size.cols);
 +                if col >= start && col < end { return Click::Header(&item.tab_name); }
 +                start = end;
 +            }
