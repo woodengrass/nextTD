@@ -2,8 +2,13 @@
 #
 # Runs on pull requests and pushes to main. Setup installs toolchains from
 # the project's own files (rust-toolchain.toml, .python-version) and then
-# runs the project check entry `make check`, which owns all build, test,
-# lint, and probe logic. Tagged release smoke lives in release-smoke.yml.
+# runs the project check entry `make check` exactly once, which owns all
+# build, test, lint, probe, stage, archive, and archive-verification logic
+# (including the golden desktop suite via the archive gate). No other step
+# builds, archives, or re-verifies: `make check` is the single gate.
+# The immutable-refs job refuses any alteration or deletion of frozen
+# baselines (see frozen-release-verification.adr.md). Tagged releases reuse
+# the tested archive in release-smoke.yml and never rebuild.
 # Branch protection targets the stable `ci-required` job.
 # No step publishes anything or touches branch protection.
 #
@@ -87,14 +92,111 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: make check
 
+  immutable-refs:
+    name: immutable-refs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Refuse changes to frozen baselines
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if test "${{ github.event_name }}" != "pull_request"; then
+            echo "immutable-refs: not a pull request; nothing to guard."
+            exit 0
+          fi
+          test -n "${BASE}" || { echo "immutable-refs: error: missing base sha." >&2; exit 1; }
+          test -n "${HEAD_SHA}" || { echo "immutable-refs: error: missing head sha." >&2; exit 1; }
+          # Frozen once present on the base: golden screens, the golden lock
+          # (tests/golden.lock*), and its checker. Per
+          # frozen-release-verification.adr.md the baselines never move with
+          # the product, so no Spec-change: line can ever approve touching
+          # them once established.
+          mapfile -t FROZEN < <(git ls-tree -r --name-only "${BASE}" \
+            | grep -E '^(tests/golden/.*\.screen|tests/golden\.lock[^/]*|scripts/check-golden-lock\.py)$' || true)
+          CHANGED="$(git diff --name-only "${BASE}" "${HEAD_SHA}")"
+          for path in ${FROZEN[@]+"${FROZEN[@]}"}; do
+            if printf '%s\n' "${CHANGED}" | grep -qxF "${path}"; then
+              echo "immutable-refs: error: frozen baseline '${path}' is already on the base and must not be altered or deleted (no override)." >&2
+              exit 1
+            fi
+          done
+          # Bootstrap: baselines absent on the base may be added exactly once,
+          # and only with an explicit Spec-change: line plus hashes pinned in
+          # the lock. Golden screens must each match the lock's pinned hash
+          # list; the lock and its checker only need the explicit line.
+          mapfile -t ADDED < <(git diff --name-only --diff-filter=A "${BASE}" "${HEAD_SHA}" \
+            | grep -E '^(tests/golden/.*\.screen|tests/golden\.lock[^/]*|scripts/check-golden-lock\.py)$' || true)
+          if test "${#ADDED[@]}" -eq 0; then
+            echo "immutable-refs: ok (frozen: ${#FROZEN[@]}, added: 0)."
+            exit 0
+          fi
+          git log --format=%B "${BASE}..${HEAD_SHA}" | grep -q '^Spec-change:' \
+            || { echo "immutable-refs: error: first addition of frozen baselines requires an explicit 'Spec-change:' line in a commit message." >&2; exit 1; }
+          LOCK_TEXT=""
+          ANSI16_TEXT=""
+          while IFS= read -r lock; do
+            # Only lock files pin hashes; the checker script carries the tests.
+            # (A lock already on the base that this PR touches fails above in
+            # the frozen loop; a lock added here is the bootstrap pin list.)
+            # The nested ansi16 set has its own exact-set guard
+            # (tests/golden.lock.ansi16.json over tests/golden/ansi16/); it
+            # must never be satisfied by the archival lock and vice versa.
+            case "${lock}" in
+              tests/golden.lock*) LOCK_TEXT="${LOCK_TEXT}$(git show "${HEAD_SHA}:${lock}")"$'\n' ;;
+            esac
+            case "${lock}" in
+              tests/golden.lock.ansi16.json) ANSI16_TEXT="$(git show "${HEAD_SHA}:${lock}")" ;;
+            esac
+          done < <(git ls-tree -r --name-only "${HEAD_SHA}" \
+            | grep -E '^tests/golden\.lock[^/]*$' || true)
+          test -n "${LOCK_TEXT}" \
+            || { echo "immutable-refs: error: bootstrap additions require a tests/golden.lock* pin list in the head tree." >&2; exit 1; }
+          for path in "${ADDED[@]}"; do
+            case "${path}" in
+              tests/golden/ansi16/*.screen) WANT="${ANSI16_TEXT}" ;;
+              tests/golden/*.screen) WANT="${LOCK_TEXT}" ;;
+              *) continue ;;
+            esac
+            # Nested files carry their directory prefix, so the specific
+            # lock above is mandatory: a nested screen pinned only by the
+            # archival lock (or vice versa) still fails here, and the
+            # runtime checker enforces each exact file set separately.
+            if test "${WANT}" != "${LOCK_TEXT}" -a -z "${WANT}"; then
+              echo "immutable-refs: error: added '${path}' needs its own lock (tests/golden.lock.ansi16.json) in the head tree." >&2
+              exit 1
+            fi
+            digest="$(git show "${HEAD_SHA}:${path}" | sha256sum)"
+            digest="${digest%% *}"
+            name="$(basename "${path}")"
+            case "${WANT}" in
+              *"${digest}"*) ;;
+              *) echo "immutable-refs: error: added '${path}' (sha256 ${digest}) is not in its lock's pinned hash list." >&2; exit 1; ;;
+            esac
+            case "${WANT}" in
+              *"${name}"*) ;;
+              *) echo "immutable-refs: error: added '${path}' is not named in its lock's pinned hash list." >&2; exit 1; ;;
+            esac
+          done
+          echo "immutable-refs: ok (frozen: ${#FROZEN[@]}, bootstrap-added: ${#ADDED[@]} with Spec-change: and pinned hashes)."
+
   ci-required:
     name: ci-required
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    needs: [ci]
+    needs: [ci, immutable-refs]
     if: always()
     steps:
       - name: Check the required results
         working-directory: ${{ github.workspace }}
         run: |
           test "${{ needs.ci.result }}" = "success"
+          test "${{ needs.immutable-refs.result }}" = "success"
