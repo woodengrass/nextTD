@@ -34,10 +34,11 @@ from __future__ import annotations
 
 import re
 import subprocess
+import time
 import unicodedata
 from pathlib import Path
 
-__all__ = ["ANSI16_DIR", "GOLDEN_DIR", "assert_frame", "assert_frame_in", "capture_frame"]
+__all__ = ["ANSI16_DIR", "GOLDEN_DIR", "assert_frame", "assert_frame_in", "capture_frame", "wait_for_frame"]
 
 #: Directory owning every ``<name>.screen`` fixture. The golden recorder
 #: generates files here; this helper only reads them.
@@ -218,6 +219,34 @@ def _truncate(line: str, limit: int = _DIFF_CONTEXT) -> str:
     return text if len(text) <= limit else text[:limit] + "...'"
 
 
+def _read_expected(path: Path) -> str:
+    if not path.is_file():
+        raise AssertionError(
+            f"golden file missing: {path}; the golden recorder owns fixture generation, "
+            "this helper never creates or updates golden files"
+        )
+    return path.read_text(encoding="utf-8")
+
+
+def wait_for_frame(name: str, socket: Path, target: str, cols: int, rows: int, *, golden_dir: Path) -> str:
+    """Require three consecutive full matches; a stable intermediate layout is not ready."""
+    path = golden_dir / f"{name}.screen"
+    expected = _read_expected(path)
+    deadline = time.monotonic() + 10
+    matches = 0
+    while True:
+        actual = capture_frame(socket, target, cols, rows)
+        matches = matches + 1 if actual == expected else 0
+        if matches == 3:
+            return actual
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if actual != expected:
+                raise AssertionError(_describe_mismatch(name, path, expected, actual))
+            raise AssertionError(f"golden frame {name!r} did not remain stable for three consecutive captures")
+        time.sleep(min(0.1, remaining))
+
+
 def assert_frame(name: str, actual: str, *, golden_dir: Path | None = None) -> None:
     """Compare a captured frame against its golden fixture.
 
@@ -233,12 +262,7 @@ def assert_frame(name: str, actual: str, *, golden_dir: Path | None = None) -> N
     """
     directory = GOLDEN_DIR if golden_dir is None else golden_dir
     path = directory / f"{name}.screen"
-    if not path.is_file():
-        raise AssertionError(
-            f"golden file missing: {path}; the golden recorder owns fixture generation, "
-            "this helper never creates or updates golden files"
-        )
-    expected = path.read_text(encoding="utf-8")
+    expected = _read_expected(path)
     if expected == actual:
         return None
     raise AssertionError(_describe_mismatch(name, path, expected, actual))

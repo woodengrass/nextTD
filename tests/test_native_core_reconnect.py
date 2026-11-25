@@ -50,7 +50,9 @@ def test_core_back_click_without_detach(tmp_path: Path, core_native: tuple[dict[
         origin_tab = session.active_tab()
         origin_pane = session.action("list-clients").splitlines()[1].split()[1]
         session.open_settings()
-        assert capture(session).splitlines()[3][111:115] == "Back"
+        # The pane content is ready before the client frame is redrawn; wait
+        # for Back at the click cell in the composed client screen.
+        wait_for_click_ready(session)
         session.mouse(113, 4, release=False)
         session.mouse(113, 4, release=True)
         wait_for(lambda: session.active_tab() == origin_tab)
