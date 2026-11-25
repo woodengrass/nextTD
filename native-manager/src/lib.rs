@@ -166,22 +166,26 @@ impl Manager {
         let _guard = self.store.lock()?;
         let state = self.store.read()?;
         match action {
-            Action::Install => {
-                let order = graph::dependency_order(&self.manifests, id, &self.errors)?;
-                self.check_dependencies(&order, &mut approve)?;
-                let installed: BTreeSet<String> =
-                    state.installed.union(&order_set(&order)).cloned().collect();
-                self.store.write(&State::new(installed, state.enabled)?)?;
-                Ok(order)
-            }
-            Action::Enable => {
-                let order = self.enable_order(id, &state)?;
-                self.check_dependencies(&order, &mut approve)?;
+            Action::Install | Action::Enable => {
+                let order = if action == Action::Enable {
+                    self.enable_order(id, &state)?
+                } else {
+                    graph::dependency_order(&self.manifests, id, &self.errors)?
+                };
                 let additions = order_set(&order);
-                let installed: BTreeSet<String> =
-                    state.installed.union(&additions).cloned().collect();
-                let enabled: BTreeSet<String> = state.enabled.union(&additions).cloned().collect();
-                self.store.write(&State::new(installed, enabled)?)?;
+                let installed = state.installed.union(&additions).cloned().collect();
+                let enabled = if action == Action::Enable {
+                    state.enabled.union(&additions).cloned().collect()
+                } else {
+                    state.enabled
+                };
+                let next = State::new(installed, enabled)?;
+                self.store.check_writable()?;
+                let tools = self.check_dependencies(&order, &mut approve)?;
+                self.store.write(&next)?;
+                for tool in tools {
+                    tool.commit();
+                }
                 Ok(order)
             }
             Action::Disable | Action::Uninstall => {
@@ -211,7 +215,7 @@ impl Manager {
         &self,
         order: &[String],
         approve: &mut impl FnMut(&str) -> bool,
-    ) -> Result<()> {
+    ) -> Result<Vec<installer::PendingTool>> {
         let mut downloads = Vec::new();
         let mut seen = BTreeSet::new();
         for name in order {
@@ -234,10 +238,10 @@ impl Manager {
                 bail!("Installation declined; plugin state was not changed");
             }
         }
-        for (executable, _) in downloads {
-            installer::install(executable, &self.bin)?;
-        }
-        Ok(())
+        downloads
+            .into_iter()
+            .map(|(executable, _)| installer::install(executable, &self.bin))
+            .collect()
     }
 
     /// Dependency order for enabling `id`, selecting the single compatible
@@ -682,6 +686,38 @@ command = "tdnext-strict"
         );
         assert!(!manager.bin.join("btop").exists());
         assert_eq!(std::fs::read(&manager.store.path)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn unwritable_state_directory_prevents_download() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let empty = tempfile::tempdir()?;
+        with_path(
+            empty.path(),
+            "tests::unwritable_state_directory_prevents_download",
+        )?;
+        if !is_child() {
+            return Ok(());
+        }
+        let (root, manager) = programmatic(&[("app", Role::View, &[], &["btop"])])?;
+        std::fs::create_dir(&manager.bin)?;
+        let dir = root.path().join("settings");
+        std::fs::create_dir(&dir)?;
+        let target = dir.join("saved.json");
+        std::fs::write(&target, b"{}")?;
+        symlink(&target, &manager.store.path)?;
+        // A previously created lock remains writable in a now read-only directory.
+        drop(manager.store.lock()?);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))?;
+        let result = manager.apply(Action::Install, "app", &set(&[]), |_| true);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        assert!(
+            matches!(result, Err(ref e) if format!("{e:#}").contains("Permission denied")),
+            "{result:?}"
+        );
+        assert!(!manager.bin.join("btop").exists());
+        assert_eq!(std::fs::read(target)?, b"{}");
         Ok(())
     }
 

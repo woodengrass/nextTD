@@ -74,8 +74,40 @@ pub fn description(name: &str, bin: &Path) -> anyhow::Result<String> {
     ))
 }
 
+/// Retain the verified inode until the state commit. Never overwrite a user file
+/// on publication, or remove a replacement if the operation rolls back.
+pub(crate) struct PendingTool {
+    destination: PathBuf,
+    candidate: PathBuf,
+    _work: tempfile::TempDir,
+    committed: bool,
+}
+
+impl PendingTool {
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PendingTool {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        if !self.committed
+            && let (Ok(original), Ok(current)) = (
+                self.candidate.metadata(),
+                self.destination.symlink_metadata(),
+            )
+            && original.dev() == current.dev()
+            && original.ino() == current.ino()
+            && let Err(error) = fs::remove_file(&self.destination)
+        {
+            eprintln!("Cannot roll back {}: {error}", self.destination.display());
+        }
+    }
+}
+
 /// Download one allowlisted binary, never extracting arbitrary archive paths.
-pub fn install(name: &str, bin: &Path) -> anyhow::Result<PathBuf> {
+pub(crate) fn install(name: &str, bin: &Path) -> anyhow::Result<PendingTool> {
     let release = release_for(name).ok_or_else(|| {
         anyhow::anyhow!("No local installer for '{name}'; install it yourself and add it to PATH.")
     })?;
@@ -101,7 +133,7 @@ pub fn check_btop(binary: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn install_release(release: &Release, bin: &Path) -> anyhow::Result<PathBuf> {
+fn install_release(release: &Release, bin: &Path) -> anyhow::Result<PendingTool> {
     let name = release.name;
     if std::env::consts::OS != "linux" || std::env::consts::ARCH != "x86_64" {
         anyhow::bail!("No bundled {name} release for this platform; install it on PATH.");
@@ -177,9 +209,14 @@ fn install_release(release: &Release, bin: &Path) -> anyhow::Result<PathBuf> {
         anyhow::bail!("Installed executable is not a working btop");
     }
     let destination = bin.join(name);
-    fs::rename(&candidate, &destination)
+    fs::hard_link(&candidate, &destination)
         .map_err(|exc| anyhow::anyhow!("Failed to install {name}: {exc}"))?;
-    Ok(destination)
+    Ok(PendingTool {
+        destination,
+        candidate,
+        _work: work,
+        committed: false,
+    })
 }
 
 /// SHA-256 of a file via the system `sha256sum` (no extra crypto dependency).

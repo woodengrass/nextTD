@@ -86,7 +86,8 @@ impl StateStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Cannot lock plugin state {}", self.path.display()))?;
         }
-        let sidecar = self.sidecar();
+        let mut sidecar = resolve_target(&self.path)?.into_os_string();
+        sidecar.push(".lock");
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -124,8 +125,10 @@ impl StateStore {
         }
     }
 
-    fn sidecar(&self) -> PathBuf {
-        self.path.with_extension("json.lock")
+    pub(crate) fn check_writable(&self) -> Result<()> {
+        writable_target(&self.path)
+            .with_context(|| format!("Cannot save plugin state {}", self.path.display()))?;
+        Ok(())
     }
 
     /// Atomically replace the snapshot; the target is never truncated in place.
@@ -143,19 +146,39 @@ impl StateStore {
     }
 }
 
+fn resolve_target(path: &Path) -> std::io::Result<PathBuf> {
+    if path.is_symlink() {
+        path.canonicalize()
+    } else {
+        Ok(path.to_owned())
+    }
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn writable_target(path: &Path) -> std::io::Result<PathBuf> {
+    use rustix::fs::{Access, AtFlags, CWD, accessat};
+    let target = resolve_target(path)?;
+    if target.try_exists()? {
+        accessat(CWD, &target, Access::WRITE_OK, AtFlags::EACCESS)?;
+    }
+    accessat(
+        CWD,
+        parent_dir(&target),
+        Access::WRITE_OK | Access::EXEC_OK,
+        AtFlags::EACCESS,
+    )?;
+    Ok(target)
+}
+
 /// Replace the resolved file durably, leaving any user-owned symlink in place.
 pub fn write_atomically(path: &Path, text: String) -> std::io::Result<()> {
-    let target;
-    let path = if path.is_symlink() {
-        target = path.canonicalize()?;
-        &target
-    } else {
-        path
-    };
-    let parent = path
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+    let path = writable_target(path)?;
+    let parent = parent_dir(&path);
     let directory = std::fs::File::open(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     use std::io::Write as _;
@@ -174,6 +197,33 @@ mod tests {
 
     fn set(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn linked_read_only_target_is_left_untouched() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = tempfile::tempdir()?;
+        let target = root.path().join("saved");
+        std::fs::write(&target, b"old")?;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o444))?;
+        let link = root.path().join("appearance.json");
+        symlink(&target, &link)?;
+        assert!(write_atomically(&link, "new".into()).is_err());
+        assert_eq!(std::fs::read(&target)?, b"old");
+        assert!(link.is_symlink());
+        Ok(())
+    }
+
+    #[test]
+    fn aliases_of_one_state_share_its_mutation_lock() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let target = root.path().join("shared");
+        std::fs::write(&target, b"{}")?;
+        let link = root.path().join("editor.json");
+        std::os::unix::fs::symlink(&target, &link)?;
+        let _guard = StateStore::new(target).lock()?;
+        assert!(StateStore::new(link).lock().is_err());
+        Ok(())
     }
 
     #[test]
