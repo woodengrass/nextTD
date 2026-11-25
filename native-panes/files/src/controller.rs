@@ -997,10 +997,10 @@ impl Controller {
                     || self.ui.focus == Focus::Preview && prev.width == 0
                     || self.ui.focus == Focus::Table && table.width == 0
                 {
-                    self.ui.focus = if table.width == 0 {
-                        Focus::Preview
-                    } else {
-                        Focus::Table
+                    if table.width > 0 {
+                        self.ui.focus = Focus::Table;
+                    } else if prev.width > 0 {
+                        self.ui.focus = Focus::Preview;
                     }
                 }
                 self.clamp()
