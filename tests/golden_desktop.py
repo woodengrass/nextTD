@@ -250,7 +250,7 @@ def desktop(name: str, term: str):
                     subprocess.run(['tmux', '-S', str(socket), '-f', '/dev/null', 'new-session',
                                     '-d', '-s', 'golden', '-x', str(cols), '-y', str(rows),
                                     *command], env=env, check=True, capture_output=True, timeout=10)
-                    yield socket, tag, work, state
+                    yield socket, tag, work, state, env
                 finally:
                     subprocess.run(['tmux', '-S', str(socket), 'kill-server'], env=env,
                                    capture_output=True, check=False, timeout=10)
@@ -299,28 +299,37 @@ def choose_codicons_provider(socket: Path, state: Path) -> None:
     poll_state(30, 'appearance.json carries the icons provider', provider_saved)
 
 
-def disable_codicons_plugin(socket: Path, state: Path) -> None:
+def listed_plugins(env: dict[str, str]) -> tuple[set[str], set[str]]:
+    listing = subprocess.run([dist_root() / 'tdnext', 'list'], env=env, check=True,
+                             capture_output=True, text=True, timeout=10)
+    installed, enabled = set(), set()
+    for line in listing.stdout.splitlines():
+        plugin, status, *_ = line.split()
+        assert status in {'enabled', 'installed', 'available'}, line
+        if status in {'enabled', 'installed'}:
+            installed.add(plugin)
+        if status == 'enabled':
+            enabled.add(plugin)
+    return installed, enabled
+
+
+def disable_codicons_plugin(socket: Path, env: dict[str, str]) -> None:
     """Disable the Codicons plugin in Settings and prove it persisted."""
+    installed, enabled = listed_plugins(env)
+    assert 'icons' in enabled
     tmux(socket, 'send-keys', '-t', 'golden', 'Down')
     tmux(socket, 'send-keys', '-t', 'golden', 'Down')
     tmux(socket, 'send-keys', '-t', 'golden', 'd')
     wait_text(socket, 'Restart desktop to apply plugin changes.')
 
-    def plugin_disabled() -> bool:
-        try:
-            plugins = json.loads((state / 'plugins.json').read_text(encoding='utf-8'))
-        except (OSError, ValueError):
-            return False
-        return 'icons' not in plugins.get('enabled', [])
-
-    poll_state(30, 'plugins.json no longer enables icons', plugin_disabled)
+    assert listed_plugins(env) == (installed, enabled - {'icons'})
 
 
 def scene(name: str, term: str) -> str:
     cols, rows, actions = SCENES[name]
     if term not in TERMINALS:
         raise AssertionError(f'unknown terminal mode: {term!r}; expected one of {TERMINALS!r}')
-    with desktop(name, term) as (socket, tag, work, state):
+    with desktop(name, term) as (socket, tag, work, state, env):
         # Wait for the prompt before every input: the Files view is the
         # initial view in all scenes, so its readiness gates all keys.
         wait_text(socket, 'example.txt')
@@ -358,5 +367,5 @@ def scene(name: str, term: str) -> str:
         elif name == 'settings_general_120x38':
             choose_codicons_provider(socket, state)
         elif name == 'settings_plugins_120x38':
-            disable_codicons_plugin(socket, state)
+            disable_codicons_plugin(socket, env)
         return frame
