@@ -108,6 +108,11 @@ pub fn handle(app: &mut App, event: Event, targets: &Targets) -> bool {
         }
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
+                if app.busy {
+                    app.feedback =
+                        "Plugin operation in progress. Finish or cancel it before quitting.".into();
+                    return false;
+                }
                 if app.dialog.is_some() {
                     confirm(app, false);
                 }
