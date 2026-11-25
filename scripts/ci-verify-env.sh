@@ -46,8 +46,7 @@ case "${BTOP_VERSION}" in
 esac
 
 test -d /dev/shm || fail "/dev/shm is missing (Files cross-device tests need it)."
-SHM_PROBE="/dev/shm/tdnext-ci-probe.$$"
-: > "${SHM_PROBE}" 2>/dev/null || fail "/dev/shm is not writable."
+SHM_PROBE="$(mktemp -p /dev/shm tdnext-ci-probe.XXXXXX)" || fail "/dev/shm is not writable."
 rm -f "${SHM_PROBE}"
 # The cross-device tests compare the default tempdir against /dev/shm, so
 # compare those two actual devices (not /).

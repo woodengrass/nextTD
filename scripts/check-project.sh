@@ -327,15 +327,10 @@ export TDNEXT_PREBUILT_CORE="${CORE_DEST}"
 bash scripts/build-dist.sh "${DIST_STAGE}" "${ZELLIJ_SRC}"
 ARCHIVE="${STAGE_PARENT}/tdnext-linux-x86_64.tar.gz"
 tar -C "${STAGE_PARENT}" -czf "${ARCHIVE}" tdnext
-# Same interpreter rule as `make verify-dist`: the verifier imports project
-# test dependencies, so prefer the synced project venv when present.
-if test -x "${ROOT}/.venv/bin/python"; then
-  VERIFY_PY="${ROOT}/.venv/bin/python"
-else
-  VERIFY_PY="python3"
-fi
-"${VERIFY_PY}" "${ROOT}/scripts/verify-dist.py" "${ARCHIVE}"
-ARCHIVE_SHA="$(sha256sum "${ARCHIVE}")"
+RECEIPT="${STAGE_PARENT}/verified.sha256"
+TDNEXT_VERIFIED_DIGEST_OUT="${RECEIPT}" make verify-dist "ARCHIVE=${ARCHIVE}"
+read -r ARCHIVE_SHA < "${RECEIPT}"
+[[ "${ARCHIVE_SHA}" =~ ^[0-9a-f]{64}$ ]] || fail "invalid verifier digest"
 ARCHIVE_BYTES="$(stat -c %s "${ARCHIVE}")"
 echo "check-project: archive verified: tdnext-linux-x86_64.tar.gz (${ARCHIVE_BYTES} bytes, sha256 ${ARCHIVE_SHA%% *})."
 if test -n "${ARCHIVE_OUT:-}"; then
@@ -347,7 +342,9 @@ if test -n "${ARCHIVE_OUT:-}"; then
     && fail "ARCHIVE_OUT already exists; refusing to overwrite: ${ARCHIVE_OUT}"
   mkdir -p "$(dirname "${ARCHIVE_OUT}")"
   cp -- "${ARCHIVE}" "${ARCHIVE_OUT}"
-  ( cd "$(dirname "${ARCHIVE_OUT}")" && sha256sum "$(basename "${ARCHIVE_OUT}")" > "${ARCHIVE_OUT}.sha256" )
+  EXPORTED_SHA="$(sha256sum < "${ARCHIVE_OUT}")"
+  test "${EXPORTED_SHA%% *}" = "${ARCHIVE_SHA}" || fail "exported archive differs from verified bytes"
+  printf '%s  %s\n' "${ARCHIVE_SHA}" "$(basename "${ARCHIVE_OUT}")" > "${ARCHIVE_OUT}.sha256"
   echo "check-project: exported tested archive to ${ARCHIVE_OUT} (+ .sha256)."
 fi
 

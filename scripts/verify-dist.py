@@ -34,7 +34,8 @@ The verifier never builds anything; it only checks and runs:
    must show every scene-mode pair from the ANSI lock passing exactly
    once; skips, filters, and deselections fail the gate.
 
-On success the archive SHA-256 digest is printed. Any failure exits
+On success the archive SHA-256 digest is printed and, if
+TDNEXT_VERIFIED_DIGEST_OUT is set, written there as a single hex line. Any failure exits
 non-zero with the failing step named.
 """
 
@@ -223,6 +224,8 @@ def run_golden_scenes(dist: Path, env: dict[str, str], expected: list[str], work
         pytest_command = [sys.executable, '-m', 'pytest']
     report = workdir / 'golden-junit.xml'
     golden_env = dict(env, TDNEXT_VERIFIED_DIST_ROOT=str(dist))
+    golden_env.pop('TDNEXT_GOLDEN_VIA_VERIFY_DIST', None)
+    golden_env.pop('TDNEXT_DESELECTED_REPORT', None)
     for key in [key for key in golden_env if key.startswith('PYTEST_')]:
         golden_env.pop(key)
     run_logged(step, [*pytest_command, GOLDEN_TEST, '-q', f'--junitxml={report}'], golden_env)
@@ -264,6 +267,7 @@ def main(argv: list[str]) -> int:
     expected = lock_screens()
     data = read_archive(archive)
     digest = hashlib.sha256(data).hexdigest()
+    digest_out = os.environ.pop('TDNEXT_VERIFIED_DIGEST_OUT', None)
     check_layout(data)
     dest = Path(tempfile.mkdtemp(prefix='tdnext-verify-'))
     try:
@@ -275,6 +279,8 @@ def main(argv: list[str]) -> int:
         run_golden_scenes(dist, env, expected, dest)
     finally:
         shutil.rmtree(dest, ignore_errors=True)
+    if digest_out:
+        Path(digest_out).write_text(digest + '\n', encoding='ascii')
     print(f'verify-dist: ok sha256={digest} archive={archive}', flush=True)
     return 0
 
