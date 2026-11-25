@@ -1396,6 +1396,13 @@ fn setgid_destination_does_not_gain_source_group_permissions()
     // the test runner belongs to only one group. Root may assign the GID.
     let group = 123454321;
     crate::actions::TEST_SOURCE_GROUP.set(Some(group));
+    let restricted = src.path().join("restricted");
+    write(&restricted, b"data")?;
+    std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o604))?;
+    let restricted = paste(&restricted, dst.path(), false)?;
+    if restricted.metadata()?.gid() != group {
+        assert_eq!(mode_of(&restricted)?, 0o600);
+    }
     let folder = src.path().join("folder");
     std::fs::create_dir(&folder)?;
     let mut acl = 2u32.to_le_bytes().to_vec();
@@ -1407,7 +1414,14 @@ fn setgid_destination_does_not_gain_source_group_permissions()
         (32, u32::MAX),
     ] {
         acl.extend(tag.to_le_bytes());
-        acl.extend(if tag == 1 { 7u16 } else { 5u16 }.to_le_bytes());
+        acl.extend(
+            match tag {
+                1 | 16 => 7u16,
+                32 => 4,
+                _ => 5,
+            }
+            .to_le_bytes(),
+        );
         acl.extend(id.to_le_bytes());
     }
     for key in ["system.posix_acl_access", "system.posix_acl_default"] {
@@ -1416,12 +1430,12 @@ fn setgid_destination_does_not_gain_source_group_permissions()
     let copy = paste(&folder, dst.path(), false)?;
     crate::actions::TEST_SOURCE_GROUP.set(None);
     if copy.metadata()?.gid() != group {
-        assert_eq!(copy.metadata()?.mode() & 0o070, 0);
+        assert_eq!(copy.metadata()?.mode() & 0o077, 0o44);
         for key in ["system.posix_acl_access", "system.posix_acl_default"] {
             let stored = get_xattr(&copy, key)?;
             for record in stored[4..].chunks_exact(8) {
-                if matches!(u16::from_le_bytes([record[0], record[1]]), 4 | 8 | 16) {
-                    assert_eq!(&record[2..4], &[0, 0]);
+                if matches!(u16::from_le_bytes([record[0], record[1]]), 4 | 8 | 16 | 32) {
+                    assert_eq!(&record[2..4], &[4, 0]);
                 }
             }
         }
@@ -1470,4 +1484,94 @@ fn copy_read_only_tree() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn move_read_only_tree_across_devices() -> Result<(), Box<dyn std::error::Error>> {
     transfer_read_only_tree(true)
+}
+
+#[test]
+fn interrupted_delete_keeps_remaining_children_visible() -> Result<(), Box<dyn std::error::Error>> {
+    let tmp = dir()?;
+    let tree = tmp.path().join("tree");
+    std::fs::create_dir(&tree)?;
+    for n in ["a", "b"] {
+        write(&tree.join(n), b"keep")?;
+    }
+    crate::actions::AFTER_UNLINK.set(Some(Box::new(|_| panic!("interrupt after first unlink"))));
+    assert!(std::panic::catch_unwind(|| remove(&tree)).is_err());
+    assert_eq!(std::fs::read_dir(&tree)?.count(), 1);
+    Ok(())
+}
+#[test]
+fn missing_published_child_preserves_its_source_only() -> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = tempfile::tempdir_in("/dev/shm")?;
+    let tree = src.path().join("tree");
+    std::fs::create_dir(&tree)?;
+    for n in ["a", "b"] {
+        write(&tree.join(n), b"original")?;
+    }
+    let missing = dst.path().join("tree/a");
+    crate::actions::stash_between_note(&tree, move || std::fs::remove_file(missing).unwrap());
+    let err = paste(&tree, dst.path(), true).unwrap_err();
+    assert!(err.contains("Partial move"));
+    assert_eq!(read(&tree.join("a"))?, b"original");
+    assert!(!tree.join("b").exists());
+    Ok(())
+}
+fn replaced_stage_entry(directory: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = dir()?;
+    let item = src.path().join("item");
+    if directory {
+        std::fs::create_dir(&item)?;
+    } else {
+        std::os::unix::fs::symlink("original", &item)?;
+    }
+    crate::actions::BEFORE_RECORD.set(Some(Box::new(move |p| {
+        std::fs::rename(p, p.with_file_name("displaced")).unwrap();
+        if directory {
+            std::fs::create_dir(p).unwrap();
+        } else {
+            std::os::unix::fs::symlink("replaced", p).unwrap();
+        }
+    })));
+    let err = paste(&item, dst.path(), false).unwrap_err();
+    assert!(err.contains("Staging remains"), "{err}");
+    assert!(!dst.path().join("item").exists());
+    let stage = std::fs::read_dir(dst.path())?.next().unwrap()?.path();
+    if directory {
+        assert!(stage.join("item").is_dir());
+    } else {
+        assert_eq!(
+            std::fs::read_link(stage.join("item"))?,
+            Path::new("replaced")
+        );
+    }
+    Ok(())
+}
+#[test]
+fn staged_directory_replacement_survives_rollback() -> Result<(), Box<dyn std::error::Error>> {
+    replaced_stage_entry(true)
+}
+#[test]
+fn staged_symlink_replacement_survives_rollback() -> Result<(), Box<dyn std::error::Error>> {
+    replaced_stage_entry(false)
+}
+#[test]
+fn same_length_staged_edit_is_not_published() -> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = dir()?;
+    let item = src.path().join("file");
+    write(&item, b"good")?;
+    let parent = dst.path().to_owned();
+    crate::actions::stash_between_note(&parent.join("file"), move || {
+        let stage = std::fs::read_dir(parent)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(stage.join("file"), b"evil").unwrap();
+    });
+    assert!(paste(&item, dst.path(), false).is_err());
+    assert!(!dst.path().join("file").exists());
+    Ok(())
 }

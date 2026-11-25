@@ -624,6 +624,10 @@ fn unlink_tree(
             )),
         };
     }
+    #[cfg(test)]
+    if let Some(stop) = AFTER_UNLINK.take() {
+        stop(&path);
+    }
     if !expected.is_dir() && expected.nlink() > 1 {
         let after = fd_metadata(&held)?;
         if after.nlink() + 1 != expected.nlink()
@@ -739,6 +743,7 @@ fn fire_between_note(source: &Path) {
 pub(crate) type PathHook = Box<dyn FnOnce(&Path)>;
 #[cfg(test)]
 thread_local! {
+    pub(crate) static AFTER_UNLINK:std::cell::Cell<Option<PathHook>>=const {std::cell::Cell::new(None)};
     pub(crate) static BEFORE_RECORD: std::cell::Cell<Option<PathHook>>=const {std::cell::Cell::new(None)};
     pub(crate) static BEFORE_CLAIM: std::cell::Cell<Option<PathHook>>=const {std::cell::Cell::new(None)};
 }
@@ -754,6 +759,10 @@ fn copy_file(source: &Path, target: &Path, stage: &mut Stage) -> Result<CopiedEn
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
         copy_symlink_noreplace(source, target)?;
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_RECORD.take() {
+            hook(target);
+        }
         stage.record(target)?;
         rustix::fs::utimensat(
             CWD,
@@ -906,6 +915,10 @@ fn copy_tree_entry(
         .file_type();
     if file_type.is_dir() {
         create_private_dir(target)?;
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_RECORD.take() {
+            hook(target);
+        }
         stage.record(target)?;
         #[cfg(test)]
         note_initial(target);
