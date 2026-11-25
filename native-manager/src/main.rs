@@ -1,5 +1,5 @@
 //! The `tdnext` management CLI: list, install, enable, disable, uninstall,
-//! install-zellij, desktop, and run.
+//! desktop, and run.
 //!
 //! Settings and the CLI share the `tdnext_manager` library; content programs
 //! run as independent processes. Lifecycle commands resolve the shared
@@ -28,7 +28,6 @@ commands:
   enable <id>
   disable <id>
   uninstall <id>
-  install-zellij
   desktop [DIR]
   run <id>";
 
@@ -37,26 +36,22 @@ fn usage_error(message: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
-fn dispatch(args: &[String]) -> Result<ExitCode> {
+fn dispatch(args: &[std::ffi::OsString]) -> Result<ExitCode> {
     let (command, rest) = args
         .split_first()
-        .map(|(first, rest)| (first.as_str(), rest))
+        .map(|(first, rest)| (first.to_str().unwrap_or("<non-UTF-8>"), rest))
         .unwrap_or(("", &[]));
     if command.is_empty() {
         return Ok(usage_error("no command given"));
     }
     if !matches!(
         command,
-        "list"
-            | "install"
-            | "enable"
-            | "disable"
-            | "uninstall"
-            | "install-zellij"
-            | "desktop"
-            | "run"
+        "list" | "install" | "enable" | "disable" | "uninstall" | "desktop" | "run"
     ) {
         return Ok(usage_error(&format!("unknown command '{command}'")));
+    }
+    fn plugin_id(id: &std::ffi::OsStr) -> Result<&str> {
+        id.to_str().context("plugin ID must be UTF-8")
     }
     match (command, rest) {
         ("list", []) => {
@@ -66,32 +61,29 @@ fn dispatch(args: &[String]) -> Result<ExitCode> {
             ops::apply_and_report(
                 &Manager::load().context("loading plugin state")?,
                 Action::Install,
-                id,
+                plugin_id(id)?,
             )?;
         }
         ("enable", [id]) => {
             ops::apply_and_report(
                 &Manager::load().context("loading plugin state")?,
                 Action::Enable,
-                id,
+                plugin_id(id)?,
             )?;
         }
         ("disable", [id]) => {
             ops::apply_and_report(
                 &Manager::load().context("loading plugin state")?,
                 Action::Disable,
-                id,
+                plugin_id(id)?,
             )?;
         }
         ("uninstall", [id]) => {
             ops::apply_and_report(
                 &Manager::load().context("loading plugin state")?,
                 Action::Uninstall,
-                id,
+                plugin_id(id)?,
             )?;
-        }
-        ("install-zellij", []) => {
-            ops::install_zellij(&Manager::load().context("loading plugin state")?)?;
         }
         ("desktop", []) => {
             desktop::desktop(
@@ -106,7 +98,10 @@ fn dispatch(args: &[String]) -> Result<ExitCode> {
             )?;
         }
         ("run", [id]) => {
-            run::run_view(&Manager::load().context("loading plugin state")?, id)?;
+            run::run_view(
+                &Manager::load().context("loading plugin state")?,
+                plugin_id(id)?,
+            )?;
         }
         _ => {
             return Ok(usage_error(&format!(
@@ -118,7 +113,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode> {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
     match dispatch(&args) {
         Ok(code) => code,
         Err(error) => {
@@ -138,7 +133,6 @@ mod dispatch_tests {
             "enable",
             "disable",
             "uninstall",
-            "install-zellij",
             "desktop",
             "run",
         ] {
@@ -147,5 +141,6 @@ mod dispatch_tests {
                 "usage must document {command}"
             );
         }
+        assert!(!super::USAGE.contains("install-zellij"));
     }
 }

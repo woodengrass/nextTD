@@ -1,7 +1,6 @@
 //! Pinned, checksum-verified, user-local executable installation.
 //!
-//! Port of `src/tdnext/core/executables.py` (`install_executable`,
-//! `install_release`, `RELEASES`) and the monitor plugin's
+//! Port of `src/tdnext/core/executables.py` (`install_release`) and the monitor plugin's
 //! `src/tdnext/plugins/monitor/dependencies.py` (`BTOP_RELEASE`,
 //! `MonitorDependencies::check` / `::install`).
 //!
@@ -27,12 +26,6 @@ const BTOP_URL: &str = "https://github.com/aristocratos/btop/releases/download/v
 const BTOP_SHA256: &str = "af589cf82cc9ea9c29ce050b9239a13bef2d1492256d476156e1054a42ce89ad";
 const BTOP_MEMBER: &str = "./btop/bin/btop";
 
-const ZELLIJ_NAME: &str = "zellij";
-const ZELLIJ_VERSION: &str = "0.45.1";
-const ZELLIJ_URL: &str = "https://github.com/zellij-org/zellij/releases/download/v0.45.1/zellij-no-web-x86_64-unknown-linux-musl.tar.gz";
-const ZELLIJ_SHA256: &str = "d7bda1e18c30a688833ae7627f1d6a253bbba5349a4bc48e4f0ec008aaf75ed1";
-const ZELLIJ_MEMBER: &str = "zellij";
-
 /// One allowlisted downloadable release.
 struct Release {
     name: &'static str,
@@ -50,12 +43,13 @@ const RELEASES: &[Release] = &[
         sha256: BTOP_SHA256,
         member: BTOP_MEMBER,
     },
+    #[cfg(test)]
     Release {
-        name: ZELLIJ_NAME,
-        version: ZELLIJ_VERSION,
-        url: ZELLIJ_URL,
-        sha256: ZELLIJ_SHA256,
-        member: ZELLIJ_MEMBER,
+        name: "test-tool",
+        version: "1",
+        url: "test.invalid",
+        sha256: "unused",
+        member: "test-tool",
     },
 ];
 
@@ -179,6 +173,9 @@ fn install_release(release: &Release, bin: &Path) -> anyhow::Result<PathBuf> {
         ));
     }
 
+    if name == BTOP_NAME && !lossy(&output.stdout).to_lowercase().contains("btop") {
+        anyhow::bail!("Installed executable is not a working btop");
+    }
     let destination = bin.join(name);
     fs::rename(&candidate, &destination)
         .map_err(|exc| anyhow::anyhow!("Failed to install {name}: {exc}"))?;
@@ -297,46 +294,53 @@ fn run_with_timeout(
     args: &[impl AsRef<OsStr>],
     timeout: Duration,
 ) -> std::io::Result<Option<Output>> {
+    use rustix::process::{Pid, Signal, kill_process_group};
+    use std::os::unix::process::CommandExt as _;
+    use std::sync::mpsc;
+    let deadline = std::time::Instant::now() + timeout;
+    let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
     let mut child = Command::new(program)
         .args(args)
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let stdout_drain = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(handle) = stdout.as_mut() {
-            let _ = handle.read_to_end(&mut buf);
-        }
-        buf
-    });
-    let stderr_drain = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(handle) = stderr.as_mut() {
-            let _ = handle.read_to_end(&mut buf);
-        }
-        buf
-    });
-
-    match child.wait_timeout(timeout)? {
-        Some(status) => {
-            let stdout = stdout_drain.join().unwrap_or_default();
-            let stderr = stderr_drain.join().unwrap_or_default();
-            Ok(Some(Output {
-                status,
-                stdout,
-                stderr,
-            }))
-        }
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            Ok(None)
-        }
+    fn drain(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<std::io::Result<Vec<u8>>> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+            let _ = tx.send(result);
+        });
+        rx
     }
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("missing stdout pipe"))?,
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::other("missing stderr pipe"))?,
+    );
+    if let Some(status) = child.wait_timeout(remaining())?
+        && let Ok(stdout) = stdout.recv_timeout(remaining())
+        && let Ok(stderr) = stderr.recv_timeout(remaining())
+    {
+        return Ok(Some(Output {
+            status,
+            stdout: stdout?,
+            stderr: stderr?,
+        }));
+    }
+    let _ = kill_process_group(Pid::from_child(&child), Signal::KILL);
+    let _ = child.kill();
+    child.wait()?;
+    Ok(None)
 }
 
 /// `shutil.which` equivalent: first executable `name` on `PATH`.

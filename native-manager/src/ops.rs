@@ -1,11 +1,10 @@
-//! The `list`, `install`, `enable`, `disable`, `uninstall`, and
-//! `install-zellij` subcommands.
+//! The `list`, `install`, `enable`, `disable`, and `uninstall` subcommands.
 
 use std::collections::BTreeSet;
 use std::io::{self, Write as _};
 
 use anyhow::{Context, Result};
-use tdnext_manager::{Action, Manager, installer};
+use tdnext_manager::{Action, Manager};
 
 /// `approve` answers the installer's consent prompt on the terminal.
 pub fn confirm(text: &str) -> bool {
@@ -90,14 +89,6 @@ fn describe(action: Action) -> &'static str {
         Action::Disable => "disable",
         Action::Uninstall => "uninstall",
     }
-}
-
-/// Explicit opt-in install of the pinned Zellij binary; never automatic.
-pub fn install_zellij(manager: &Manager) -> Result<()> {
-    let bin = manager.root.join("bin");
-    let installed = installer::install("zellij", &bin)?;
-    println!("Installed Zellij: {}", installed.display());
-    Ok(())
 }
 
 #[cfg(test)]

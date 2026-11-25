@@ -45,7 +45,7 @@ pub struct StateStore {
 /// write, so two simultaneous operations cannot interleave. A second
 /// operation fails fast with an actionable busy error instead of waiting or
 /// overwriting. Reads never take it: atomic replacement keeps them consistent.
-pub(crate) struct StateLock {
+pub struct StateLock {
     _file: std::fs::File,
 }
 
@@ -58,7 +58,9 @@ impl StateStore {
     /// Read the snapshot; missing file means empty, corrupt file is an error.
     pub fn read(&self) -> Result<State> {
         let text = match std::fs::read_to_string(&self.path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && !self.path.is_symlink() =>
+            {
                 return Ok(State::default());
             }
             Err(error) => {
@@ -79,7 +81,7 @@ impl StateStore {
     /// Take the mutation lock without blocking. Contention is an error naming
     /// the state file and telling the caller to retry after the in-flight
     /// operation (possibly one waiting on user consent) finishes.
-    pub(crate) fn lock(&self) -> Result<StateLock> {
+    pub fn lock(&self) -> Result<StateLock> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Cannot lock plugin state {}", self.path.display()))?;
@@ -141,17 +143,27 @@ impl StateStore {
     }
 }
 
-fn write_atomically(path: &Path, text: String) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+/// Replace the resolved file durably, leaving any user-owned symlink in place.
+pub fn write_atomically(path: &Path, text: String) -> std::io::Result<()> {
+    let target;
+    let path = if path.is_symlink() {
+        target = path.canonicalize()?;
+        &target
+    } else {
+        path
+    };
+    let parent = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = std::fs::File::open(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     use std::io::Write as _;
     temporary.write_all(text.as_bytes())?;
     temporary.write_all(b"\n")?;
-    temporary.flush()?;
-    temporary
-        .persist(path)
-        .map(|_| ())
-        .map_err(|error| error.error)
+    temporary.as_file().sync_all()?;
+    temporary.persist(path)?;
+    directory.sync_all()
 }
 
 #[cfg(test)]
