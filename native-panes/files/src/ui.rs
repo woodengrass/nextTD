@@ -252,9 +252,9 @@ fn modal(f: &mut Frame, d: &Dialog) {
                 if input.width > 0 { text(f, Rect::new(input.x, input.y + y, 1, 1), "▊", border.reversed()); }
             }
             let r = inset(line(input, 1), 3);
-            let x = value.chars().take(*cursor).map(|c| c.width().unwrap_or(0)).sum::<usize>();
+            let x = single_line(value.chars().take(*cursor).collect::<String>()).width();
             let off = x.saturating_sub(r.width.saturating_sub(1).into());
-            f.render_widget(Paragraph::new(value.as_str()).scroll((0, off.min(65535) as u16)).style(if *selected { style().reversed() } else { style() }), r.intersection(f.area()));
+            f.render_widget(Paragraph::new(single_line(value)).scroll((0, off.min(65535) as u16)).style(if *selected { style().reversed() } else { style() }), r.intersection(f.area()));
             let cursor = (r.x + (x - off) as u16, r.y);
             if *b == 0 && r.width > 0 && r.height > 0 && f.area().contains(cursor.into()) {
                 f.buffer_mut()[cursor].set_style(if *selected { style().remove_modifier(Modifier::REVERSED) } else { style().reversed() });
@@ -264,7 +264,7 @@ fn modal(f: &mut Frame, d: &Dialog) {
         }
         Dialog::Delete { name, button: b, ready } => {
             text(f, line(body, 0), "Delete permanently?", style());
-            text(f, line(body, 1), &single_line(name), style());
+            text(f, line(body, 1), name, style());
             if *ready { text(f, line(body, 2), "Directories and their contents will be removed.", style()) }
             button(f, cancel, "Cancel", false, true, *b == 0);
             button(f, submit, "Delete", true, *ready, *b == 1);
@@ -278,7 +278,7 @@ pub fn draw(f: &mut Frame, ui: &Ui) {
         f,
         inset(line(a, 1), 1),
         &ellipsis(
-            &format!("Files  /  {}", single_line(&ui.directory.to_string_lossy())),
+            &format!("Files  /  {}", single_line(&ui.directory)),
             a.width.saturating_sub(2),
         ),
         style().bold(),
@@ -307,7 +307,7 @@ pub fn draw(f: &mut Frame, ui: &Ui) {
                 format!(
                     "{} {}",
                     if p == &ui.directory { ">" } else { " " },
-                    single_line(&p.file_name().unwrap_or(p.as_os_str()).to_string_lossy())
+                    single_line(p.file_name().unwrap_or(p.as_os_str()))
                 )
             } else {
                 break;
@@ -324,7 +324,7 @@ pub fn draw(f: &mut Frame, ui: &Ui) {
             )
         }
     }
-    let err = &ui.listing.error;
+    let err = single_line(&ui.listing.error);
     let empty = ui.listing.entries.is_empty();
     if table.width > 0 {
         heading(
@@ -356,7 +356,7 @@ pub fn draw(f: &mut Frame, ui: &Ui) {
             .take(table.height.saturating_sub(3).into())
             .enumerate()
         {
-            let name = single_line(&e.path.file_name().unwrap_or_default().to_string_lossy())
+            let name = single_line(e.path.file_name().unwrap_or_default())
                 + if e.directory { "/" } else { "" };
             table_row(
                 f,
@@ -384,7 +384,7 @@ pub fn draw(f: &mut Frame, ui: &Ui) {
             let status = if ui.loading {
                 "Loading folder…"
             } else if !err.is_empty() {
-                err
+                &err
             } else {
                 "Empty folder — n: folder, f: file"
             };
@@ -460,7 +460,7 @@ pub fn draw(f: &mut Frame, ui: &Ui) {
                 if ui.loading {
                     "Loading folder…"
                 } else if !err.is_empty() {
-                    err
+                    &err
                 } else if empty {
                     "This folder is empty. Press n or f to create an item."
                 } else {
@@ -470,8 +470,7 @@ pub fn draw(f: &mut Frame, ui: &Ui) {
                         .get(ui.row)
                         .and_then(|e| e.path.file_name())
                         .unwrap_or_default();
-                    loading_preview =
-                        format!("Loading preview: {}", single_line(&name.to_string_lossy()));
+                    loading_preview = format!("Loading preview: {}", single_line(name));
                     &loading_preview
                 },
                 style().dim(),

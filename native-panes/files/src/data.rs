@@ -28,20 +28,33 @@ pub struct Preview {
     pub lines: Vec<String>,
 }
 
-pub fn single_line(s: &str) -> String {
-    s.chars()
-        .map(|c| match get_general_category(c) {
-            G::Control
-            | G::Format
-            | G::Surrogate
-            | G::PrivateUse
-            | G::Unassigned
-            | G::LineSeparator
-            | G::ParagraphSeparator => '?',
-            G::SpaceSeparator if c != ' ' => '?',
-            _ => c,
-        })
-        .collect()
+pub fn single_line(s: impl AsRef<std::ffi::OsStr>) -> String {
+    use std::{fmt::Write as _, os::unix::ffi::OsStrExt as _};
+    let mut out = String::new();
+    for chunk in s.as_ref().as_bytes().utf8_chunks() {
+        for c in chunk.valid().chars() {
+            match get_general_category(c) {
+                _ if c == '\\' => out.push_str("\\\\"),
+                G::Control
+                | G::Format
+                | G::Surrogate
+                | G::PrivateUse
+                | G::Unassigned
+                | G::LineSeparator
+                | G::ParagraphSeparator
+                | G::SpaceSeparator
+                    if c != ' ' =>
+                {
+                    write!(out, "\\u{{{:x}}}", c as u32).unwrap();
+                }
+                _ => out.push(c),
+            }
+        }
+        for b in chunk.invalid() {
+            write!(out, "\\x{b:02x}").unwrap();
+        }
+    }
+    out
 }
 fn bytes(size: u64) -> String {
     let digits = size.to_string();
@@ -170,7 +183,7 @@ thread_local! {
 }
 
 pub fn preview(path: &Path) -> Preview {
-    let name = single_line(&path.file_name().unwrap_or_default().to_string_lossy());
+    let name = single_line(path.file_name().unwrap_or_default());
     let make = |kind: &str,
                 size: Option<u64>,
                 meta: Option<&fs::Metadata>,
@@ -195,7 +208,7 @@ pub fn preview(path: &Path) -> Preview {
                 Some(m.len()),
                 Some(&m),
                 false,
-                vec![single_line(&format!(
+                vec![single_line(format!(
                     "Link to {}",
                     fs::read_link(path)?.display()
                 ))],
@@ -317,7 +330,7 @@ pub fn preview(path: &Path) -> Preview {
             None,
             None,
             false,
-            vec![single_line(&format!(
+            vec![single_line(format!(
                 "Cannot preview: {}",
                 os_error(&e, path)
             ))],

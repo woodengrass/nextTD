@@ -155,3 +155,53 @@ def test_editor_runs_configured_command_with_selected_real_file_and_restored_env
         pty.wait_for("notes.txt")
     finally:
         pty.close()
+
+
+def test_delete_detail_visibly_distinguishes_raw_filename(tmp_path: Path) -> None:
+    root = tmp_path / "files"
+    root.mkdir()
+    (root / os.fsdecode(b"odd?\\\xff\x1b\x7f\xc2\x85")).touch()
+    pane = FilesPty(require_binary(), root, tmp_path)
+    try:
+        pane.wait_for("odd?")
+        pane.send("d")
+        frame = pane.wait_for("Delete permanently?")
+        detail = frame.split("Delete permanently?", 1)[1].splitlines()[1]
+        assert r"odd?\\\xff\u{1b}\u{7f}\u{85}" in detail
+    finally:
+        pane.close()
+
+
+def test_sigterm_restores_terminal(tmp_path: Path) -> None:
+    import fcntl
+    import select
+    import termios
+
+    (tmp_path / "signal-ready").touch()
+    master, slave = os.openpty()
+    termios.tcsetwinsize(slave, (24, 100))
+
+    def control_terminal() -> None:
+        os.setsid()
+        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+    try:
+        with subprocess.Popen([require_binary(), str(tmp_path)], stdin=slave, stdout=slave, stderr=slave, preexec_fn=control_terminal) as proc:
+            output = b""
+            try:
+                while b"signal-ready" not in output:
+                    assert select.select([master], [], [], 5)[0], output
+                    output += os.read(master, 65536)
+                assert b"\x1b[?1049h" in output
+                proc.terminate()
+                proc.wait(timeout=5)
+                while select.select([master], [], [], 0)[0]:
+                    output += os.read(master, 65536)
+                flags = termios.tcgetattr(slave)[3]
+                assert flags & termios.ECHO and flags & termios.ICANON
+                assert b"\x1b[?1049l" in output
+            finally:
+                proc.kill()
+    finally:
+        os.close(slave)
+        os.close(master)

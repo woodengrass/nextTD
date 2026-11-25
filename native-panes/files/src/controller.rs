@@ -293,7 +293,7 @@ impl Controller {
         }
     }
     fn notify(&mut self, s: impl Into<String>, severity: Severity) {
-        self.ui.toast = Some((s.into(), severity));
+        self.ui.toast = Some((data::single_line(s.into()), severity));
         self.expires = Some(Instant::now() + Duration::from_secs(3))
     }
     fn selected(&self) -> Option<PathBuf> {
@@ -669,7 +669,7 @@ impl Controller {
                         "No current selection. Cancel and choose a file.".into()
                     }
                 },
-                |s| s.to_string_lossy().into_owned(),
+                data::single_line,
             );
         self.ui.dialog = Some(Dialog::Delete {
             name,
