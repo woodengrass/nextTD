@@ -188,7 +188,7 @@ fn table_row(f: &mut Frame, r: Rect, cols: [&str; 3], st: Style) {
         x += w + 2
     }
 }
-fn dialogs(area: Rect, d: &Dialog) -> (Rect, Rect, Rect, Rect) {
+pub(crate) fn dialogs(area: Rect, d: &Dialog) -> (Rect, Rect, Rect, Rect) {
     let (w, h) = match d {
         Dialog::Help => (68, 11),
         Dialog::Name { .. } => (60, 11),
@@ -489,12 +489,22 @@ pub fn draw(f: &mut Frame, ui: &Ui) {
         f.render_widget(Block::default().style(style()), r.intersection(a));
         text(f, inset(line(r, 1), 1), s, toast_style)
     }
+    let desktop =
+        std::env::var_os("TDNEXT_ZELLIJ").is_some() && std::env::var_os("ZELLIJ_PANE_ID").is_some();
+    if desktop {
+        crate::desktop_ui::paint(f, ui);
+    }
     if let Some(d) = &ui.dialog {
         let buffer = f.buffer_mut();
         for y in a.y..a.bottom() {
             for x in a.x..a.right() {
                 let cell = &mut buffer[(x, y)];
-                cell.modifier.insert(Modifier::DIM);
+                if desktop {
+                    let table = panes(a.width, a.height, ui)[1];
+                    crate::desktop_ui::dim(cell, table.contains((x, y).into()) && y == table.y + 2);
+                } else {
+                    cell.modifier.insert(Modifier::DIM);
+                }
             }
         }
         let (body, _, _, _) = dialogs(a, d);
@@ -503,6 +513,9 @@ pub fn draw(f: &mut Frame, ui: &Ui) {
         f.render_widget(ratatui::widgets::Clear, area);
         f.render_widget(Block::default().style(style()), area);
         modal(f, d);
+        if desktop {
+            crate::desktop_ui::paint_modal(f, d);
+        }
     }
 }
 pub fn hit(ui: &Ui, w: u16, h: u16, x: u16, y: u16) -> Hit {
@@ -675,6 +688,89 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(pane.x + 1, pane.y + 11)].symbol(), "1");
         assert_eq!(buffer[(pane.x + 2, pane.y + 11)].symbol(), "1");
+    }
+
+    #[test]
+    fn desktop_preview_scrollbar_thumb_is_visible_and_moves() {
+        let mut ui = ui();
+        ui.preview = Some(Preview {
+            meta: vec![],
+            lines: vec!["x".repeat(100)],
+        });
+        let pane = panes(80, 24, &ui)[2];
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let capture = |terminal: &mut Terminal<TestBackend>, ui: &Ui| {
+            terminal
+                .draw(|frame| {
+                    draw(frame, ui);
+                    crate::desktop_ui::paint(frame, ui);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let y = pane.bottom() - 1;
+            (pane.x + 1..pane.right() - 1)
+                .filter(|&x| {
+                    let cell = &buffer[(x, y)];
+                    cell.modifier.contains(Modifier::REVERSED) || cell.symbol() != " "
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = capture(&mut terminal, &ui);
+        assert!(
+            before.len() > 1,
+            "whole-cell scrollbar thumb must be visible: {before:?}"
+        );
+        ui.preview_x = 100 - usize::from(pane.width - 2);
+        let after = capture(&mut terminal, &ui);
+        assert!(
+            after.len() > 1,
+            "scrolled thumb must remain visible: {after:?}"
+        );
+        assert!(after[0] > before[0], "thumb must move right");
+    }
+
+    #[test]
+    fn desktop_pending_delete_is_visibly_disabled_until_ready() {
+        let mut ui = ui();
+        ui.dialog = Some(Dialog::Delete {
+            name: "entry".into(),
+            button: 0,
+            ready: false,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let render = |terminal: &mut Terminal<TestBackend>, ui: &Ui| {
+            terminal
+                .draw(|frame| {
+                    draw(frame, ui);
+                    crate::desktop_ui::paint_modal(frame, ui.dialog.as_ref().unwrap());
+                })
+                .unwrap();
+            let (body, _, _, submit) =
+                dialogs(Rect::new(0, 0, 80, 24), ui.dialog.as_ref().unwrap());
+            let buffer = terminal.backend().buffer();
+            (
+                buffer[(submit.x + 5, submit.y + 1)].clone(),
+                buffer[(body.x, body.y)].clone(),
+            )
+        };
+        let (pending, surface) = render(&mut terminal, &ui);
+        assert!(
+            pending.modifier.contains(Modifier::DIM),
+            "pending delete must be dimmed: {pending:?}"
+        );
+        assert_eq!(
+            pending.bg, surface.bg,
+            "pending delete must not use the active destructive surface"
+        );
+        if let Some(Dialog::Delete { ready, .. }) = &mut ui.dialog {
+            *ready = true;
+        }
+        let (ready, _) = render(&mut terminal, &ui);
+        assert_ne!(
+            ready.bg, pending.bg,
+            "ready delete must regain its destructive surface"
+        );
+        assert!(!ready.modifier.contains(Modifier::DIM));
     }
 
     #[test]

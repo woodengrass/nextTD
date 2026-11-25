@@ -1,8 +1,10 @@
 mod actions;
 #[cfg(test)]
 mod actions_tests;
+mod ansi_output;
 mod controller;
 mod data;
+mod desktop_ui;
 mod terminal;
 mod ui;
 

@@ -1,0 +1,39 @@
+# golden-screen v1 cols=120 rows=38
+\x1b[40m \x1b[1m\x1b[97mTERMINAL DESKTOP\x1b[0m\x1b[40m                                                                                    \x1b[1;7m\x1b[97m Settings [Alt+o] \x1b[0m\x1b[40m 
+\x1b[38;2;128;128;128m\x1b[49m─────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────
+\x1b[39m\x1b[40m                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[1m\x1b[97mSettings\x1b[0m\x1b[40m                                                                            \x1b[37m┌──────────┐\x1b[39m 
+ \x1b[97mF7: Collapse\x1b[39m        \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m                                                                                     \x1b[37m│\x1b[39m  \x1b[1m\x1b[97m Back \x1b[0m\x1b[40m  \x1b[37m│\x1b[39m 
+ \x1b[1m\x1b[97mWORKSPACE\x1b[0m\x1b[40m           \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m                                                                                     \x1b[37m└──────────┘\x1b[39m 
+ \x1b[1m\x1b[97m                   \x1b[0m\x1b[40m \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m┌─────────────┐┌─────────────┐\x1b[39m                                                                   
+ \x1b[37mVIEWS\x1b[39m               \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m│\x1b[39m \x1b[1m\x1b[97m   General \x1b[0m\x1b[40m \x1b[37m││\x1b[39m \x1b[1m\x1b[97m > Plugins \x1b[0m\x1b[40m \x1b[37m│\x1b[39m                                                                   
+ \x1b[37m                   \x1b[39m \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m└─────────────┘└─────────────┘\x1b[39m                                                                   
+ \x1b[46m                   \x1b[40m \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37mManage trusted local plugins.\x1b[39m                                                                    
+ \x1b[1m\x1b[97m\x1b[46m  ▤    Files\x1b[0m\x1b[46m       \x1b[40m \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37mi Install  e Enable  d Disable   u Uninstall\x1b[39m                                                     
+ \x1b[46m                   \x1b[40m \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m┌──────────────────────────────────────────────────────────────────────────────────────────────┐\x1b[39m 
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m│\x1b[1m\x1b[97m\x1b[100m Plugin    State                                                                              \x1b[0m\x1b[37m\x1b[40m│\x1b[39m 
+ \x1b[97m  ▥    Monitor\x1b[39m      \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m│\x1b[1m\x1b[97m\x1b[46m Desktop   Enabled                                                                            \x1b[0m\x1b[37m\x1b[40m│\x1b[39m 
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m│\x1b[97m Files     Enabled                                                                            \x1b[37m│\x1b[39m 
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m│\x1b[97m Codicons  Enabled                                                                            \x1b[37m│\x1b[39m 
+ \x1b[97m  >_   Shell\x1b[39m        \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m│\x1b[97m Monitor   Enabled                                                                            \x1b[37m│\x1b[39m 
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m│\x1b[97m Settings  Enabled                                                                            \x1b[37m│\x1b[39m 
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m│\x1b[97m Shell     Enabled                                                                            \x1b[37m│\x1b[39m 
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m│\x1b[97m                                                                                              \x1b[37m│\x1b[39m 
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m│\x1b[97m                                                                                              \x1b[37m│\x1b[39m 
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m│\x1b[97m                                                                                              \x1b[37m│\x1b[39m 
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m│\x1b[97m                                                                                              \x1b[37m│\x1b[39m 
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m│\x1b[97m                                                                                              \x1b[37m│\x1b[39m 
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m│\x1b[97m                                                                                              \x1b[37m│\x1b[39m 
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m│\x1b[97m                                                                                              \x1b[37m│\x1b[39m 
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m│\x1b[97m                                                                                              \x1b[37m│\x1b[39m 
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m│\x1b[97m                                                                                              \x1b[37m│\x1b[39m 
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m└──────────────────────────────────────────────────────────────────────────────────────────────┘\x1b[39m 
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37mProtected (running Desktop / Settings): Persistent terminal desktop shell\x1b[39m                        
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[90m┌──────────────────────┐┌──────────────────────┐┌──────────────────────┐┌──────────────────────┐\x1b[39m 
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[90m│\x1b[39m      \x1b[1m\x1b[90m Install \x1b[0m\x1b[40m       \x1b[90m││\x1b[39m       \x1b[1m\x1b[90m Enable \x1b[0m\x1b[40m       \x1b[90m││\x1b[39m      \x1b[1m\x1b[90m Disable \x1b[0m\x1b[40m       \x1b[90m││\x1b[39m     \x1b[1m\x1b[90m Uninstall \x1b[0m\x1b[40m      \x1b[90m│\x1b[39m 
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[90m└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘\x1b[39m 
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m┌──────────────────────────────────────────────────────────────────────────────────────────────┐\x1b[39m 
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m│\x1b[97mChanges apply after restarting the desktop.\x1b[39m                                                   \x1b[37m│\x1b[39m 
+ \x1b[37mAlt+1..9 switch\x1b[39m     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[37m└──────────────────────────────────────────────────────────────────────────────────────────────┘\x1b[39m 
+ \x1b[37mCtrl+q quit\x1b[39m         \x1b[38;2;128;128;128m\x1b[49m├──────────────────────────────────────────────────────────────────────────────────────────────────
+\x1b[39m\x1b[40m \x1b[37m                   \x1b[39m \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[97mTool (Settings): Esc Back   Tab Sections and controls\x1b[39m                                            
+                     \x1b[38;2;128;128;128m\x1b[49m│\x1b[39m\x1b[40m \x1b[97mGlobal: Ctrl+q quit Ctrl+p panes Alt+o header Alt+1..3 views\x1b[39m                                     

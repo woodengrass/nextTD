@@ -1,5 +1,17 @@
-`uv` 不在 PATH 時，可使用專案現有虛擬環境執行檢查：`.venv/bin/pytest -q`、`.venv/bin/ruff check .`、`.venv/bin/basedpyright`。
-桌面進入點為 Rust：`cargo build --locked --release --manifest-path native-desktop/Cargo.toml`；patched core：`scripts/build-zellij-core-navigation.sh <zellij-checkout> <dest>`（HEAD 須為 script 內 pinned commit，見 `patches/`）。standalone 發布須同時包含 launcher 與同版 patched core（預設為執行檔旁的 `tdnext-core`，或 `--core` 指定），不可用 stock Zellij。Python wheel 只含工具與管理 CLI，不打包 WASM/broker/core；Python 工具安裝不需 Rust/Zellij。
-獨立 Files pane：`cargo build --locked --release --manifest-path native-panes/files/Cargo.toml`；`cargo test --locked --manifest-path native-panes/files/Cargo.toml`；直接執行 `native-panes/files/target/release/tdnext-files [DIRECTORY]`。
-變異測試（`cargo` 需先 `export PATH="$HOME/.cargo/bin:$PATH"`）：`cargo install --locked cargo-mutants`（已驗證 v27.1.0）；範圍執行 `cargo mutants -d native-panes/files -f src/data.rs -F 'src/data.rs:116:37' -o /tmp/opencode/mutants-scratch -- <單一test名稱>`（`-F` 在 v27.1.0 會選中同函數數個 mutant，輸出至 scratch，repo 不留 `mutants.out`）。
-專案檢查入口：`make check`（`ZELLIJ_SRC` 或 `TDNEXT_ZELLIJ_SRC` 提供 pinned 上游 checkout，未提供則自動 depth-1 shallow fetch；需 Rust 1.95（見 `rust-toolchain.toml`）、Python 3.12（見 `.python-version`）、uv 與 `scripts/ci-verify-env.sh` 所列系統工具；pytest 一律跑剛建好的 core，`state/bin/btop` 只增不覆寫）；release smoke（tagged）仍屬 workflow，不在 `make check` 內。CI 等待：`gh pr checks <PR號碼> --watch --fail-fast`。
+# 開始工作
+
+以目前的 Git 根目錄為準。先讀 `GOALS.md` 和改動範圍內適用的 `*.adr.md`；建置與執行方式見 `README.md`。
+
+## 開發流程
+
+從 `main` 開功能分支。開發中先跑與改動相關的檢查，交付前在根目錄執行 `make check`。開 PR 後用 `gh pr checks <PR號碼> --watch --fail-fast` 查看結果，確認 `ci-required` 通過後再合併。
+
+## 專案指令
+
+- `make verify-dist ARCHIVE=<archive.tar.gz>`：只跑發行包驗收（`scripts/verify-dist.py`，有 venv 時用 venv 的 Python）。
+- `make check ARCHIVE_OUT=<絕對路徑>`：全數通過後才輸出受測壓縮包與 `<路徑>.sha256`（`sha256sum` 格式）。
+- `tests/golden/**/*.screen`（含 `tests/golden/ansi16/`）、`tests/golden.lock*`、`scripts/check-golden-lock.py` 一旦進入 base 即凍結；PR 更動一律失敗，無 `Spec-change:` 例外（首次加入需 `Spec-change:`；巢狀 `ansi16` 檔雜湊須釘在 `tests/golden.lock.ansi16.json`，由其專屬 exact-set guard 驗證）。
+
+## 使用 VM
+
+一般開發與 CI 不需要 VM。只有任務明確需要 VM 或 `partner-test` 基準時，才讀根目錄的 `./VM-INFO.md`。這是本機檔案，不提交到 Git；若檔案不存在，請指出缺少本機設定，不要猜測連線方式。保留 VM 既有的設定與工作階段，不得刪除或覆寫。

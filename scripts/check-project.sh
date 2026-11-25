@@ -15,6 +15,11 @@
 #      used; the checkout is never modified). When neither is given, the
 #      pinned commit is shallow-fetched (depth 1) into a private temp
 #      directory.
+#   $3 / ARCHIVE_OUT: optional absolute path of the release archive to write
+#      (e.g. /tmp/tdnext-linux-x86_64.tar.gz). The tested archive bytes are
+#      copied there together with a `<path>.sha256` checksum file in
+#      sha256sum text format (`<hash><two spaces><basename>`), but only
+#      after every gate below succeeds.
 #
 # Scope (mirrors the workflow `ci` job; the tagged release smoke stays in
 # the workflow, which owns it):
@@ -42,9 +47,18 @@
 #      must be executable mode 0755 and the core must report native chrome
 #      version 1.
 #   6. uv run ruff check ., uv run basedpyright,
-#      scripts/ci-run-pytest.sh (full default suite once; skips fail, an empty
-#      pass fails).
+#      scripts/ci-run-pytest.sh (full default suite once, except the golden
+#      file deselected via TDNEXT_GOLDEN_VIA_VERIFY_DIST=1; skips fail, an
+#      empty pass fails).
 #   7. uv build --wheel into a private temp dir (exactly one wheel).
+#   8. scripts/build-dist.sh stages the tested siblings (reusing the fresh
+#      core from step 4, no rebuild), the stage is archived exactly once
+#      into tdnext-linux-x86_64.tar.gz, and scripts/verify-dist.py verifies
+#      that archive (same gate as `make verify-dist`: venv python when
+#      present, else python3). The verifier owns tests/test_desktop_golden.py
+#      against the extracted dist root, so golden coverage still runs exactly
+#      once per check. ARCHIVE_OUT (plus `<path>.sha256`) is written only
+#      after this gate passes.
 #
 # Every step propagates failures (set -euo pipefail, no `|| true`); the first
 # failure aborts the run and names the step. All private temp directories are
@@ -54,6 +68,7 @@ set -euo pipefail
 
 ROOT="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
 ZELLIJ_SRC_INPUT="${2:-${TDNEXT_ZELLIJ_SRC:-}}"
+ARCHIVE_OUT="${3:-${ARCHIVE_OUT:-}}"
 cd "${ROOT}"
 
 # Rust crate builds use their default target/ dirs (reusing existing build
@@ -100,9 +115,11 @@ discover_crates() {
   # $1 = root. Prints the launcher manifest first, then every native pane
   # manifest; fails when mandatory coverage is absent.
   local root="$1" manifest count
-  test -f "${root}/native-desktop/Cargo.toml" \
-    || { echo "check-project: error: mandatory launcher crate missing: native-desktop/Cargo.toml" >&2; return 1; }
-  printf '%s\n' "${root}/native-desktop/Cargo.toml"
+  for manifest in "${root}/native-desktop/Cargo.toml" "${root}/native-manager/Cargo.toml" "${root}/native-panes/settings/Cargo.toml"; do
+    test -f "${manifest}" \
+      || { echo "check-project: error: mandatory crate missing: ${manifest}" >&2; return 1; }
+  done
+  printf '%s\n' "${root}/native-desktop/Cargo.toml" "${root}/native-manager/Cargo.toml"
   count=0
   shopt -s nullglob
   for manifest in "${root}"/native-panes/*/Cargo.toml; do
@@ -280,6 +297,10 @@ uv run basedpyright
 CURRENT="run the full suite once on the fresh core (scripts/ci-run-pytest.sh)"
 step "${CURRENT}"
 export TDNEXT_CORE_BINARY="${CORE_DEST}"
+# The golden desktop file runs inside the archive gate below (step 8 owns it
+# via scripts/verify-dist.py), so it is deselected exactly here and nowhere
+# else: one run per check, never skipped, never duplicated.
+export TDNEXT_GOLDEN_VIA_VERIFY_DIST=1
 bash scripts/ci-run-pytest.sh "${ROOT}"
 
 # 7. Packaging: the wheel must build.
@@ -292,5 +313,43 @@ uv build --wheel --out-dir "${WHEEL_DIR}"
 test "$(find "${WHEEL_DIR}" -maxdepth 1 -name '*.whl' | wc -l)" -eq 1 \
   || fail "expected exactly 1 wheel in ${WHEEL_DIR}"
 
+CURRENT="stage siblings, archive once, verify the archive (scripts/verify-dist.py)"
+step "${CURRENT}"
+test -f "${ROOT}/scripts/verify-dist.py" \
+  || fail "scripts/verify-dist.py is missing (archive verifier track owns it); refusing to pass without the archive gate."
+STAGE_PARENT=""
+mktemp_dir tdnext-stage
+STAGE_PARENT="${MKTEMP_DIR}"
+DIST_STAGE="${STAGE_PARENT}/tdnext"
+# Reuse the probed fresh core: the core is built once per check (step 4),
+# and staging must archive those exact tested bytes, not a second build.
+export TDNEXT_PREBUILT_CORE="${CORE_DEST}"
+bash scripts/build-dist.sh "${DIST_STAGE}" "${ZELLIJ_SRC}"
+ARCHIVE="${STAGE_PARENT}/tdnext-linux-x86_64.tar.gz"
+tar -C "${STAGE_PARENT}" -czf "${ARCHIVE}" tdnext
+# Same interpreter rule as `make verify-dist`: the verifier imports project
+# test dependencies, so prefer the synced project venv when present.
+if test -x "${ROOT}/.venv/bin/python"; then
+  VERIFY_PY="${ROOT}/.venv/bin/python"
+else
+  VERIFY_PY="python3"
+fi
+"${VERIFY_PY}" "${ROOT}/scripts/verify-dist.py" "${ARCHIVE}"
+ARCHIVE_SHA="$(sha256sum "${ARCHIVE}")"
+ARCHIVE_BYTES="$(stat -c %s "${ARCHIVE}")"
+echo "check-project: archive verified: tdnext-linux-x86_64.tar.gz (${ARCHIVE_BYTES} bytes, sha256 ${ARCHIVE_SHA%% *})."
+if test -n "${ARCHIVE_OUT:-}"; then
+  case "${ARCHIVE_OUT}" in
+    /*) ;;
+    *) fail "ARCHIVE_OUT must be an absolute path: ${ARCHIVE_OUT}" ;;
+  esac
+  test -e "${ARCHIVE_OUT}" -o -L "${ARCHIVE_OUT}" \
+    && fail "ARCHIVE_OUT already exists; refusing to overwrite: ${ARCHIVE_OUT}"
+  mkdir -p "$(dirname "${ARCHIVE_OUT}")"
+  cp -- "${ARCHIVE}" "${ARCHIVE_OUT}"
+  ( cd "$(dirname "${ARCHIVE_OUT}")" && sha256sum "$(basename "${ARCHIVE_OUT}")" > "${ARCHIVE_OUT}.sha256" )
+  echo "check-project: exported tested archive to ${ARCHIVE_OUT} (+ .sha256)."
+fi
+
 DUR="$(( $(date +%s) - START ))"
-echo "check-project: ok in ${DUR}s (crates: ${#CRATE_MANIFESTS[@]}, fresh core: ${CORE_DEST}, wheel: $(basename "$(find "${WHEEL_DIR}" -maxdepth 1 -name '*.whl')"))."
+echo "check-project: ok in ${DUR}s (crates: ${#CRATE_MANIFESTS[@]}, fresh core: ${CORE_DEST}, wheel: $(basename "$(find "${WHEEL_DIR}" -maxdepth 1 -name '*.whl')"), archive: tdnext-linux-x86_64.tar.gz)."
