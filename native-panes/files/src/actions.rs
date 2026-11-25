@@ -474,7 +474,7 @@ fn copy_access(
                     // Linux POSIX ACL xattr: version followed by (tag,perm,id) records.
                     let mut shared = 7;
                     for entry in acl[4..n].chunks_exact(8) {
-                        if matches!(u16::from_le_bytes([entry[0], entry[1]]), 4 | 16 | 32) {
+                        if matches!(u16::from_le_bytes([entry[0], entry[1]]), 4 | 8 | 16 | 32) {
                             shared &= entry[2];
                         }
                     }
@@ -572,6 +572,29 @@ fn unlink_tree(
     let held = pin(&path)?;
     if !same_entry(&fd_metadata(&held)?, &expected) {
         return Err(changed(&entry.path));
+    }
+    // Descending first could empty a directory whose own name cannot be removed.
+    rustix::fs::accessat(
+        parent,
+        ".",
+        Access::WRITE_OK | Access::EXEC_OK,
+        rustix::fs::AtFlags::EACCESS,
+    )
+    .map_err(|e| {
+        format!(
+            "Cannot remove {}: {e}",
+            crate::data::single_line(&entry.path)
+        )
+    })?;
+    let parent_meta = fd_metadata(parent)?;
+    if parent_meta.mode() & libc::S_ISVTX != 0 {
+        let uid = rustix::process::geteuid().as_raw();
+        if uid != expected.uid() && uid != parent_meta.uid() {
+            return Err(format!(
+                "Cannot remove {}: sticky directory",
+                crate::data::single_line(&entry.path)
+            ));
+        }
     }
     check_mount(parent, &held, &entry.path)?;
     #[cfg(test)]
