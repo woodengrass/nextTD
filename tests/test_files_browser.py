@@ -172,6 +172,19 @@ def test_delete_detail_visibly_distinguishes_raw_filename(tmp_path: Path) -> Non
         pane.close()
 
 
+def wait_for_input_poll(pid: int) -> None:
+    # The rendered frame alone does not establish that the input read has begun.
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        for path in Path(f"/proc/{pid}/task").glob("*/wchan"):
+            try:
+                if "ep_poll" in path.read_text():
+                    return
+            except FileNotFoundError:
+                continue  # A directory listing or preview worker just finished.
+    pytest.fail("event reader never entered epoll")
+
+
 def test_sigterm_restores_terminal(tmp_path: Path) -> None:
     import fcntl
     import select
@@ -195,8 +208,9 @@ def test_sigterm_restores_terminal(tmp_path: Path) -> None:
                     assert select.select([master], [], [], 5)[0], output
                     output += os.read(master, 65536)
                 assert b"\x1b[?1049h" in output
+                wait_for_input_poll(proc.pid)
                 proc.terminate()
-                proc.wait(timeout=5)
+                assert proc.wait(timeout=2) == 0
                 while select.select([master], [], [], 0)[0]:
                     output += os.read(master, 65536)
                 flags = termios.tcgetattr(slave)[3]
@@ -207,3 +221,62 @@ def test_sigterm_restores_terminal(tmp_path: Path) -> None:
     finally:
         os.close(slave)
         os.close(master)
+
+
+@pytest.mark.parametrize("operation", ["idle", "copying", "no-controlling-tty"])
+def test_master_hangup_exits_during_event_read(tmp_path: Path, operation: str) -> None:
+    import fcntl
+    import select
+    import termios
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "ready-file").touch()
+    if operation == "copying":
+        for i in range(2048):
+            (source / f"child-{i}").touch()
+    dest = tmp_path / "z-destination"
+    dest.mkdir()
+    master, slave = os.openpty()
+    termios.tcsetwinsize(slave, (24, 100))
+
+    def control_terminal() -> None:
+        os.setsid()
+        if operation != "no-controlling-tty":
+            fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+    def see(marker: bytes) -> None:
+        output = b""
+        deadline = time.monotonic() + 5
+        while marker not in output:
+            assert select.select([master], [], [], max(0, deadline - time.monotonic()))[0], output[-500:]
+            output += os.read(master, 65536)
+
+    try:
+        with subprocess.Popen(
+            [require_binary(), str(tmp_path if operation == "copying" else source)],
+            stdin=slave, stdout=slave, stderr=slave, preexec_fn=control_terminal,
+        ) as proc:
+            try:
+                if operation == "copying":
+                    see(b"z-destination")
+                    os.write(master, b"yj\r")
+                    see(b"Empty folder")
+                    os.write(master, b"p")
+                    deadline = time.monotonic() + 3
+                    while not any(dest.iterdir()):
+                        assert time.monotonic() < deadline, "copy never started"
+                else:
+                    see(b"ready-file")
+                wait_for_input_poll(proc.pid)
+                if operation == "copying":
+                    assert not (dest / "source/ready-file").exists(), "transfer already finished"
+                os.close(master)
+                master = -1
+                assert proc.wait(timeout=2) == 0
+            finally:
+                proc.kill()
+    finally:
+        os.close(slave)
+        if master >= 0:
+            os.close(master)
