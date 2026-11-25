@@ -1298,16 +1298,11 @@ fn copy_accepts_destination_timestamp_rounding() -> Result<(), Box<dyn std::erro
     let file = src.path().join("file");
     write(&file, b"content")?;
     set_times(&file, 1700000001, 1700000001)?;
-    let parent = dst.path().to_owned();
-    crate::actions::stash_between_note(&parent.join("file"), move || {
-        let stage = std::fs::read_dir(parent)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        set_times(&stage.join("file"), 1700000000, 1700000000).unwrap();
-    });
+    // Emulate the precision of the timestamp actually stored by futimens,
+    // before recording the fd snapshot (not a subsequent external edit).
+    crate::actions::AFTER_FILE_METADATA.set(Some(Box::new(|p| {
+        set_times(p, 1700000000, 1700000000).unwrap()
+    })));
     let copy = paste(&file, dst.path(), false)?;
     assert_eq!(copy.metadata()?.mtime(), 1700000000);
     assert_eq!(read(&copy)?, b"content");
@@ -1561,6 +1556,7 @@ fn same_length_staged_edit_is_not_published() -> Result<(), Box<dyn std::error::
     let dst = dir()?;
     let item = src.path().join("file");
     write(&item, b"good")?;
+    set_times(&item, 1700000000, 1700000000)?;
     let parent = dst.path().to_owned();
     crate::actions::stash_between_note(&parent.join("file"), move || {
         let stage = std::fs::read_dir(parent)
@@ -1571,7 +1567,28 @@ fn same_length_staged_edit_is_not_published() -> Result<(), Box<dyn std::error::
             .path();
         std::fs::write(stage.join("file"), b"evil").unwrap();
     });
-    assert!(paste(&item, dst.path(), false).is_err());
+    let err = paste(&item, dst.path(), false).unwrap_err();
+    assert!(err.contains("Staging remains"), "{err}");
+    let stage = std::fs::read_dir(dst.path())?.next().unwrap()?.path();
+    assert_eq!(read(&stage.join("file"))?, b"evil");
     assert!(!dst.path().join("file").exists());
+    Ok(())
+}
+
+#[test]
+fn published_same_length_edit_keeps_move_source() -> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = tempfile::tempdir_in("/dev/shm")?;
+    let file = src.path().join("file");
+    write(&file, b"good")?;
+    set_times(&file, 1700000000, 1700000000)?;
+    let visible = dst.path().join("file");
+    crate::actions::stash_between_note(&file, move || std::fs::write(visible, b"edit").unwrap());
+    assert!(
+        paste(&file, dst.path(), true)
+            .unwrap_err()
+            .contains("Partial move")
+    );
+    assert_eq!(read(&file)?, b"good");
     Ok(())
 }

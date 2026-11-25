@@ -67,7 +67,6 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::fd::AsFd as _;
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -226,11 +225,11 @@ pub fn remove(src: &Path) -> Result<(), String> {
     remove_confirmed(src, confirm(src)?)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Identity(u64, u64, std::fs::FileType);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Identity(u64, u64, u32);
 impl From<&std::fs::Metadata> for Identity {
     fn from(m: &std::fs::Metadata) -> Self {
-        Self(m.dev(), m.ino(), m.file_type())
+        Self(m.dev(), m.ino(), m.mode() & libc::S_IFMT)
     }
 }
 pub fn identity(path: &Path) -> Result<Identity, String> {
@@ -352,14 +351,18 @@ pub fn remove_confirmed(src: &Path, confirmed: Confirmed) -> Result<(), String> 
     {
         return Err(changed(src));
     }
-    unlink_tree(&parent, &tree, &mut HashMap::new(), false)
+    unlink_tree(&parent, &tree, &mut HashMap::new(), None)
 }
 fn changed(path: &Path) -> String {
     format!("Source changed: {}", crate::data::single_line(path))
 }
 
 /// Atomically recreate a symlink; fails if the destination exists.
-fn copy_symlink_noreplace(source: &Path, target: &Path) -> Result<(), String> {
+fn copy_symlink_noreplace(
+    source: &Path,
+    target: &Path,
+    parent: &std::fs::File,
+) -> Result<Identity, String> {
     let link = std::fs::read_link(source).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             source_gone(&display_name(source))
@@ -367,13 +370,20 @@ fn copy_symlink_noreplace(source: &Path, target: &Path) -> Result<(), String> {
             error.to_string()
         }
     })?;
-    match std::os::unix::fs::symlink(&link, target) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(already_exists(&display_name(target)))
+    let name = target.file_name().ok_or(NAME_ERROR)?;
+    rustix::fs::symlinkat(&link, parent, name).map_err(|e| {
+        if e == Errno::EXIST {
+            already_exists(&display_name(target))
+        } else {
+            e.to_string()
         }
-        Err(error) => Err(error.to_string()),
-    }
+    })?;
+    identity_at(parent, name)
+}
+fn identity_at(parent: &std::fs::File, name: &OsStr) -> Result<Identity, String> {
+    let st = rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|e| e.to_string())?;
+    Ok(Identity(st.st_dev, st.st_ino, st.st_mode & libc::S_IFMT))
 }
 
 /// Best-effort extended-attribute copy mirroring `shutil._copyxattr`:
@@ -449,6 +459,7 @@ fn copy_access(
         .st_gid
         == group
         || rustix::fs::fchown(&target, None, Some(rustix::fs::Gid::from_raw(group))).is_ok();
+    let mut common = (meta.mode() >> 3) & meta.mode() & 7;
     copy_xattrs_fd(&source, &target);
     for attr in ["system.posix_acl_access", "system.posix_acl_default"] {
         if attr.ends_with("default") && !meta.is_dir() {
@@ -461,9 +472,18 @@ fn copy_access(
                     .map_err(|e| e.to_string())?;
                 if !keep_group {
                     // Linux POSIX ACL xattr: version followed by (tag,perm,id) records.
+                    let mut shared = 7;
+                    for entry in acl[4..n].chunks_exact(8) {
+                        if matches!(u16::from_le_bytes([entry[0], entry[1]]), 4 | 16 | 32) {
+                            shared &= entry[2];
+                        }
+                    }
+                    if attr == "system.posix_acl_access" {
+                        common &= u32::from(shared);
+                    }
                     for entry in acl[4..n].chunks_exact_mut(8) {
-                        if matches!(u16::from_le_bytes([entry[0], entry[1]]), 4 | 8 | 16) {
-                            entry[2..4].fill(0);
+                        if matches!(u16::from_le_bytes([entry[0], entry[1]]), 4 | 8 | 16 | 32) {
+                            entry[2] &= shared;
                         }
                     }
                 }
@@ -477,9 +497,11 @@ fn copy_access(
             Err(e) => return Err(e.to_string()),
         }
     }
-    Ok(Mode::from_bits_truncate(
-        meta.mode() & if keep_group { 0o1777 } else { 0o1707 },
-    ))
+    Ok(Mode::from_bits_truncate(if keep_group {
+        meta.mode() & 0o1777
+    } else {
+        (meta.mode() & 0o1700) | (common << 3) | common
+    }))
 }
 fn finish_metadata(
     target: impl rustix::fd::AsFd,
@@ -524,23 +546,26 @@ fn unchanged(path: &Path, metadata: &std::fs::Metadata) -> Result<(), String> {
 
 #[cfg(test)]
 pub(crate) fn cleanup_copied(entry: &CopiedEntry) -> Result<(), String> {
-    cleanup_if(entry, || Ok(()))
+    cleanup_if(entry, |_| Ok(()))
 }
 fn cleanup_if(
     entry: &CopiedEntry,
-    before_unlink: impl FnOnce() -> Result<(), String>,
+    before_unlink: impl Fn(&CopiedEntry) -> Result<(), String>,
 ) -> Result<(), String> {
     let parent = parent_dir(&entry.path)?;
     scan_removal(&parent, &entry.path)?;
-    before_unlink()?;
-    unlink_tree(&parent, entry, &mut HashMap::new(), true)
+    unlink_tree(&parent, entry, &mut HashMap::new(), Some(&before_unlink))
 }
+type CheckPublished<'a> = dyn Fn(&CopiedEntry) -> Result<(), String> + 'a;
 fn unlink_tree(
     parent: &std::fs::File,
     entry: &CopiedEntry,
     links: &mut HashMap<(u64, u64), std::fs::Metadata>,
-    move_cleanup: bool,
+    check: Option<&CheckPublished<'_>>,
 ) -> Result<(), String> {
+    if let Some(check) = check {
+        check(entry)?;
+    }
     let path = dir_path(parent).join(entry.path.file_name().ok_or(NAME_ERROR)?);
     let key = (entry.metadata.dev(), entry.metadata.ino());
     let expected = links.get(&key).unwrap_or(&entry.metadata).clone();
@@ -553,8 +578,47 @@ fn unlink_tree(
     if let Some(hook) = BEFORE_CLAIM.take() {
         hook(&path);
     }
-    // Rename within the same parent: even a read-only directory can be
-    // claimed without rewriting its `..`. Never auto-unlink a rejected claim.
+    if expected.is_dir() {
+        let dir = checked_dir(parent, &path, Identity::from(&expected))?;
+        // Only the pinned source of a committed move may need
+        // owner write permission to unlink children. Restore it even when
+        // a conflict leaves some of the tree in place.
+        let mode = Mode::from_bits_truncate(expected.mode());
+        let needs_write = check.is_some()
+            && !entry.children.is_empty()
+            && !mode.contains(Mode::WUSR)
+            && rustix::fs::accessat(&dir, ".", Access::WRITE_OK, rustix::fs::AtFlags::EACCESS)
+                == Err(Errno::ACCESS);
+        if needs_write {
+            rustix::fs::fchmod(&dir, mode | Mode::WUSR).map_err(|e| e.to_string())?;
+        }
+        let mut children = Ok(());
+        for child in &entry.children {
+            if let Err(e) = unlink_tree(&dir, child, links, check) {
+                if children.is_ok() {
+                    children = Err(e);
+                }
+                if check.is_none() {
+                    break;
+                }
+            }
+        }
+        if needs_write && let Err(e) = rustix::fs::fchmod(&dir, mode) {
+            return Err(format!(
+                "Cannot restore source permissions on {}: {e}",
+                crate::data::single_line(&entry.path)
+            ));
+        }
+        children?;
+        if let Some(check) = check {
+            check(entry)?;
+        }
+        if identity(&path)? != Identity::from(&expected) {
+            return Err(changed(&entry.path));
+        }
+        return std::fs::remove_dir(&path).map_err(|e| e.to_string());
+    }
+    // A non-directory can be claimed and unlinked in immediate succession.
     let claim = tempfile::Builder::new()
         .prefix(".tdnext-remove-")
         .rand_bytes(16)
@@ -576,38 +640,10 @@ fn unlink_tree(
         {
             return Err(changed(&entry.path));
         }
-        if expected.is_dir() {
-            let dir = checked_dir(parent, slot, Identity::from(&actual))?;
-            // Only the already-claimed source of a committed move may need
-            // owner write permission to unlink children. Restore before giving
-            // a partially moved tree back its original name.
-            let mode = Mode::from_bits_truncate(actual.mode());
-            let needs_write = move_cleanup
-                && !entry.children.is_empty()
-                && !mode.contains(Mode::WUSR)
-                && rustix::fs::accessat(&dir, ".", Access::WRITE_OK, rustix::fs::AtFlags::EACCESS)
-                    == Err(Errno::ACCESS);
-            if needs_write {
-                rustix::fs::fchmod(&dir, mode | Mode::WUSR).map_err(|e| e.to_string())?;
-            }
-            let children = entry
-                .children
-                .iter()
-                .try_for_each(|child| unlink_tree(&dir, child, links, move_cleanup));
-            if needs_write && let Err(e) = rustix::fs::fchmod(&dir, mode) {
-                return Err(format!(
-                    "Cannot restore source permissions on {}: {e}",
-                    crate::data::single_line(&entry.path)
-                ));
-            }
-            children?;
-            if identity(slot)? != Identity::from(&expected) {
-                return Err(changed(&entry.path));
-            }
-            std::fs::remove_dir(slot).map_err(|e| e.to_string())
-        } else {
-            std::fs::remove_file(slot).map_err(|e| e.to_string())
+        if let Some(check) = check {
+            check(entry)?;
         }
+        std::fs::remove_file(slot).map_err(|e| e.to_string())
     })();
     if let Err(e) = result {
         return match rename_noreplace(slot, &path) {
@@ -628,7 +664,7 @@ fn unlink_tree(
     if let Some(stop) = AFTER_UNLINK.take() {
         stop(&path);
     }
-    if !expected.is_dir() && expected.nlink() > 1 {
+    if expected.nlink() > 1 {
         let after = fd_metadata(&held)?;
         if after.nlink() + 1 != expected.nlink()
             || after.mode() != expected.mode()
@@ -642,19 +678,28 @@ fn unlink_tree(
     Ok(())
 }
 
-pub(crate) fn create_private_dir(target: &Path) -> Result<(), String> {
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(target)
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                already_exists(&display_name(target))
-            } else {
-                error.to_string()
-            }
-        })
+#[cfg(test)]
+pub(crate) fn create_private_dir(target: &Path) -> Result<std::fs::File, String> {
+    create_private_dir_at(&parent_dir(target)?, target)
 }
-
+fn create_private_dir_at(parent: &std::fs::File, target: &Path) -> Result<std::fs::File, String> {
+    let name = target.file_name().ok_or(NAME_ERROR)?;
+    rustix::fs::mkdirat(parent, name, Mode::RWXU).map_err(|e| {
+        if e == Errno::EXIST {
+            already_exists(&display_name(target))
+        } else {
+            e.to_string()
+        }
+    })?;
+    rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(Into::into)
+    .map_err(|e| e.to_string())
+}
 pub(crate) fn create_private_file(target: &Path) -> Result<std::fs::File, String> {
     rustix::fs::open(
         target,
@@ -743,12 +788,18 @@ fn fire_between_note(source: &Path) {
 pub(crate) type PathHook = Box<dyn FnOnce(&Path)>;
 #[cfg(test)]
 thread_local! {
+    pub(crate) static AFTER_FILE_METADATA:std::cell::Cell<Option<PathHook>>=const {std::cell::Cell::new(None)};
     pub(crate) static AFTER_UNLINK:std::cell::Cell<Option<PathHook>>=const {std::cell::Cell::new(None)};
     pub(crate) static BEFORE_RECORD: std::cell::Cell<Option<PathHook>>=const {std::cell::Cell::new(None)};
     pub(crate) static BEFORE_CLAIM: std::cell::Cell<Option<PathHook>>=const {std::cell::Cell::new(None)};
 }
 /// Copy a single file/symlink to a path that must not exist, atomically.
-fn copy_file(source: &Path, target: &Path, stage: &mut Stage) -> Result<CopiedEntry, String> {
+fn copy_file(
+    source: &Path,
+    target: &Path,
+    parent: &std::fs::File,
+    stage: &mut Stage,
+) -> Result<CopiedEntry, String> {
     let metadata = std::fs::symlink_metadata(source).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             source_gone(&display_name(source))
@@ -758,15 +809,19 @@ fn copy_file(source: &Path, target: &Path, stage: &mut Stage) -> Result<CopiedEn
     })?;
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
-        copy_symlink_noreplace(source, target)?;
+        let name = target.file_name().ok_or(NAME_ERROR)?;
+        let created = copy_symlink_noreplace(source, target, parent)?;
         #[cfg(test)]
         if let Some(hook) = BEFORE_RECORD.take() {
             hook(target);
         }
-        stage.record(target)?;
+        stage.created.insert(target.to_owned(), created);
+        if identity_at(parent, name)? != created {
+            return Err("Staging symlink replaced".into());
+        }
         rustix::fs::utimensat(
-            CWD,
-            target,
+            parent,
+            name,
             &timestamps(&metadata),
             rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
         )
@@ -812,10 +867,17 @@ fn copy_file(source: &Path, target: &Path, stage: &mut Stage) -> Result<CopiedEn
             crate::data::single_line(source)
         ));
     }
+    let dest = dir_path(parent).join(target.file_name().ok_or(NAME_ERROR)?);
     let key = (opened.dev(), opened.ino());
     if let Some(previous) = stage.links.get(&key) {
         let expected = stage.created[previous];
-        std::fs::hard_link(previous, target).map_err(|e| e.to_string())?;
+        let held = pin(previous)?;
+        let before = fd_metadata(&held)?;
+        if !stage.matches(previous, &before) {
+            return Err("Staged hard link changed".into());
+        }
+        std::fs::hard_link(previous, &dest).map_err(|e| e.to_string())?;
+        stage.update_after_namespace_change(expected, &held)?;
         stage.created.insert(target.to_owned(), expected);
         return Ok(CopiedEntry {
             path: source.to_owned(),
@@ -823,7 +885,7 @@ fn copy_file(source: &Path, target: &Path, stage: &mut Stage) -> Result<CopiedEn
             children: Vec::new(),
         });
     }
-    let mut outgoing = create_private_file(target)?;
+    let mut outgoing = create_private_file(&dest)?;
     #[cfg(test)]
     if let Some(hook) = BEFORE_RECORD.take() {
         hook(target);
@@ -843,6 +905,14 @@ fn copy_file(source: &Path, target: &Path, stage: &mut Stage) -> Result<CopiedEn
     unchanged(source, &opened)?;
     let mode = copy_access(&opened, &incoming, &outgoing)?;
     finish_metadata(&outgoing, mode, &opened)?;
+    #[cfg(test)]
+    if let Some(hook) = AFTER_FILE_METADATA.take() {
+        hook(target);
+    }
+    let stored = fd_metadata(&outgoing)?;
+    stage
+        .stamps
+        .insert(Identity::from(&stored), FileStamp::from(&stored));
     if stage.moving && opened.nlink() > 1 {
         stage.links.insert(key, target.to_owned());
     }
@@ -901,6 +971,7 @@ fn ensure_tree_copyable(source: &Path) -> Result<(), String> {
 fn copy_tree_entry(
     source: &Path,
     target: &Path,
+    parent: &std::fs::File,
     stage: &mut Stage,
     outermost: bool,
 ) -> Result<CopiedEntry, String> {
@@ -914,17 +985,21 @@ fn copy_tree_entry(
         })?
         .file_type();
     if file_type.is_dir() {
-        create_private_dir(target)?;
+        let dir = create_private_dir_at(parent, target)?;
         #[cfg(test)]
         if let Some(hook) = BEFORE_RECORD.take() {
             hook(target);
         }
-        stage.record(target)?;
+        let created = Identity::from(&fd_metadata(&dir)?);
+        stage.created.insert(target.to_owned(), created);
+        if identity_at(parent, target.file_name().ok_or(NAME_ERROR)?)? != created {
+            return Err("Staging directory replaced".into());
+        }
         #[cfg(test)]
         note_initial(target);
-        copy_dir_contents(source, target, stage, outermost)
+        copy_dir_contents(source, target, stage, outermost, dir)
     } else if file_type.is_file() || file_type.is_symlink() {
-        copy_file(source, target, stage)
+        copy_file(source, target, parent, stage)
     } else {
         Err(special(&display_name(source)))
     }
@@ -935,12 +1010,12 @@ fn copy_dir_contents(
     target: &Path,
     stage: &mut Stage,
     outermost: bool,
+    target_fd: std::fs::File,
 ) -> Result<CopiedEntry, String> {
     let source_fd: std::fs::File = open_dir_nofollow(source)?.into();
     if stage.moving {
         check_mount(&parent_dir(source)?, &source_fd, source)?;
     }
-    let target_fd = open_dir_nofollow(target)?;
     let metadata = source_fd.metadata().map_err(|error| error.to_string())?;
     unchanged(source, &metadata)?;
     let mut names = Vec::new();
@@ -953,6 +1028,7 @@ fn copy_dir_contents(
         children.push(copy_tree_entry(
             &source.join(&name),
             &target.join(&name),
+            &target_fd,
             stage,
             false,
         )?);
@@ -970,7 +1046,7 @@ fn copy_dir_contents(
         // Linux checks write permission on the directory whose `..` changes.
         rustix::fs::fchmod(&target_fd, mode | Mode::WUSR).map_err(|e| e.to_string())?;
         rustix::fs::fsync(&target_fd).map_err(|e| e.to_string())?;
-        stage.root_metadata = Some((target_fd, mode));
+        stage.root_metadata = Some((target_fd.into(), mode));
     } else {
         finish_metadata(&target_fd, mode, &metadata)?;
     }
@@ -982,28 +1058,63 @@ fn copy_dir_contents(
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+impl From<&std::fs::Metadata> for FileStamp {
+    fn from(m: &std::fs::Metadata) -> Self {
+        Self {
+            size: m.len(),
+            mtime: (m.mtime(), m.mtime_nsec()),
+            ctime: (m.ctime(), m.ctime_nsec()),
+        }
+    }
+}
 #[derive(Default)]
 struct Stage {
+    stamps: HashMap<Identity, FileStamp>,
     root_metadata: Option<(rustix::fd::OwnedFd, Mode)>,
     created: HashMap<PathBuf, Identity>,
     links: HashMap<(u64, u64), PathBuf>,
     moving: bool,
 }
 impl Stage {
-    fn record(&mut self, path: &Path) -> Result<(), String> {
-        self.created.insert(path.to_owned(), identity(path)?);
+    fn matches(&self, path: &Path, m: &std::fs::Metadata) -> bool {
+        let id = Identity::from(m);
+        self.created.get(path) == Some(&id)
+            && (!m.is_file() || self.stamps.get(&id) == Some(&FileStamp::from(m)))
+    }
+    // link and rename advance ctime on the pinned inode, but change neither
+    // its bytes nor its stored mtime. Rebase only that part of the snapshot.
+    fn update_after_namespace_change(
+        &mut self,
+        id: Identity,
+        held: &std::fs::File,
+    ) -> Result<(), String> {
+        let stamp = self
+            .stamps
+            .get_mut(&id)
+            .ok_or("Missing staged file snapshot")?;
+        let now = FileStamp::from(&fd_metadata(held)?);
+        if now.size != stamp.size || now.mtime != stamp.mtime {
+            return Err("Staged file changed".into());
+        }
+        stamp.ctime = now.ctime;
         Ok(())
     }
     // Walk only recorded entries and anchor every descent at the checked directory.
-    fn discard(&self, parent: &std::fs::File, logical: &Path) -> Result<(), String> {
+    fn discard(&mut self, parent: &std::fs::File, logical: &Path) -> Result<(), String> {
         let Some(&expected) = self.created.get(logical) else {
             return Ok(());
         };
         let path = dir_path(parent).join(logical.file_name().ok_or(NAME_ERROR)?);
-        if identity(&path)? != expected {
+        if identity_at(parent, logical.file_name().ok_or(NAME_ERROR)?)? != expected {
             return Err("staging entry replaced".into());
         }
-        if expected.2.is_dir() {
+        if expected.2 == libc::S_IFDIR {
             let dir = checked_dir(parent, logical, expected)?;
             rustix::fs::fchmod(&dir, Mode::RWXU).map_err(|e| e.to_string())?;
             for child in std::fs::read_dir(dir_path(&dir)).map_err(|e| e.to_string())? {
@@ -1012,7 +1123,21 @@ impl Stage {
                     &logical.join(child.map_err(|e| e.to_string())?.file_name()),
                 )?;
             }
+            if identity_at(parent, logical.file_name().ok_or(NAME_ERROR)?)? != expected {
+                return Err("staging directory replaced".into());
+            }
             std::fs::remove_dir(path).map_err(|e| e.to_string())
+        } else if self.stamps.contains_key(&expected) {
+            let held = pin(&path)?;
+            let meta = fd_metadata(&held)?;
+            if !self.matches(logical, &meta) {
+                return Err("staging file modified".into());
+            }
+            std::fs::remove_file(path).map_err(|e| e.to_string())?;
+            if meta.nlink() > 1 {
+                self.update_after_namespace_change(expected, &held)?;
+            }
+            Ok(())
         } else {
             std::fs::remove_file(path).map_err(|e| e.to_string())
         }
@@ -1021,7 +1146,7 @@ impl Stage {
 fn verify(entry: &CopiedEntry, path: &Path, stage: &Stage) -> Result<(), String> {
     unchanged(&entry.path, &entry.metadata)?;
     let m = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-    if stage.created.get(path) != Some(&Identity::from(&m))
+    if !stage.matches(path, &m)
         || m.file_type() != entry.metadata.file_type()
         || (!m.is_dir() && m.len() != entry.metadata.len())
     {
@@ -1068,7 +1193,7 @@ pub(crate) fn staged_copy(
     };
     let mut committed = false;
     let result: Result<_, String> = (|| {
-        let copied = copy_tree_entry(source, &staged, &mut stage, true)?;
+        let copied = copy_tree_entry(source, &staged, &dir, &mut stage, true)?;
         dir.sync_all().map_err(|e| e.to_string())?;
         #[cfg(test)]
         fire_between_note(target);
@@ -1077,12 +1202,16 @@ pub(crate) fn staged_copy(
             Some((dir, mode)) => (std::fs::File::from(dir), Some(mode)),
             None => (pin(&staged)?, None),
         };
-        if stage.created.get(&staged) != Some(&Identity::from(&fd_metadata(&published)?)) {
+        let pinned = fd_metadata(&published)?;
+        if !stage.matches(&staged, &pinned) {
             return Err("Staged object changed".into());
         }
         rename_noreplace(&staged, &dir_path(&parent).join(name))
             .map_err(RenameError::into_message)?;
         committed = true;
+        if pinned.is_file() {
+            stage.update_after_namespace_change(Identity::from(&pinned), &published)?;
+        }
         if let Some(mode) = final_mode {
             finish_metadata(&published, mode, &copied.metadata).map_err(|e| {
                 format!("Destination committed; cannot finalize directory metadata: {e}")
@@ -1112,15 +1241,22 @@ pub(crate) fn staged_copy(
     if moving {
         #[cfg(test)]
         fire_between_note(source);
-        cleanup_if(&copy, || {
-            if identity(target).ok() == Some(Identity::from(&fd_metadata(&published)?)) {
-                Ok(())
+        cleanup_if(&copy, |entry| {
+            let relative = entry.path.strip_prefix(source).map_err(|e| e.to_string())?;
+            let (visible, record) = if relative.as_os_str().is_empty() {
+                (target.to_owned(), staged.clone())
             } else {
-                Err(format!(
+                (target.join(relative), staged.join(relative))
+            };
+            if identity(target).ok() != Some(Identity::from(&fd_metadata(&published)?))
+                || !std::fs::symlink_metadata(&visible).is_ok_and(|m| stage.matches(&record, &m))
+            {
+                return Err(format!(
                     "Destination changed: {}",
-                    crate::data::single_line(target)
-                ))
+                    crate::data::single_line(&visible)
+                ));
             }
+            Ok(())
         })
         .map_err(|e| format!("Partial move: destination copied, source cleanup incomplete: {e}"))?;
     }
