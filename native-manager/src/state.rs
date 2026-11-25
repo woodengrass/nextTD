@@ -99,11 +99,12 @@ impl StateStore {
             .truncate(false)
             .open(&sidecar)
             .with_context(|| format!("Cannot lock plugin state {}", self.path.display()))?;
-        // A lone lock call can report a transient busy status under process
-        // load, so spin briefly before treating it as a concurrent holder.
-        // A genuine holder keeps the lock far longer than this spin, so two
-        // simultaneous mutations still fail fast with the busy error below.
-        let mut attempts = 0;
+        // A child forked by another thread holds a copy of this descriptor
+        // until it execs, which can take milliseconds under load and makes
+        // the lock look busy. Retry for a bounded time, not a spin count,
+        // before treating it as a concurrent holder; a genuine holder keeps
+        // the lock far longer, so two mutations still fail fast below.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         loop {
             match file.try_lock_exclusive() {
                 Ok(()) => {
@@ -113,10 +114,10 @@ impl StateStore {
                     });
                 }
                 Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock && attempts < 10_000 =>
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
                 {
-                    attempts += 1;
-                    std::thread::yield_now();
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 Err(error) => {
                     if error.kind() == std::io::ErrorKind::WouldBlock {
