@@ -45,7 +45,11 @@ fn main() -> io::Result<()> {
                 break;
             }
             app.poll();
-            screen.draw(|frame| ui::draw(frame, &app.ui))?;
+            screen.draw(|frame| {
+                let size = frame.area();
+                app.resize(size.width, size.height);
+                ui::draw(frame, &app.ui);
+            })?;
             let deadline = app.timeout().map(|t| std::time::Instant::now() + t);
             let input = loop {
                 if closing.load(std::sync::atomic::Ordering::Relaxed) || terminal::hung_up(tty)? {

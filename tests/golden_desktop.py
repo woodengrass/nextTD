@@ -38,7 +38,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 
-from golden_screen import ANSI16_DIR, assert_frame, capture_frame
+from golden_screen import ANSI16_DIR, wait_for_frame
 from native_processes import tagged_processes, terminate_tagged
 
 DIST_ENV = 'TDNEXT_VERIFIED_DIST_ROOT'
@@ -347,8 +347,7 @@ def scene(name: str, term: str) -> str:
             tmux(socket, 'send-keys', '-t', 'golden', "printf 'GOLDEN_RESULT:%s\\n' hello", 'Enter')
             wait_text(socket, 'GOLDEN_RESULT:hello')
         verify_dist_panes(tag, dist_root())
-        frame = capture_frame(socket, 'golden', cols, rows)
-        assert_frame(name, frame, golden_dir=ANSI16_DIR)
+        frame = wait_for_frame(name, socket, 'golden', cols, rows, golden_dir=ANSI16_DIR)
         # The golden frame above is the frozen contract. Only now, with
         # equality already proven, complete the operation the dialog offered
         # and verify it persisted through the real archive panes.

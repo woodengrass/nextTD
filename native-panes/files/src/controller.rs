@@ -870,9 +870,18 @@ impl Controller {
             self.ui.focus = v[(i + if back { v.len() - 1 } else { 1 }) % v.len()]
         }
     }
-    pub fn handle(&mut self, event: Event, w: u16, h: u16) -> Effect {
+    pub fn resize(&mut self, w: u16, h: u16) {
+        if (self.width, self.height) == (w, h) {
+            return;
+        }
         self.width = w;
         self.height = h;
+        self.ui.top = 0;
+        self.ui.neighbour_top = 0;
+        self.clamp();
+    }
+    pub fn handle(&mut self, event: Event, w: u16, h: u16) -> Effect {
+        self.resize(w, h);
         match event {
             Event::Key(k) if k.kind != KeyEventKind::Release => {
                 if k.code == K::Char('q') && k.modifiers == M::CONTROL {
@@ -1010,10 +1019,10 @@ impl Controller {
                     || self.ui.focus == Focus::Preview && prev.width == 0
                     || self.ui.focus == Focus::Table && table.width == 0
                 {
-                    self.ui.focus = if table.width == 0 {
-                        Focus::Preview
-                    } else {
-                        Focus::Table
+                    if table.width > 0 {
+                        self.ui.focus = Focus::Table;
+                    } else if prev.width > 0 {
+                        self.ui.focus = Focus::Preview;
                     }
                 }
                 self.clamp()
@@ -2395,6 +2404,37 @@ mod controller_tests {
             settle(&mut c);
             assert!(!current.join("source.txt").exists());
         }
+    }
+
+    #[test]
+    fn folder_top_and_file_selection_style_after_resize_match_direct_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::write(work.join("example.txt"), "example").unwrap();
+        let render = |sizes: &[(u16, u16)]| {
+            let mut c = Controller::new(work.clone());
+            for &(w, h) in sizes {
+                c.handle(Event::Resize(w, h), w, h);
+                settle(&mut c);
+            }
+            let &(w, h) = sizes.last().unwrap();
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| ui::draw(f, &c.ui)).unwrap();
+            let folder_top = (1..21)
+                .map(|x| terminal.backend().buffer()[(x, 4)].symbol())
+                .collect::<String>();
+            let table = ui::panes(w, h, &c.ui)[1];
+            (
+                folder_top,
+                terminal.backend().buffer()[(table.x, table.y + 3)].style(),
+            )
+        };
+        let expected = render(&[(98, 36)]);
+        assert!(expected.0.contains("..  Parent"));
+        assert_eq!(render(&[(1, 1), (20, 5), (98, 36)]), expected);
+        assert_eq!(render(&[(1, 1), (98, 36)]), expected);
     }
 
     #[test]
