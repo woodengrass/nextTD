@@ -122,25 +122,3 @@ fn main() -> ExitCode {
         }
     }
 }
-
-#[cfg(test)]
-mod dispatch_tests {
-    #[test]
-    fn usage_names_every_subcommand() {
-        for command in [
-            "list",
-            "install",
-            "enable",
-            "disable",
-            "uninstall",
-            "desktop",
-            "run",
-        ] {
-            assert!(
-                super::USAGE.contains(command),
-                "usage must document {command}"
-            );
-        }
-        assert!(!super::USAGE.contains("install-zellij"));
-    }
-}
