@@ -100,7 +100,7 @@ fn special(name: &str) -> String {
 
 fn display_name(path: &Path) -> String {
     path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
+        .map(crate::data::single_line)
         .unwrap_or_default()
 }
 
@@ -118,13 +118,9 @@ fn child_path_os(dir: &Path, name: &OsStr) -> Result<PathBuf, String> {
     }
     let target = dir.join(name);
     if std::fs::symlink_metadata(&target).is_ok() {
-        return Err(already_exists(&name.to_string_lossy()));
+        return Err(already_exists(&crate::data::single_line(name)));
     }
     Ok(target)
-}
-
-fn child_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
-    child_path_os(dir, OsStr::new(name))
 }
 
 fn is_symlink(path: &Path) -> bool {
@@ -180,13 +176,14 @@ pub(crate) fn rename_noreplace(source: &Path, target: &Path) -> Result<(), Renam
 }
 
 /// Create a file or folder; fails if the target already exists.
-pub fn create(dir: &Path, name: &str, folder: bool) -> Result<PathBuf, String> {
-    let target = child_path(dir, name)?;
+pub fn create(dir: &Path, name: impl AsRef<OsStr>, folder: bool) -> Result<PathBuf, String> {
+    let name = name.as_ref();
+    let target = child_path_os(dir, name)?;
     if folder {
         match std::fs::create_dir(&target) {
             Ok(()) => Ok(target),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                Err(already_exists(name))
+                Err(already_exists(&crate::data::single_line(name)))
             }
             Err(error) => Err(error.to_string()),
         }
@@ -202,20 +199,22 @@ pub fn create(dir: &Path, name: &str, folder: bool) -> Result<PathBuf, String> {
                 drop(fd);
                 Ok(target)
             }
-            Err(error) if error == Errno::EXIST => Err(already_exists(name)),
+            Err(error) if error == Errno::EXIST => {
+                Err(already_exists(&crate::data::single_line(name)))
+            }
             Err(error) => Err(error.to_string()),
         }
     }
 }
 
 /// Rename without ever replacing an existing destination.
-pub fn rename(src: &Path, name: &str) -> Result<PathBuf, String> {
+pub fn rename(src: &Path, name: impl AsRef<OsStr>) -> Result<PathBuf, String> {
     let parent = src
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    let target = child_path(&parent, name)?;
+    let target = child_path_os(&parent, name.as_ref())?;
     rename_noreplace(src, &target).map_err(RenameError::into_message)?;
     Ok(target)
 }
@@ -274,10 +273,16 @@ pub(crate) fn checked_dir(
     let name = path.file_name().ok_or("Cannot delete filesystem root")?;
     let dir: std::fs::File = open_dir_nofollow(&dir_path(parent).join(name))?.into();
     if mount(parent)? != mount(&dir)? {
-        return Err(format!("Cannot remove mount point: {}", path.display()));
+        return Err(format!(
+            "Cannot remove mount point: {}",
+            crate::data::single_line(path)
+        ));
     }
     if Identity::from(&dir.metadata().map_err(|e| e.to_string())?) != expected {
-        return Err(format!("Source changed: {}", path.display()));
+        return Err(format!(
+            "Source changed: {}",
+            crate::data::single_line(path)
+        ));
     }
     Ok(dir)
 }
@@ -304,11 +309,11 @@ fn scan_removal(parent: &std::fs::File, path: &Path) -> Result<CopiedEntry, Stri
 pub fn remove_confirmed(src: &Path, confirmed: Identity) -> Result<(), String> {
     let parent = parent_dir(src)?;
     if identity(src)? != confirmed {
-        return Err(format!("Source changed: {}", src.display()));
+        return Err(format!("Source changed: {}", crate::data::single_line(src)));
     }
     let tree = scan_removal(&parent, src)?;
     if Identity::from(&tree.metadata) != confirmed {
-        return Err(format!("Source changed: {}", src.display()));
+        return Err(format!("Source changed: {}", crate::data::single_line(src)));
     }
     unlink_tree(&parent, &tree, &mut Default::default())
 }
@@ -443,7 +448,10 @@ fn unchanged(path: &Path, metadata: &std::fs::Metadata) -> Result<(), String> {
     if same_entry(metadata, &current) {
         Ok(())
     } else {
-        Err(format!("Source changed: {}", path.display()))
+        Err(format!(
+            "Source changed: {}",
+            crate::data::single_line(path)
+        ))
     }
 }
 
@@ -460,14 +468,18 @@ fn unlink_tree(
     let path = dir_path(parent).join(entry.path.file_name().ok_or(NAME_ERROR)?);
     let key = (entry.metadata.dev(), entry.metadata.ino());
     let expected = links.get(&key).unwrap_or(&entry.metadata);
-    unchanged(&path, expected).map_err(|_| format!("Source changed: {}", entry.path.display()))?;
+    unchanged(&path, expected)
+        .map_err(|_| format!("Source changed: {}", crate::data::single_line(&entry.path)))?;
     if entry.metadata.is_dir() {
         let dir = checked_dir(parent, &entry.path, Identity::from(expected))?;
         for child in &entry.children {
             unlink_tree(&dir, child, links)?;
         }
         if identity(&path)? != Identity::from(&entry.metadata) {
-            return Err(format!("Source changed: {}", entry.path.display()));
+            return Err(format!(
+                "Source changed: {}",
+                crate::data::single_line(&entry.path)
+            ));
         }
         std::fs::remove_dir(path).map_err(|e| e.to_string())
     } else {
@@ -487,7 +499,10 @@ fn unlink_tree(
                 || after.len() != expected.len()
                 || (after.mtime(), after.mtime_nsec()) != (expected.mtime(), expected.mtime_nsec())
             {
-                return Err(format!("Source changed: {}", entry.path.display()));
+                return Err(format!(
+                    "Source changed: {}",
+                    crate::data::single_line(&entry.path)
+                ));
             }
             links.insert(key, after);
         }
@@ -629,7 +644,10 @@ fn copy_file(source: &Path, target: &Path, stage: &mut Stage) -> Result<CopiedEn
     ) {
         Ok(fd) => fd,
         Err(error) if error == Errno::LOOP => {
-            return Err(format!("Source changed: {}", source.display()));
+            return Err(format!(
+                "Source changed: {}",
+                crate::data::single_line(source)
+            ));
         }
         Err(error) if error == Errno::NOENT => {
             return Err(source_gone(&display_name(source)));
@@ -645,7 +663,10 @@ fn copy_file(source: &Path, target: &Path, stage: &mut Stage) -> Result<CopiedEn
         return Err(special(&display_name(source)));
     }
     if !same_entry(&metadata, &opened) {
-        return Err(format!("Source changed: {}", source.display()));
+        return Err(format!(
+            "Source changed: {}",
+            crate::data::single_line(source)
+        ));
     }
     let key = (opened.dev(), opened.ino());
     if let Some(previous) = stage.links.get(&key) {
@@ -663,11 +684,14 @@ fn copy_file(source: &Path, target: &Path, stage: &mut Stage) -> Result<CopiedEn
     note_initial(target);
     let count = std::io::copy(&mut incoming, &mut outgoing).map_err(|e| e.to_string())?;
     if count != opened.len() {
-        return Err(format!("Source changed: {}", source.display()));
+        return Err(format!(
+            "Source changed: {}",
+            crate::data::single_line(source)
+        ));
     }
     unchanged(source, &opened)?;
     copy_metadata(&opened, &incoming, &outgoing)?;
-    if opened.nlink() > 1 {
+    if stage.moving && opened.nlink() > 1 {
         stage.links.insert(key, target.to_owned());
     }
     Ok(CopiedEntry {
@@ -752,7 +776,10 @@ fn copy_dir_contents(
 ) -> Result<CopiedEntry, String> {
     let source_fd: std::fs::File = open_dir_nofollow(source)?.into();
     if stage.moving && mount(&source_fd)? != mount(&parent_dir(source)?)? {
-        return Err(format!("Cannot remove mount point: {}", source.display()));
+        return Err(format!(
+            "Cannot remove mount point: {}",
+            crate::data::single_line(source)
+        ));
     }
     let target_fd = open_dir_nofollow(target)?;
     let metadata = source_fd.metadata().map_err(|error| error.to_string())?;
@@ -772,7 +799,10 @@ fn copy_dir_contents(
     }
     let copied = source_fd.metadata().map_err(|error| error.to_string())?;
     if !same_entry(&metadata, &copied) {
-        return Err(format!("Source changed: {}", source.display()));
+        return Err(format!(
+            "Source changed: {}",
+            crate::data::single_line(source)
+        ));
     }
     unchanged(source, &copied)?;
     copy_metadata(&metadata, source_fd.as_fd(), &target_fd)?;
@@ -824,9 +854,11 @@ fn verify(entry: &CopiedEntry, path: &Path, stage: &Stage) -> Result<(), String>
     if stage.created.get(path) != Some(&Identity::from(&m))
         || m.file_type() != entry.metadata.file_type()
         || (!m.is_dir() && m.len() != entry.metadata.len())
-        || (m.mtime(), m.mtime_nsec()) != (entry.metadata.mtime(), entry.metadata.mtime_nsec())
     {
-        return Err(format!("Staged copy differs: {}", entry.path.display()));
+        return Err(format!(
+            "Staged copy differs: {}",
+            crate::data::single_line(&entry.path)
+        ));
     }
     for child in &entry.children {
         verify(
@@ -851,7 +883,12 @@ pub(crate) fn staged_copy(
         .map_err(|e| e.to_string())?
         .keep();
     let visible = target.with_file_name(root.file_name().ok_or(NAME_ERROR)?);
-    let left = |e: String| format!("Staging remains at {}: {e}", visible.display());
+    let left = |e: String| {
+        format!(
+            "Staging remains at {}: {e}",
+            crate::data::single_line(&visible)
+        )
+    };
     let dir: std::fs::File = open_dir_nofollow(&root).map_err(left)?.into();
     let id = Identity::from(&dir.metadata().map_err(|e| left(e.to_string()))?);
     let staged = dir_path(&dir).join(name);
@@ -862,9 +899,9 @@ pub(crate) fn staged_copy(
     let result: Result<_, String> = (|| {
         let copied = copy_tree_entry(source, &staged, &mut stage)?;
         dir.sync_all().map_err(|e| e.to_string())?;
-        verify(&copied, &staged, &stage)?;
         #[cfg(test)]
         fire_between_note(target);
+        verify(&copied, &staged, &stage)?;
         rename_noreplace(&staged, &dir_path(&parent).join(name))
             .map_err(RenameError::into_message)?;
         Ok(copied)
@@ -1052,7 +1089,7 @@ fn read_editor_choice() -> Result<EditorChoice, String> {
 fn preferences_error(path: &Path, detail: &str) -> String {
     format!(
         "Cannot read editor preferences {}: {detail}",
-        path.display()
+        crate::data::single_line(path)
     )
 }
 

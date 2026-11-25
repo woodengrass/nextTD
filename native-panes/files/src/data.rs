@@ -29,12 +29,18 @@ pub struct Preview {
 }
 
 pub fn single_line(s: impl AsRef<std::ffi::OsStr>) -> String {
+    escape_text(s.as_ref(), true)
+}
+pub fn message(text: &str) -> String {
+    escape_text(text.as_ref(), false)
+}
+fn escape_text(s: &std::ffi::OsStr, escape_slash: bool) -> String {
     use std::{fmt::Write as _, os::unix::ffi::OsStrExt as _};
     let mut out = String::new();
-    for chunk in s.as_ref().as_bytes().utf8_chunks() {
+    for chunk in s.as_bytes().utf8_chunks() {
         for c in chunk.valid().chars() {
             match get_general_category(c) {
-                _ if c == '\\' => out.push_str("\\\\"),
+                _ if escape_slash && c == '\\' => out.push_str("\\\\"),
                 G::Control
                 | G::Format
                 | G::Surrogate
@@ -55,6 +61,35 @@ pub fn single_line(s: impl AsRef<std::ffi::OsStr>) -> String {
         }
     }
     out
+}
+/// Decode the visible name after an edit, retaining incomplete escapes literally.
+pub fn edited_name(mut text: &str) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    let mut bytes = Vec::with_capacity(text.len());
+    while !text.is_empty() {
+        if let Some(rest) = text.strip_prefix("\\\\") {
+            bytes.push(b'\\');
+            text = rest;
+        } else if let Some(rest) = text.strip_prefix("\\x")
+            && let Some(hex) = rest.get(..2)
+            && let Ok(b) = u8::from_str_radix(hex, 16)
+        {
+            bytes.push(b);
+            text = &rest[2..];
+        } else if let Some(rest) = text.strip_prefix("\\u{")
+            && let Some((hex, tail)) = rest.split_once('}')
+            && let Ok(code) = u32::from_str_radix(hex, 16)
+            && let Some(c) = char::from_u32(code)
+        {
+            bytes.extend(c.encode_utf8(&mut [0; 4]).as_bytes());
+            text = tail;
+        } else {
+            let c = text.chars().next().unwrap();
+            bytes.extend_from_slice(&text.as_bytes()[..c.len_utf8()]);
+            text = &text[c.len_utf8()..];
+        }
+    }
+    std::ffi::OsString::from_vec(bytes)
 }
 fn bytes(size: u64) -> String {
     let digits = size.to_string();
@@ -172,7 +207,7 @@ fn os_error(e: &io::Error, path: &Path) -> String {
     format!(
         "[Errno {n}] {}: '{}'",
         text.split(" (os error").next().unwrap_or(&text),
-        path.display()
+        single_line(path)
     )
 }
 
@@ -208,10 +243,7 @@ pub fn preview(path: &Path) -> Preview {
                 Some(m.len()),
                 Some(&m),
                 false,
-                vec![single_line(format!(
-                    "Link to {}",
-                    fs::read_link(path)?.display()
-                ))],
+                vec![format!("Link to {}", single_line(fs::read_link(path)?))],
             ));
         }
         if m.is_dir() {
@@ -330,10 +362,7 @@ pub fn preview(path: &Path) -> Preview {
             None,
             None,
             false,
-            vec![single_line(format!(
-                "Cannot preview: {}",
-                os_error(&e, path)
-            ))],
+            vec![format!("Cannot preview: {}", os_error(&e, path))],
         )
     })
 }

@@ -1177,6 +1177,10 @@ fn move_with_two_names_for_one_inode_completes() -> Result<(), Box<dyn std::erro
     std::fs::create_dir(&tree)?;
     write(&tree.join("a"), b"linked")?;
     std::fs::hard_link(tree.join("a"), tree.join("b"))?;
+    let copy_dir = dir()?;
+    let copy = paste(&tree, copy_dir.path(), false)?;
+    write(&copy.join("a"), b"edited")?;
+    assert_eq!(read(&copy.join("b"))?, b"linked");
     let target = paste(&tree, dst.path(), true)?;
     assert!(!tree.exists());
     assert_eq!(read(&target.join("b"))?, b"linked");
@@ -1246,5 +1250,28 @@ fn late_rival_and_foreign_staging_entry_survive_failed_commit()
     assert!(err.contains(stage.to_str().unwrap()));
     assert_eq!(read(&stage.join("tree/foreign"))?, b"foreign");
     assert!(!stage.join("tree/payload").exists());
+    Ok(())
+}
+
+#[test]
+fn copy_accepts_destination_timestamp_rounding() -> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = dir()?;
+    let file = src.path().join("file");
+    write(&file, b"content")?;
+    set_times(&file, 1700000001, 1700000001)?;
+    let parent = dst.path().to_owned();
+    crate::actions::stash_between_note(&parent.join("file"), move || {
+        let stage = std::fs::read_dir(parent)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        set_times(&stage.join("file"), 1700000000, 1700000000).unwrap();
+    });
+    let copy = paste(&file, dst.path(), false)?;
+    assert_eq!(copy.metadata()?.mtime(), 1700000000);
+    assert_eq!(read(&copy)?, b"content");
     Ok(())
 }

@@ -252,9 +252,9 @@ fn modal(f: &mut Frame, d: &Dialog) {
                 if input.width > 0 { text(f, Rect::new(input.x, input.y + y, 1, 1), "▊", border.reversed()); }
             }
             let r = inset(line(input, 1), 3);
-            let x = single_line(value.chars().take(*cursor).collect::<String>()).width();
+            let x = value.chars().take(*cursor).collect::<String>().width();
             let off = x.saturating_sub(r.width.saturating_sub(1).into());
-            f.render_widget(Paragraph::new(single_line(value)).scroll((0, off.min(65535) as u16)).style(if *selected { style().reversed() } else { style() }), r.intersection(f.area()));
+            f.render_widget(Paragraph::new(value.as_str()).scroll((0, off.min(65535) as u16)).style(if *selected { style().reversed() } else { style() }), r.intersection(f.area()));
             let cursor = (r.x + (x - off) as u16, r.y);
             if *b == 0 && r.width > 0 && r.height > 0 && f.area().contains(cursor.into()) {
                 f.buffer_mut()[cursor].set_style(if *selected { style().remove_modifier(Modifier::REVERSED) } else { style().reversed() });
@@ -324,7 +324,7 @@ pub fn draw(f: &mut Frame, ui: &Ui) {
             )
         }
     }
-    let err = single_line(&ui.listing.error);
+    let err = &ui.listing.error;
     let empty = ui.listing.entries.is_empty();
     if table.width > 0 {
         heading(
@@ -384,7 +384,7 @@ pub fn draw(f: &mut Frame, ui: &Ui) {
             let status = if ui.loading {
                 "Loading folder…"
             } else if !err.is_empty() {
-                &err
+                err
             } else {
                 "Empty folder — n: folder, f: file"
             };
@@ -460,7 +460,7 @@ pub fn draw(f: &mut Frame, ui: &Ui) {
                 if ui.loading {
                     "Loading folder…"
                 } else if !err.is_empty() {
-                    &err
+                    err
                 } else if empty {
                     "This folder is empty. Press n or f to create an item."
                 } else {
