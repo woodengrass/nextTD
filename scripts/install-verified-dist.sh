@@ -133,6 +133,24 @@ ACTUAL="$(sha256sum < "$COPY")"
 ACTUAL="${ACTUAL%% *}"
 ACTUAL="${ACTUAL,,}"
 
+read_digest() {
+  local file="$1" record hex basename
+  if IFS= read -r -d '' record < "$file"; then fail "NUL in digest file"; fi
+  record="${record%$'\n'}"
+  [[ "$record" != *$'\n'* ]] || fail "expected one digest record"
+  hex="${record:0:64}"
+  [[ "$hex" =~ ^[0-9a-fA-F]{64}$ ]] || fail "expected a sha256 hex digest"
+  if [[ "$record" != "$hex" ]]; then
+    basename="${record#"$hex  "}"
+    [[ "$basename" != "$record" && -n "$basename" && "$basename" != */* ]] \
+      || fail "expected <digest> or <digest>  <basename>"
+    if (($# == 2)) && [[ "$basename" != "$2" ]]; then
+      fail "digest record basename '$basename' does not match archive basename '$2'"
+    fi
+  fi
+  printf '%s\n' "${hex,,}"
+}
+
 if ((VERIFY == 1)); then
   VERIFY_LOG="$WORK/verify.log"
   if ! TDNEXT_VERIFIED_DIGEST_OUT="$WORK/verified.sha256" make -C "$ROOT" verify-dist "ARCHIVE=$COPY" >"$VERIFY_LOG" 2>&1; then
@@ -149,16 +167,7 @@ if ((VERIFY == 1)); then
   EXPECTED="$ACTUAL"
   echo "$PROG: verifier passed on the exact bytes being installed (sha256 $ACTUAL)."
 else
-  # Read through EOF, rejecting NUL rather than silently discarding it.
-  if IFS= read -r -d '' record < "$DIGEST_FILE"; then fail "NUL in digest file"; fi
-  record="${record%$'\n'}"
-  [[ "$record" != *$'\n'* ]] || fail "expected one digest record"
-  EXPECTED="${record:0:64}"
-  [[ "$record" = "$EXPECTED" || "$record" = "$EXPECTED  ${ARCHIVE##*/}" ]] \
-    || fail "invalid digest record or archive filename"
-  EXPECTED="${EXPECTED,,}"
-  [[ "$EXPECTED" =~ ^[0-9a-f]{64}$ ]] \
-    || fail "digest file does not start with a sha256 hex digest: $DIGEST_FILE"
+  EXPECTED="$(read_digest "$DIGEST_FILE" "${ARCHIVE##*/}")"
   test "$ACTUAL" = "$EXPECTED" \
     || fail "digest mismatch: archive sha256 $ACTUAL != trusted $EXPECTED; no activation"
 fi
@@ -174,7 +183,7 @@ tar --absolute-names --numeric-owner --quoting-style=escape -tvzf "$COPY" |
   for name in $EXPECTED_MEMBERS; do echo "- $EXPECTED_TOP/$name"; done
 } | sort | cmp -s - "$WORK/members.txt" || fail "unexpected archive layout"
 mkdir "$WORK/stage"
-tar --no-same-owner --no-same-permissions -xzf "$COPY" -C "$WORK/stage"
+(umask 022; tar --no-same-owner --no-same-permissions -xzf "$COPY" -C "$WORK/stage")
 
 mapfile -t TOPS < <(find "$WORK/stage" -mindepth 1 -maxdepth 1)
 if ((${#TOPS[@]} != 1)) || [[ "${TOPS[0]}" != "$WORK/stage/$EXPECTED_TOP" ]]; then
@@ -206,7 +215,11 @@ compare_release() {
   [[ -d "$old" && ! -L "$old" ]] || { echo "not a real release directory"; return 1; }
   [[ "$(find "$old" -mindepth 1 -maxdepth 1 -printf . | wc -c)" -eq 7 ]] \
     || { echo "existing release has wrong number of members"; return 1; }
-  for name in $EXPECTED_MEMBERS digest.sha256; do
+  [[ -f "$old/digest.sha256" && ! -L "$old/digest.sha256" ]] \
+    || { echo "existing digest.sha256 is not a regular file"; return 1; }
+  [[ "$(read_digest "$old/digest.sha256")" = "$ACTUAL" ]] \
+    || { echo "existing release digest mismatch"; return 1; }
+  for name in $EXPECTED_MEMBERS; do
     test -f "$old/$name" && ! test -L "$old/$name" \
       || { echo "existing member $name is missing or not a regular file"; return 1; }
     om="$(stat -c %a -- "$old/$name")"; nm="$(stat -c %a -- "$new/$name")"
@@ -220,6 +233,8 @@ compare_release() {
 LAYOUT_ERR=""
 LAYOUT_ERR="$(check_exact_layout "$CANDIDATE" 2>&1)" \
   || fail "package layout rejected ($LAYOUT_ERR); no activation"
+for name in $BINARIES; do chmod 0755 -- "$CANDIDATE/$name"; done
+chmod 0644 -- "$CANDIDATE/LICENSE.zellij-0.45.1"
 
 RELEASE="$DEST/releases/$ACTUAL"
 printf '%s  %s\n' "$ACTUAL" "${ARCHIVE##*/}" >"$CANDIDATE/digest.sha256"
