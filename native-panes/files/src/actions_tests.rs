@@ -453,6 +453,10 @@ fn copied_tree_cleanup_removes_only_unchanged_entries() -> Result<(), String> {
     std::fs::create_dir(&nested).map_err(|error| error.to_string())?;
     write(&source.join("a"), b"copied")?;
     write(&nested.join("changed"), b"before")?;
+    for p in [&nested, &source] {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o555))
+            .map_err(|e| e.to_string())?;
+    }
     let target = root.path().join("target");
     let copied = staged_copy(&source, &target, false)?;
     write(&nested.join("changed"), b"after change")?;
@@ -460,6 +464,12 @@ fn copied_tree_cleanup_removes_only_unchanged_entries() -> Result<(), String> {
     assert!(!source.join("a").exists());
     assert_eq!(read(&nested.join("changed"))?, b"after change");
     assert_eq!(read(&target.join("nested/changed"))?, b"before");
+    assert_eq!(mode_of(&source)?, 0o555);
+    assert_eq!(mode_of(&nested)?, 0o555);
+    for path in [&source, &nested, &target, &target.join("nested")] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -1417,4 +1427,47 @@ fn setgid_destination_does_not_gain_source_group_permissions()
         }
     }
     Ok(())
+}
+
+fn transfer_read_only_tree(moving: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = if moving {
+        tempfile::tempdir_in("/dev/shm")?
+    } else {
+        dir()?
+    };
+    let tree = src.path().join("readonly");
+    let nested = tree.join("nested");
+    std::fs::create_dir_all(&nested)?;
+    write(&nested.join("file"), b"payload")?;
+    if moving {
+        assert_ne!(tree.metadata()?.dev(), dst.path().metadata()?.dev());
+    }
+    for (path, stamp) in [(&tree, 1600000010), (&nested, 1600000020)] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555))?;
+        set_times(path, stamp, stamp + 1)?;
+    }
+    let target = paste(&tree, dst.path(), moving)?;
+    for (path, stamp) in [(&target, 1600000010), (&target.join("nested"), 1600000020)] {
+        assert_eq!(mode_of(path)?, 0o555);
+        assert_eq!(times_of(path)?, (stamp, 0, stamp + 1, 0));
+    }
+    assert_eq!(read(&target.join("nested/file"))?, b"payload");
+    assert_eq!(tree.exists(), !moving);
+    for root in [target, tree].into_iter().filter(|root| root.exists()) {
+        for path in [root.clone(), root.join("nested")] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn copy_read_only_tree() -> Result<(), Box<dyn std::error::Error>> {
+    transfer_read_only_tree(false)
+}
+
+#[test]
+fn move_read_only_tree_across_devices() -> Result<(), Box<dyn std::error::Error>> {
+    transfer_read_only_tree(true)
 }

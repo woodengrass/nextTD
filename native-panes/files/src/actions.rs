@@ -352,7 +352,7 @@ pub fn remove_confirmed(src: &Path, confirmed: Confirmed) -> Result<(), String> 
     {
         return Err(changed(src));
     }
-    unlink_tree(&parent, &tree, &mut HashMap::new())
+    unlink_tree(&parent, &tree, &mut HashMap::new(), false)
 }
 fn changed(path: &Path) -> String {
     format!("Source changed: {}", crate::data::single_line(path))
@@ -436,11 +436,11 @@ fn timestamps(meta: &std::fs::Metadata) -> Timestamps {
 
 #[cfg(test)]
 thread_local! {pub(crate) static TEST_SOURCE_GROUP:std::cell::Cell<Option<u32>>=const {std::cell::Cell::new(None)};}
-fn copy_metadata(
+fn copy_access(
     meta: &std::fs::Metadata,
     source: impl rustix::fd::AsFd,
     target: impl rustix::fd::AsFd,
-) -> Result<(), String> {
+) -> Result<Mode, String> {
     let group = meta.gid();
     #[cfg(test)]
     let group = TEST_SOURCE_GROUP.get().unwrap_or(group);
@@ -477,11 +477,16 @@ fn copy_metadata(
             Err(e) => return Err(e.to_string()),
         }
     }
-    rustix::fs::fchmod(
-        &target,
-        Mode::from_bits_truncate(meta.mode() & if keep_group { 0o1777 } else { 0o1707 }),
-    )
-    .map_err(|e| e.to_string())?;
+    Ok(Mode::from_bits_truncate(
+        meta.mode() & if keep_group { 0o1777 } else { 0o1707 },
+    ))
+}
+fn finish_metadata(
+    target: impl rustix::fd::AsFd,
+    mode: Mode,
+    meta: &std::fs::Metadata,
+) -> Result<(), String> {
+    rustix::fs::fchmod(&target, mode).map_err(|e| e.to_string())?;
     rustix::fs::futimens(&target, &timestamps(meta)).map_err(|e| e.to_string())?;
     rustix::fs::fsync(target).map_err(|e| e.to_string())
 }
@@ -528,12 +533,13 @@ fn cleanup_if(
     let parent = parent_dir(&entry.path)?;
     scan_removal(&parent, &entry.path)?;
     before_unlink()?;
-    unlink_tree(&parent, entry, &mut HashMap::new())
+    unlink_tree(&parent, entry, &mut HashMap::new(), true)
 }
 fn unlink_tree(
     parent: &std::fs::File,
     entry: &CopiedEntry,
     links: &mut HashMap<(u64, u64), std::fs::Metadata>,
+    move_cleanup: bool,
 ) -> Result<(), String> {
     let path = dir_path(parent).join(entry.path.file_name().ok_or(NAME_ERROR)?);
     let key = (entry.metadata.dev(), entry.metadata.ino());
@@ -572,9 +578,29 @@ fn unlink_tree(
         }
         if expected.is_dir() {
             let dir = checked_dir(parent, slot, Identity::from(&actual))?;
-            for child in &entry.children {
-                unlink_tree(&dir, child, links)?;
+            // Only the already-claimed source of a committed move may need
+            // owner write permission to unlink children. Restore before giving
+            // a partially moved tree back its original name.
+            let mode = Mode::from_bits_truncate(actual.mode());
+            let needs_write = move_cleanup
+                && !entry.children.is_empty()
+                && !mode.contains(Mode::WUSR)
+                && rustix::fs::accessat(&dir, ".", Access::WRITE_OK, rustix::fs::AtFlags::EACCESS)
+                    == Err(Errno::ACCESS);
+            if needs_write {
+                rustix::fs::fchmod(&dir, mode | Mode::WUSR).map_err(|e| e.to_string())?;
             }
+            let children = entry
+                .children
+                .iter()
+                .try_for_each(|child| unlink_tree(&dir, child, links, move_cleanup));
+            if needs_write && let Err(e) = rustix::fs::fchmod(&dir, mode) {
+                return Err(format!(
+                    "Cannot restore source permissions on {}: {e}",
+                    crate::data::single_line(&entry.path)
+                ));
+            }
+            children?;
             if identity(slot)? != Identity::from(&expected) {
                 return Err(changed(&entry.path));
             }
@@ -806,7 +832,8 @@ fn copy_file(source: &Path, target: &Path, stage: &mut Stage) -> Result<CopiedEn
         ));
     }
     unchanged(source, &opened)?;
-    copy_metadata(&opened, &incoming, &outgoing)?;
+    let mode = copy_access(&opened, &incoming, &outgoing)?;
+    finish_metadata(&outgoing, mode, &opened)?;
     if stage.moving && opened.nlink() > 1 {
         stage.links.insert(key, target.to_owned());
     }
@@ -862,7 +889,12 @@ fn ensure_tree_copyable(source: &Path) -> Result<(), String> {
 }
 
 /// Copy one tree entry without following symlinks or opening FIFOs.
-fn copy_tree_entry(source: &Path, target: &Path, stage: &mut Stage) -> Result<CopiedEntry, String> {
+fn copy_tree_entry(
+    source: &Path,
+    target: &Path,
+    stage: &mut Stage,
+    outermost: bool,
+) -> Result<CopiedEntry, String> {
     let file_type = std::fs::symlink_metadata(source)
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -877,7 +909,7 @@ fn copy_tree_entry(source: &Path, target: &Path, stage: &mut Stage) -> Result<Co
         stage.record(target)?;
         #[cfg(test)]
         note_initial(target);
-        copy_dir_contents(source, target, stage)
+        copy_dir_contents(source, target, stage, outermost)
     } else if file_type.is_file() || file_type.is_symlink() {
         copy_file(source, target, stage)
     } else {
@@ -889,6 +921,7 @@ fn copy_dir_contents(
     source: &Path,
     target: &Path,
     stage: &mut Stage,
+    outermost: bool,
 ) -> Result<CopiedEntry, String> {
     let source_fd: std::fs::File = open_dir_nofollow(source)?.into();
     if stage.moving {
@@ -908,6 +941,7 @@ fn copy_dir_contents(
             &source.join(&name),
             &target.join(&name),
             stage,
+            false,
         )?);
     }
     let copied = source_fd.metadata().map_err(|error| error.to_string())?;
@@ -918,16 +952,26 @@ fn copy_dir_contents(
         ));
     }
     unchanged(source, &copied)?;
-    copy_metadata(&metadata, source_fd.as_fd(), &target_fd)?;
+    let mode = copy_access(&metadata, source_fd.as_fd(), &target_fd)?;
+    if outermost && !mode.contains(Mode::WUSR) {
+        // Linux checks write permission on the directory whose `..` changes.
+        rustix::fs::fchmod(&target_fd, mode | Mode::WUSR).map_err(|e| e.to_string())?;
+        rustix::fs::fsync(&target_fd).map_err(|e| e.to_string())?;
+        stage.root_metadata = Some((target_fd, mode));
+    } else {
+        finish_metadata(&target_fd, mode, &metadata)?;
+    }
+
     Ok(CopiedEntry {
         path: source.to_path_buf(),
-        metadata: copied,
+        metadata,
         children,
     })
 }
 
 #[derive(Default)]
 struct Stage {
+    root_metadata: Option<(rustix::fd::OwnedFd, Mode)>,
     created: HashMap<PathBuf, Identity>,
     links: HashMap<(u64, u64), PathBuf>,
     moving: bool,
@@ -1009,22 +1053,32 @@ pub(crate) fn staged_copy(
         moving,
         ..Stage::default()
     };
+    let mut committed = false;
     let result: Result<_, String> = (|| {
-        let copied = copy_tree_entry(source, &staged, &mut stage)?;
+        let copied = copy_tree_entry(source, &staged, &mut stage, true)?;
         dir.sync_all().map_err(|e| e.to_string())?;
         #[cfg(test)]
         fire_between_note(target);
         verify(&copied, &staged, &stage)?;
-        let published = pin(&staged)?;
+        let (published, final_mode) = match stage.root_metadata.take() {
+            Some((dir, mode)) => (std::fs::File::from(dir), Some(mode)),
+            None => (pin(&staged)?, None),
+        };
         if stage.created.get(&staged) != Some(&Identity::from(&fd_metadata(&published)?)) {
             return Err("Staged object changed".into());
         }
         rename_noreplace(&staged, &dir_path(&parent).join(name))
             .map_err(RenameError::into_message)?;
+        committed = true;
+        if let Some(mode) = final_mode {
+            finish_metadata(&published, mode, &copied.metadata).map_err(|e| {
+                format!("Destination committed; cannot finalize directory metadata: {e}")
+            })?;
+        }
         Ok((copied, published))
     })();
     let cleanup = (|| {
-        if result.is_err() {
+        if !committed {
             stage.discard(&dir, &staged)?;
         }
         if identity(&root)? != id {
