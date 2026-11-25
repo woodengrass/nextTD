@@ -1435,6 +1435,87 @@ fn setgid_destination_does_not_gain_source_group_permissions()
             }
         }
     }
+    // The inherited owning GID has an explicit denial in the source ACL.
+    let contractor = dst.path().metadata()?.gid();
+    let denied = src.path().join("denied");
+    std::fs::create_dir(&denied)?;
+    let rules = format!("g::r--,g:{contractor}:---,m::r--,o::r--");
+    for default in [false, true] {
+        let mut cmd = std::process::Command::new("setfacl");
+        if default {
+            cmd.arg("-d");
+        }
+        match cmd.args(["-m", &rules]).arg(&denied).status() {
+            Ok(status) => assert!(status.success()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut denied_acl = acl.clone();
+                for record in denied_acl[4..].chunks_exact_mut(8) {
+                    let tag = u16::from_le_bytes([record[0], record[1]]);
+                    record[2] = match tag {
+                        1 => 7,
+                        8 => 0,
+                        _ => 4,
+                    };
+                    if tag == 8 {
+                        record[4..].copy_from_slice(&contractor.to_le_bytes());
+                    }
+                }
+                let name = if default {
+                    "system.posix_acl_default"
+                } else {
+                    "system.posix_acl_access"
+                };
+                rustix::fs::setxattr(&denied, name, &denied_acl, rustix::fs::XattrFlags::empty())?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    crate::actions::TEST_SOURCE_GROUP.set(Some(group));
+    let copy = paste(&denied, dst.path(), false)?;
+    crate::actions::TEST_SOURCE_GROUP.set(None);
+    if copy.metadata()?.gid() != group {
+        assert_eq!(copy.metadata()?.gid(), contractor);
+        for name in ["system.posix_acl_access", "system.posix_acl_default"] {
+            let stored = get_xattr(&copy, name)?;
+            for record in stored[4..].chunks_exact(8) {
+                if matches!(u16::from_le_bytes([record[0], record[1]]), 4 | 8 | 16 | 32) {
+                    assert_eq!(record[2], 0, "{name}: named group denied read");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn delete_in_unwritable_parent_keeps_all_contents() -> Result<(), Box<dyn std::error::Error>> {
+    let root = dir()?;
+    let work = root.path().join("work");
+    std::fs::create_dir(&work)?;
+    std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o755))?;
+    for name in ["a", "b"] {
+        write(&work.join(name), name.as_bytes())?;
+    }
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o555))?;
+    // A privileged runner can legitimately remove the directory despite 0555.
+    let writable = rustix::fs::accessat(
+        rustix::fs::CWD,
+        root.path(),
+        rustix::fs::Access::WRITE_OK,
+        rustix::fs::AtFlags::EACCESS,
+    )
+    .is_ok();
+    let result = remove(&work);
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755))?;
+    if writable {
+        result?;
+        assert!(!work.exists());
+        return Ok(());
+    }
+    assert!(result.is_err());
+    for name in ["a", "b"] {
+        assert_eq!(read(&work.join(name))?, name.as_bytes());
+    }
     Ok(())
 }
 
