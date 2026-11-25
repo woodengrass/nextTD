@@ -115,6 +115,10 @@ config containing `{"views":[]}`, or only disabled views, opens an empty
 desktop instead. Press `Ctrl+q` to exit. The desktop cannot be started inside
 an existing Zellij session.
 
+The launcher keeps session sockets in `$ZELLIJ_SOCKET_DIR` when set, otherwise in
+`$XDG_RUNTIME_DIR/tdnext/zellij` (or `/tmp/tdnext-<uid>/zellij` without a runtime directory).
+List those sessions with `ZELLIJ_SOCKET_DIR=<dir> tdnext-core list-sessions`.
+
 Views are configured as independent programs, not shell strings; see
 `native-desktop/README.md` for the `desktop.json` format. Programs inherit
 the working directory and their arguments exactly; no shell interprets

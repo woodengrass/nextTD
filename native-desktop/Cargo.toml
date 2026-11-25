@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+rustix = { version = "1", features = ["process"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

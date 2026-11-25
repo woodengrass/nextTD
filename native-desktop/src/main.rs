@@ -4,7 +4,8 @@ mod render;
 use std::{
     env, fs,
     io::{self, Write},
-    path::PathBuf,
+    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+    path::{Path, PathBuf},
     process::{Command, ExitCode},
 };
 
@@ -26,6 +27,39 @@ struct Args {
     /// Initial directory for content programs
     #[arg(default_value = ".")]
     directory: PathBuf,
+}
+
+fn private_dir(path: &Path, uid: u32) -> Result<()> {
+    match fs::DirBuilder::new().mode(0o700).create(path) {
+        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error.into()),
+        _ => {}
+    }
+    let metadata = path.symlink_metadata()?;
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        bail!(
+            "{} must be a private directory owned by uid {uid}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn socket_dir() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("ZELLIJ_SOCKET_DIR") {
+        return Ok(path.into());
+    }
+    let uid = rustix::process::getuid().as_raw();
+    let parent = if let Some(runtime) = env::var_os("XDG_RUNTIME_DIR") {
+        let runtime = std::path::absolute(runtime)?;
+        private_dir(&runtime, uid)?;
+        runtime.join("tdnext")
+    } else {
+        PathBuf::from(format!("/tmp/tdnext-{uid}"))
+    };
+    private_dir(&parent, uid)?;
+    let path = parent.join("zellij");
+    private_dir(&path, uid)?;
+    Ok(path)
 }
 
 fn run(args: Args) -> Result<ExitCode> {
@@ -63,6 +97,7 @@ fn run(args: Args) -> Result<ExitCode> {
     let config = Config::load(config_path.as_deref())?;
     let temp = tempfile::Builder::new()
         .prefix("tdnext-desktop-")
+        .permissions(fs::Permissions::from_mode(0o700))
         .tempdir()?;
     fs::create_dir(temp.path().join("layouts"))?;
     fs::create_dir(temp.path().join("data"))?;
@@ -72,7 +107,20 @@ fn run(args: Args) -> Result<ExitCode> {
     fs::write(&config_path, render::settings(&config)?)?;
     fs::write(&layout_path, render::layout(&config)?)?;
     fs::write(&chrome_path, render::chrome(&config)?)?;
-    let status = Command::new(&core)
+    let mut command = Command::new(&core);
+    if let Some(state) = env::var_os("TDNEXT_STATE_DIR") {
+        let path = PathBuf::from(state);
+        let path = if let Ok(tail) = path.strip_prefix("~") {
+            env::var_os("HOME")
+                .map_or_else(|| PathBuf::from("/root"), PathBuf::from)
+                .join(tail)
+        } else {
+            path
+        };
+        command.env("TDNEXT_STATE_DIR", env::current_dir()?.join(path));
+    }
+    let status = command
+        .env("ZELLIJ_SOCKET_DIR", socket_dir()?)
         .args(["--config"])
         .arg(&config_path)
         .arg("--config-dir")
