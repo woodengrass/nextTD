@@ -47,7 +47,11 @@ pub fn desktop(manager: &Manager, directory: &Path) -> Result<()> {
         .to_str()
         .with_context(|| format!("launcher path {} is not UTF-8", current_exe.display()))?;
     let config = build_config(&session.views, &icons, tdnext_exe);
-    let temp = tempfile::tempdir().context("creating the session config directory")?;
+    use std::os::unix::fs::PermissionsExt as _;
+    let temp = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .context("creating the session config directory")?;
     let config_path = temp.path().join("desktop.json");
     std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)
         .with_context(|| format!("writing {}", config_path.display()))?;

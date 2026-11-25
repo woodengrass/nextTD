@@ -34,7 +34,10 @@ fn private_dir(path: &Path, uid: u32) -> Result<()> {
         Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error.into()),
         _ => {}
     }
-    let metadata = path.symlink_metadata()?;
+    validate_private_dir(path, uid, &path.symlink_metadata()?)
+}
+
+fn validate_private_dir(path: &Path, uid: u32, metadata: &fs::Metadata) -> Result<()> {
     if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
         bail!(
             "{} must be a private directory owned by uid {uid}",
@@ -44,11 +47,17 @@ fn private_dir(path: &Path, uid: u32) -> Result<()> {
     Ok(())
 }
 
-fn socket_dir() -> Result<PathBuf> {
+fn socket_dir(directory: &Path) -> Result<PathBuf> {
+    let uid = rustix::process::getuid().as_raw();
     if let Some(path) = env::var_os("ZELLIJ_SOCKET_DIR") {
+        let contract = directory.join(&path).join("contract_version_1");
+        match contract.symlink_metadata() {
+            Ok(meta) => validate_private_dir(&contract, uid, &meta)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         return Ok(path.into());
     }
-    let uid = rustix::process::getuid().as_raw();
     let parent = if let Some(runtime) = env::var_os("XDG_RUNTIME_DIR") {
         let runtime = std::path::absolute(runtime)?;
         private_dir(&runtime, uid)?;
@@ -59,6 +68,7 @@ fn socket_dir() -> Result<PathBuf> {
     private_dir(&parent, uid)?;
     let path = parent.join("zellij");
     private_dir(&path, uid)?;
+    private_dir(&path.join("contract_version_1"), uid)?;
     Ok(path)
 }
 
@@ -120,7 +130,7 @@ fn run(args: Args) -> Result<ExitCode> {
         command.env("TDNEXT_STATE_DIR", env::current_dir()?.join(path));
     }
     let status = command
-        .env("ZELLIJ_SOCKET_DIR", socket_dir()?)
+        .env("ZELLIJ_SOCKET_DIR", socket_dir(&directory)?)
         .args(["--config"])
         .arg(&config_path)
         .arg("--config-dir")
