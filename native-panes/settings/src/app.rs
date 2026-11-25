@@ -2,7 +2,6 @@ use crate::preferences::{self, Appearance, Editor, IconMode};
 use std::{
     collections::BTreeSet,
     path::PathBuf,
-    process::Command,
     sync::mpsc::{self, Receiver, Sender},
     thread,
 };
@@ -62,6 +61,7 @@ pub enum Dialog {
     },
 }
 pub enum Message {
+    Back,
     Consent(String, Sender<bool>),
     Changed(Action, String, BTreeSet<String>),
     Done(Result<Vec<String>, String>),
@@ -380,9 +380,29 @@ impl App {
         });
     }
 
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self, back: &mut Option<crate::back::Back>) {
+        if let Some(command) = back {
+            match command.finished() {
+                Ok(false) => {}
+                Ok(true) => *back = None,
+                Err(error) => {
+                    self.feedback = format!("Cannot return to origin: {error}");
+                    *back = None;
+                }
+            }
+        }
         while let Ok(message) = self.rx.try_recv() {
             match message {
+                Message::Back => {
+                    if back.is_none() {
+                        match crate::back::Back::start() {
+                            Ok(command) => *back = Some(command),
+                            Err(error) => {
+                                self.feedback = format!("Cannot return to origin: {error}")
+                            }
+                        }
+                    }
+                }
                 Message::Consent(text, reply) => {
                     self.feedback_top = 0;
                     self.dialog = Some(Dialog::Consent {
@@ -412,22 +432,7 @@ impl App {
     }
 
     pub fn back(&mut self) {
-        let result = std::env::var_os("TDNEXT_ZELLIJ")
-            .ok_or_else(|| "TDNEXT_ZELLIJ is not set".to_owned())
-            .and_then(|binary| {
-                Command::new(binary)
-                    .args(["action", "return-to-origin"])
-                    .output()
-                    .map_err(|e| e.to_string())
-            })
-            .and_then(|output| {
-                if output.status.success() {
-                    Ok(())
-                } else {
-                    Err(String::from_utf8_lossy(&output.stderr).into_owned())
-                }
-            });
-        if let Err(error) = result {
+        if let Err(error) = self.tx.send(Message::Back) {
             self.feedback = format!("Cannot return to origin: {error}");
         }
     }

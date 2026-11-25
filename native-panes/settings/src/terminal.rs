@@ -22,6 +22,21 @@ impl Write for AnsiOutput {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        let result = self.flush_colors();
+        self.buffer.clear();
+        // A closed PTY returns EIO, including for ratatui's final ShowCursor.
+        // There is no output destination left; the event loop observes POLLHUP.
+        match result {
+            Err(error) if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()) => {
+                Ok(())
+            }
+            other => other,
+        }
+    }
+}
+
+impl AnsiOutput {
+    fn flush_colors(&mut self) -> io::Result<()> {
         let mut cursor = 0;
         while cursor < self.buffer.len() {
             let remaining = &self.buffer[cursor..];
@@ -65,7 +80,6 @@ impl Write for AnsiOutput {
                 cursor += 1;
             }
         }
-        self.buffer.clear();
         self.stdout.flush()
     }
 }
@@ -81,10 +95,10 @@ impl Drop for Session {
             Show,
             LeaveAlternateScreen
         ) {
-            eprintln!("Cannot restore terminal screen: {error}");
+            let _ = writeln!(io::stderr(), "Cannot restore terminal screen: {error}");
         }
         if let Err(error) = disable_raw_mode() {
-            eprintln!("Cannot restore terminal mode: {error}");
+            let _ = writeln!(io::stderr(), "Cannot restore terminal mode: {error}");
         }
     }
 }

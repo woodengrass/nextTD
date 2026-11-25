@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+rustix = { version = "1", features = ["event", "process"] }
 signal-hook = "0.3"
 anyhow = "1"
 crossterm = "0.28"
