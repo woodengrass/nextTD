@@ -163,8 +163,8 @@ impl Manager {
         preview: Option<&BTreeSet<String>>,
         mut approve: impl FnMut(&str) -> bool,
     ) -> Result<Vec<String>> {
-        let _guard = self.store.lock()?;
-        let state = self.store.read()?;
+        let guard = self.store.lock()?;
+        let state = guard.read_state()?;
         match action {
             Action::Install | Action::Enable => {
                 let order = if action == Action::Enable {
@@ -180,12 +180,12 @@ impl Manager {
                     state.enabled
                 };
                 let next = State::new(installed, enabled)?;
-                self.store.check_writable()?;
                 let tools = self.check_dependencies(&order, &mut approve)?;
-                self.store.write(&next)?;
+                let committed = guard.replace(&next)?;
                 for tool in tools {
                     tool.commit();
                 }
+                committed.sync()?;
                 Ok(order)
             }
             Action::Disable | Action::Uninstall => {
@@ -203,7 +203,7 @@ impl Manager {
                 }
                 let enabled: BTreeSet<String> =
                     state.enabled.difference(&affected).cloned().collect();
-                self.store.write(&State::new(installed, enabled)?)?;
+                guard.replace(&State::new(installed, enabled)?)?.sync()?;
                 Ok(affected.into_iter().collect())
             }
         }

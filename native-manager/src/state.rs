@@ -47,6 +47,7 @@ pub struct StateStore {
 /// overwriting. Reads never take it: atomic replacement keeps them consistent.
 pub struct StateLock {
     _file: std::fs::File,
+    target: StateStore,
 }
 
 impl StateStore {
@@ -86,7 +87,10 @@ impl StateStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Cannot lock plugin state {}", self.path.display()))?;
         }
-        let mut sidecar = resolve_target(&self.path)?.into_os_string();
+        let target = resolve_target(&self.path)?;
+        check_writable(&target)
+            .with_context(|| format!("Cannot lock plugin state {}", target.display()))?;
+        let mut sidecar = target.as_os_str().to_owned();
         sidecar.push(".lock");
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -102,7 +106,12 @@ impl StateStore {
         let mut attempts = 0;
         loop {
             match file.try_lock_exclusive() {
-                Ok(()) => return Ok(StateLock { _file: file }),
+                Ok(()) => {
+                    return Ok(StateLock {
+                        _file: file,
+                        target: StateStore::new(target),
+                    });
+                }
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock && attempts < 10_000 =>
                 {
@@ -125,16 +134,11 @@ impl StateStore {
         }
     }
 
-    pub(crate) fn check_writable(&self) -> Result<()> {
-        writable_target(&self.path)
-            .with_context(|| format!("Cannot save plugin state {}", self.path.display()))?;
-        Ok(())
-    }
-
     /// Atomically replace the snapshot; the target is never truncated in place.
     ///
     /// The caller must hold [`StateStore::lock`]: the write itself takes no
     /// lock, so taking one here would deadlock a holder that calls back in.
+    #[cfg(test)]
     pub fn write(&self, state: &State) -> Result<()> {
         let checked = State::new(state.installed.clone(), state.enabled.clone())?;
         if let Some(parent) = self.path.parent() {
@@ -146,11 +150,47 @@ impl StateStore {
     }
 }
 
+impl StateLock {
+    pub fn path(&self) -> &Path {
+        &self.target.path
+    }
+
+    pub(crate) fn read_state(&self) -> Result<State> {
+        self.target.read()
+    }
+
+    /// Rename is the commit point. Keep its subsequent durability check separate.
+    pub fn replace(&self, value: &impl Serialize) -> Result<RenamedFile> {
+        replace_at(self.path(), serde_json::to_string_pretty(value)?)
+            .with_context(|| format!("Cannot save {}", self.path().display()))
+    }
+}
+
+#[must_use = "sync the directory after committing the resources referenced by this file"]
+pub struct RenamedFile {
+    directory: std::fs::File,
+    path: PathBuf,
+}
+
+impl RenamedFile {
+    pub fn sync(self) -> Result<()> {
+        self.directory.sync_all().with_context(|| {
+            format!(
+                "Saved {} but could not sync its directory",
+                self.path.display()
+            )
+        })
+    }
+}
+
 fn resolve_target(path: &Path) -> std::io::Result<PathBuf> {
-    if path.is_symlink() {
-        path.canonicalize()
-    } else {
-        Ok(path.to_owned())
+    match path.canonicalize() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !path.is_symlink() => {
+            Ok(parent_dir(path)
+                .canonicalize()?
+                .join(path.file_name().ok_or(error)?))
+        }
+        result => result,
     }
 }
 
@@ -160,25 +200,28 @@ fn parent_dir(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-fn writable_target(path: &Path) -> std::io::Result<PathBuf> {
+fn check_writable(target: &Path) -> std::io::Result<()> {
     use rustix::fs::{Access, AtFlags, CWD, accessat};
-    let target = resolve_target(path)?;
     if target.try_exists()? {
-        accessat(CWD, &target, Access::WRITE_OK, AtFlags::EACCESS)?;
+        accessat(CWD, target, Access::WRITE_OK, AtFlags::EACCESS)?;
     }
     accessat(
         CWD,
-        parent_dir(&target),
+        parent_dir(target),
         Access::WRITE_OK | Access::EXEC_OK,
         AtFlags::EACCESS,
     )?;
-    Ok(target)
+    Ok(())
 }
 
-/// Replace the resolved file durably, leaving any user-owned symlink in place.
-pub fn write_atomically(path: &Path, text: String) -> std::io::Result<()> {
-    let path = writable_target(path)?;
-    let parent = parent_dir(&path);
+#[cfg(test)]
+fn write_atomically(path: &Path, text: String) -> Result<()> {
+    replace_at(&resolve_target(path)?, text)?.sync()
+}
+
+fn replace_at(path: &Path, text: String) -> std::io::Result<RenamedFile> {
+    check_writable(path)?;
+    let parent = parent_dir(path);
     let directory = std::fs::File::open(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     use std::io::Write as _;
@@ -186,7 +229,10 @@ pub fn write_atomically(path: &Path, text: String) -> std::io::Result<()> {
     temporary.write_all(b"\n")?;
     temporary.as_file().sync_all()?;
     temporary.persist(path)?;
-    directory.sync_all()
+    Ok(RenamedFile {
+        directory,
+        path: path.to_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -209,8 +255,33 @@ mod tests {
         let link = root.path().join("appearance.json");
         symlink(&target, &link)?;
         assert!(write_atomically(&link, "new".into()).is_err());
+        assert!(StateStore::new(link.clone()).lock().is_err());
+        assert!(!root.path().join("saved.lock").exists());
         assert_eq!(std::fs::read(&target)?, b"old");
         assert!(link.is_symlink());
+        Ok(())
+    }
+
+    #[test]
+    fn repointing_a_link_does_not_redirect_the_locked_operation() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir()?;
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        let link = root.path().join("plugins.json");
+        let state = State::new(set(&["first"]), set(&[]))?;
+        std::fs::write(&first, serde_json::to_vec(&state)?)?;
+        std::fs::write(&second, b"{}")?;
+        symlink(&first, &link)?;
+        let guard = StateStore::new(link.clone()).lock()?;
+        std::fs::remove_file(&link)?;
+        symlink(&second, &link)?;
+        assert_eq!(guard.read_state()?, state);
+        let changed = State::new(set(&["first"]), set(&["first"]))?;
+        guard.replace(&changed)?.sync()?;
+        assert_eq!(StateStore::new(first).read()?, changed);
+        assert_eq!(std::fs::read(&second)?, b"{}");
+        assert_eq!(std::fs::read_link(link)?, second);
         Ok(())
     }
 

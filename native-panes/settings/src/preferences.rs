@@ -54,7 +54,11 @@ fn read<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
 }
 
 pub fn appearance(root: &Path) -> Result<Appearance> {
-    let value: Appearance = read(&root.join("appearance.json"))?;
+    read_appearance(&root.join("appearance.json"))
+}
+
+pub fn read_appearance(path: &Path) -> Result<Appearance> {
+    let value: Appearance = read(path)?;
     if let Some(id) = &value.provider_id {
         let mut chars = id.chars();
         if !chars.next().is_some_and(|c| c.is_ascii_lowercase())
@@ -62,7 +66,7 @@ pub fn appearance(root: &Path) -> Result<Appearance> {
         {
             bail!(
                 "Cannot read preferences {}: invalid provider id",
-                root.join("appearance.json").display()
+                path.display()
             );
         }
     }
@@ -70,13 +74,17 @@ pub fn appearance(root: &Path) -> Result<Appearance> {
 }
 
 pub fn editor(root: &Path) -> Result<EditorPreferences> {
-    read(&root.join("editor.json"))
+    read_editor(&root.join("editor.json"))
 }
 
+pub fn read_editor(path: &Path) -> Result<EditorPreferences> {
+    read(path)
+}
+
+#[cfg(test)]
 pub fn save<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let parent = path.parent().context("Preference path has no parent")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("Cannot save preferences {}", path.display()))?;
-    tdnext_manager::state::write_atomically(path, serde_json::to_string_pretty(value)?)
-        .with_context(|| format!("Cannot save preferences {}", path.display()))
+    tdnext_manager::state::StateStore::new(path.to_owned())
+        .lock()?
+        .replace(value)?
+        .sync()
 }

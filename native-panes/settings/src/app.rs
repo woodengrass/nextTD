@@ -241,8 +241,8 @@ impl App {
                 Focus::Provider | Focus::Style => {
                     let store =
                         tdnext_manager::state::StateStore::new(self.root.join("appearance.json"));
-                    let _lock = store.lock()?;
-                    let mut appearance = preferences::appearance(&self.root)?;
+                    let lock = store.lock()?;
+                    let mut appearance = preferences::read_appearance(lock.path())?;
                     let before = appearance.clone();
                     if focus == Focus::Provider {
                         appearance.provider_id = (!value.is_empty()).then(|| value.to_owned());
@@ -254,7 +254,7 @@ impl App {
                         };
                     }
                     if appearance != before {
-                        preferences::save(&self.root.join("appearance.json"), &appearance)?;
+                        lock.replace(&appearance)?.sync()?;
                         self.feedback = "Appearance saved. Restart desktop to apply.".into();
                     }
                     self.appearance = Some(appearance);
@@ -262,8 +262,8 @@ impl App {
                 Focus::Editor => {
                     let store =
                         tdnext_manager::state::StateStore::new(self.root.join("editor.json"));
-                    let _lock = store.lock()?;
-                    let mut editor = preferences::editor(&self.root)?;
+                    let lock = store.lock()?;
+                    let mut editor = preferences::read_editor(lock.path())?;
                     let before = editor.clone();
                     editor.editor = match value {
                         "nvim" => Editor::Nvim,
@@ -271,7 +271,7 @@ impl App {
                         _ => Editor::Environment,
                     };
                     if editor != before {
-                        preferences::save(&self.root.join("editor.json"), &editor)?;
+                        lock.replace(&editor)?.sync()?;
                         self.feedback = "Editor saved. Applies on the next file open.".into();
                     }
                     self.editor = Some(editor.editor);
