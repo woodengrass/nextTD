@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -157,17 +158,27 @@ def test_editor_runs_configured_command_with_selected_real_file_and_restored_env
         pty.close()
 
 
-def test_delete_detail_visibly_distinguishes_raw_filename(tmp_path: Path) -> None:
+def test_actions_and_symlink_preview_visibly_distinguish_raw_names(tmp_path: Path) -> None:
     root = tmp_path / "files"
     root.mkdir()
-    (root / os.fsdecode(b"odd?\\\xff\x1b\x7f\xc2\x85")).touch()
+    name = os.fsdecode(b"odd?\\\xff\x1b\x7f\xc2\x85")
+    (root / name).symlink_to(os.fsdecode(b"target\xfe"))
+    visible = r"odd?\\\xff\u{1b}\u{7f}\u{85}"
     pane = FilesPty(require_binary(), root, tmp_path)
     try:
-        pane.wait_for("odd?")
+        pane.wait_for(r"Link to target\xfe", timeout=3)
+        pane.send("y")
+        pane.wait_for("Copied: " + visible, timeout=3)
         pane.send("d")
         frame = pane.wait_for("Delete permanently?")
         detail = frame.split("Delete permanently?", 1)[1].splitlines()[1]
         assert r"odd?\\\xff\u{1b}\u{7f}\u{85}" in detail
+        pane.send("Enter", "r")
+        frame = pane.wait_for("Rename to")
+        assert visible in frame.split("Rename to", 1)[1].splitlines()[3]
+        pane.send("End", "Z", "Enter")
+        pane.wait_for(visible + "Z")
+        assert (root / (name + "Z")).is_symlink()
     finally:
         pane.close()
 
@@ -185,7 +196,8 @@ def wait_for_input_poll(pid: int) -> None:
     pytest.fail("event reader never entered epoll")
 
 
-def test_sigterm_restores_terminal(tmp_path: Path) -> None:
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP], ids=["SIGTERM", "SIGHUP"])
+def test_signal_with_live_pty_restores_terminal(tmp_path: Path, signum: signal.Signals) -> None:
     import fcntl
     import select
     import termios
@@ -209,7 +221,7 @@ def test_sigterm_restores_terminal(tmp_path: Path) -> None:
                     output += os.read(master, 65536)
                 assert b"\x1b[?1049h" in output
                 wait_for_input_poll(proc.pid)
-                proc.terminate()
+                proc.send_signal(signum)
                 assert proc.wait(timeout=2) == 0
                 while select.select([master], [], [], 0)[0]:
                     output += os.read(master, 65536)
