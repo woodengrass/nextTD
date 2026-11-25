@@ -186,7 +186,9 @@ def test_sigterm_restores_terminal(tmp_path: Path) -> None:
         fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
 
     try:
-        with subprocess.Popen([require_binary(), str(tmp_path)], stdin=slave, stdout=slave, stderr=slave, preexec_fn=control_terminal) as proc:
+        with subprocess.Popen(
+            [require_binary(), str(tmp_path)], stdin=slave, stdout=slave, stderr=slave, preexec_fn=control_terminal,
+        ) as proc:
             output = b""
             try:
                 while b"signal-ready" not in output:

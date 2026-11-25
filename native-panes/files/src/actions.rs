@@ -7,7 +7,7 @@
 //!
 //! Public API:
 //!
-//! - [`create`] / [`rename`] / [`remove`] / [`paste`] mirror the Python
+//! - [`create`] / [`rename`] / [`remove_confirmed`] / [`paste`] mirror the Python
 //!   functions of the same name. `paste` collapses the Python `Clipboard`
 //!   (`path`, `move`) into `(src, dir, moving)`.
 //! - [`editor`] mirrors `resolve_editor_command` + the launch half of `edit`:
@@ -32,16 +32,11 @@
 //!   swapping a regular source for a FIFO (or symlink) between the checks
 //!   cannot cause a hang or an overwrite. A partially copied destination is
 //!   unlinked on failure, and a partially copied tree is removed.
-//! - Metadata: regular files and directories keep their permission bits and
-//!   access/modification times (the `shutil.copystat(..., follow_symlinks=
-//!   False)` equivalent for links is recreating the link itself), and on
-//!   Linux regular-file and directory copies also carry extended attributes
-//!   best-effort (`shutil._copyxattr` semantics: unsupported filesystems or
-//!   attributes never fail the copy). Symlinks never gain metadata.
-//! - Cross-device moves (`EXDEV`) fall back to exclusive copy + delete, so
-//!   the destination is still never overwritten and the source is removed
-//!   only after a successful copy. Plain [`rename`] does not fall back,
-//!   matching the Python `rename` (the `OSError` surfaces as an `Err`).
+//! - Copy timestamps from the pre-read snapshot and preserve mode (except
+//!   setuid/setgid) and POSIX ACLs. Other xattrs are best-effort.
+//! - Stage copies in the destination directory, verify them, and publish
+//!   with a single no-replace rename. EXDEV moves clean the source only
+//!   after commit. Recursive unlink never descends into another mount.
 //! - Scope validation: names must be a single non-empty component (no `/`,
 //!   no NUL, not `.`/`..`), and a directory cannot be copied or moved into
 //!   itself (compared after canonicalization, symlinks resolved).
@@ -68,11 +63,13 @@
 //! - `~otheruser/...` is not expanded when resolving the state directory;
 //!   only a leading `~` / `~/` is.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::fd::AsFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -269,7 +266,7 @@ fn mount(dir: &std::fs::File) -> Result<(u64, u64), String> {
     }
     Ok((m.dev(), st.stx_mnt_id))
 }
-fn checked_dir(
+pub(crate) fn checked_dir(
     parent: &std::fs::File,
     path: &Path,
     expected: Identity,
@@ -551,7 +548,7 @@ fn note_initial(target: &Path) {
             .lock()
             .expect("initial-mode lock")
             .push(InitialMode {
-                path: target.to_path_buf(),
+                path: target.canonicalize().expect("staged creation"),
                 mode: meta.mode() & 0o777,
                 len: meta.len(),
             });
@@ -596,7 +593,7 @@ fn fire_between_note(source: &Path) {
 }
 
 /// Copy a single file/symlink to a path that must not exist, atomically.
-pub(crate) fn copy_file_noreplace(source: &Path, target: &Path) -> Result<CopiedEntry, String> {
+fn copy_file(source: &Path, target: &Path, stage: &mut Stage) -> Result<CopiedEntry, String> {
     let metadata = std::fs::symlink_metadata(source).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             source_gone(&display_name(source))
@@ -607,10 +604,15 @@ pub(crate) fn copy_file_noreplace(source: &Path, target: &Path) -> Result<Copied
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
         copy_symlink_noreplace(source, target)?;
-        if let Err(error) = unchanged(source, &metadata) {
-            let _ = std::fs::remove_file(target);
-            return Err(error);
-        }
+        stage.record(target)?;
+        rustix::fs::utimensat(
+            CWD,
+            target,
+            &timestamps(&metadata),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|e| e.to_string())?;
+        unchanged(source, &metadata)?;
         return Ok(CopiedEntry {
             path: source.to_path_buf(),
             metadata,
@@ -645,28 +647,34 @@ pub(crate) fn copy_file_noreplace(source: &Path, target: &Path) -> Result<Copied
     if !same_entry(&metadata, &opened) {
         return Err(format!("Source changed: {}", source.display()));
     }
+    let key = (opened.dev(), opened.ino());
+    if let Some(previous) = stage.links.get(&key) {
+        std::fs::hard_link(previous, target).map_err(|e| e.to_string())?;
+        stage.record(target)?;
+        return Ok(CopiedEntry {
+            path: source.to_owned(),
+            metadata: opened,
+            children: Vec::new(),
+        });
+    }
     let mut outgoing = create_private_file(target)?;
+    stage.record(target)?;
     #[cfg(test)]
     note_initial(target);
-    let result = (|| {
-        std::io::copy(&mut incoming, &mut outgoing).map_err(|error| error.to_string())?;
-        let copied = incoming.metadata().map_err(|error| error.to_string())?;
-        if !same_entry(&opened, &copied) {
-            return Err(format!("Source changed: {}", source.display()));
-        }
-        unchanged(source, &copied)?;
-        copy_metadata(&opened, incoming.as_fd(), outgoing.as_fd())?;
-        Ok(CopiedEntry {
-            path: source.to_path_buf(),
-            metadata: copied,
-            children: Vec::new(),
-        })
-    })();
-    if result.is_err() {
-        drop(outgoing);
-        let _ = std::fs::remove_file(target);
+    let count = std::io::copy(&mut incoming, &mut outgoing).map_err(|e| e.to_string())?;
+    if count != opened.len() {
+        return Err(format!("Source changed: {}", source.display()));
     }
-    result
+    unchanged(source, &opened)?;
+    copy_metadata(&opened, &incoming, &outgoing)?;
+    if opened.nlink() > 1 {
+        stage.links.insert(key, target.to_owned());
+    }
+    Ok(CopiedEntry {
+        path: source.to_owned(),
+        metadata: opened,
+        children: Vec::new(),
+    })
 }
 
 /// Refuse trees containing special files before copying or moving them.
@@ -714,7 +722,7 @@ fn ensure_tree_copyable(source: &Path) -> Result<(), String> {
 }
 
 /// Copy one tree entry without following symlinks or opening FIFOs.
-fn copy_tree_entry(source: &Path, target: &Path) -> Result<CopiedEntry, String> {
+fn copy_tree_entry(source: &Path, target: &Path, stage: &mut Stage) -> Result<CopiedEntry, String> {
     let file_type = std::fs::symlink_metadata(source)
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -726,18 +734,26 @@ fn copy_tree_entry(source: &Path, target: &Path) -> Result<CopiedEntry, String> 
         .file_type();
     if file_type.is_dir() {
         create_private_dir(target)?;
+        stage.record(target)?;
         #[cfg(test)]
         note_initial(target);
-        copy_dir_contents(source, target)
+        copy_dir_contents(source, target, stage)
     } else if file_type.is_file() || file_type.is_symlink() {
-        copy_file_noreplace(source, target)
+        copy_file(source, target, stage)
     } else {
         Err(special(&display_name(source)))
     }
 }
 
-fn copy_dir_contents(source: &Path, target: &Path) -> Result<CopiedEntry, String> {
+fn copy_dir_contents(
+    source: &Path,
+    target: &Path,
+    stage: &mut Stage,
+) -> Result<CopiedEntry, String> {
     let source_fd: std::fs::File = open_dir_nofollow(source)?.into();
+    if stage.moving && mount(&source_fd)? != mount(&parent_dir(source)?)? {
+        return Err(format!("Cannot remove mount point: {}", source.display()));
+    }
     let target_fd = open_dir_nofollow(target)?;
     let metadata = source_fd.metadata().map_err(|error| error.to_string())?;
     unchanged(source, &metadata)?;
@@ -748,7 +764,11 @@ fn copy_dir_contents(source: &Path, target: &Path) -> Result<CopiedEntry, String
     names.sort();
     let mut children = Vec::new();
     for name in names {
-        children.push(copy_tree_entry(&source.join(&name), &target.join(&name))?);
+        children.push(copy_tree_entry(
+            &source.join(&name),
+            &target.join(&name),
+            stage,
+        )?);
     }
     let copied = source_fd.metadata().map_err(|error| error.to_string())?;
     if !same_entry(&metadata, &copied) {
@@ -763,32 +783,125 @@ fn copy_dir_contents(source: &Path, target: &Path) -> Result<CopiedEntry, String
     })
 }
 
-pub(crate) fn copy_dir_noreplace(source: &Path, target: &Path) -> Result<CopiedEntry, String> {
-    create_private_dir(target)?;
-    #[cfg(test)]
-    note_initial(target);
-    let result = copy_dir_contents(source, target);
-    if result.is_err() {
-        let _ = std::fs::remove_dir_all(target);
+#[derive(Default)]
+struct Stage {
+    created: HashMap<PathBuf, Identity>,
+    links: HashMap<(u64, u64), PathBuf>,
+    moving: bool,
+}
+impl Stage {
+    fn record(&mut self, path: &Path) -> Result<(), String> {
+        self.created.insert(path.to_owned(), identity(path)?);
+        Ok(())
     }
-    result
+    // Walk only recorded entries and anchor every descent at the checked directory.
+    fn discard(&self, parent: &std::fs::File, logical: &Path) -> Result<(), String> {
+        let Some(&expected) = self.created.get(logical) else {
+            return Ok(());
+        };
+        let path = dir_path(parent).join(logical.file_name().ok_or(NAME_ERROR)?);
+        if identity(&path)? != expected {
+            return Err("staging entry replaced".into());
+        }
+        if expected.2.is_dir() {
+            let dir = checked_dir(parent, logical, expected)?;
+            rustix::fs::fchmod(&dir, Mode::RWXU).map_err(|e| e.to_string())?;
+            for child in std::fs::read_dir(dir_path(&dir)).map_err(|e| e.to_string())? {
+                self.discard(
+                    &dir,
+                    &logical.join(child.map_err(|e| e.to_string())?.file_name()),
+                )?;
+            }
+            std::fs::remove_dir(path).map_err(|e| e.to_string())
+        } else {
+            std::fs::remove_file(path).map_err(|e| e.to_string())
+        }
+    }
+}
+fn verify(entry: &CopiedEntry, path: &Path, stage: &Stage) -> Result<(), String> {
+    unchanged(&entry.path, &entry.metadata)?;
+    let m = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if stage.created.get(path) != Some(&Identity::from(&m))
+        || m.file_type() != entry.metadata.file_type()
+        || (!m.is_dir() && m.len() != entry.metadata.len())
+        || (m.mtime(), m.mtime_nsec()) != (entry.metadata.mtime(), entry.metadata.mtime_nsec())
+    {
+        return Err(format!("Staged copy differs: {}", entry.path.display()));
+    }
+    for child in &entry.children {
+        verify(
+            child,
+            &path.join(child.path.file_name().ok_or(NAME_ERROR)?),
+            stage,
+        )?;
+    }
+    Ok(())
+}
+pub(crate) fn staged_copy(
+    source: &Path,
+    target: &Path,
+    moving: bool,
+) -> Result<CopiedEntry, String> {
+    let parent = parent_dir(target)?;
+    let name = target.file_name().ok_or(NAME_ERROR)?;
+    let root = tempfile::Builder::new()
+        .prefix(".tdnext-files-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(dir_path(&parent))
+        .map_err(|e| e.to_string())?
+        .keep();
+    let visible = target.with_file_name(root.file_name().ok_or(NAME_ERROR)?);
+    let left = |e: String| format!("Staging remains at {}: {e}", visible.display());
+    let dir: std::fs::File = open_dir_nofollow(&root).map_err(left)?.into();
+    let id = Identity::from(&dir.metadata().map_err(|e| left(e.to_string()))?);
+    let staged = dir_path(&dir).join(name);
+    let mut stage = Stage {
+        moving,
+        ..Stage::default()
+    };
+    let result: Result<_, String> = (|| {
+        let copied = copy_tree_entry(source, &staged, &mut stage)?;
+        dir.sync_all().map_err(|e| e.to_string())?;
+        verify(&copied, &staged, &stage)?;
+        #[cfg(test)]
+        fire_between_note(target);
+        rename_noreplace(&staged, &dir_path(&parent).join(name))
+            .map_err(RenameError::into_message)?;
+        Ok(copied)
+    })();
+    let cleanup = (|| {
+        if result.is_err() {
+            stage.discard(&dir, &staged)?;
+        }
+        if identity(&root)? != id {
+            return Err("staging directory replaced".into());
+        }
+        std::fs::remove_dir(&root).map_err(|e| e.to_string())
+    })();
+    if let Err(e) = cleanup {
+        return Err(match result {
+            Err(cause) => format!("{cause}; {}", left(e)),
+            Ok(_) => format!("Destination committed; {}", left(e)),
+        });
+    }
+    let copy = result?;
+    parent
+        .sync_all()
+        .map_err(|e| format!("Destination committed; directory sync failed: {e}"))?;
+    Ok(copy)
 }
 
 /// Move without ever replacing an existing destination. Cross-device moves
 /// fall back to exclusive copy + delete so the destination is still never
 /// overwritten; the source is removed only after a successful copy.
 pub(crate) fn move_noreplace(source: &Path, target: &Path) -> Result<(), String> {
-    if is_real_dir(source) {
+    if is_real_dir(source) && mount(&parent_dir(source)?)? == mount(&parent_dir(target)?)? {
         ensure_tree_copyable(source)?;
     }
     match rename_noreplace(source, target) {
         Ok(()) => Ok(()),
         Err(RenameError::Exdev) => {
-            let copied = if is_real_dir(source) {
-                copy_dir_noreplace(source, target)?
-            } else {
-                copy_file_noreplace(source, target)?
-            };
+            let copied = staged_copy(source, target, true)?;
             #[cfg(test)]
             fire_between_note(source);
             cleanup_copied(&copied).map_err(|error| {
@@ -819,10 +932,8 @@ pub fn paste(src: &Path, dir: &Path, moving: bool) -> Result<PathBuf, String> {
     }
     if moving {
         move_noreplace(src, &target)?;
-    } else if is_real_dir(src) {
-        copy_dir_noreplace(src, &target)?;
     } else {
-        copy_file_noreplace(src, &target)?;
+        staged_copy(src, &target, false)?;
     }
     Ok(target)
 }

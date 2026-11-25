@@ -430,7 +430,12 @@ impl Controller {
     }
     fn refresh_after_failure(&mut self) {
         if self.clip.as_ref().is_some_and(|(p, _)| {
-            std::fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            std::fs::symlink_metadata(p).is_err_and(|e| {
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                )
+            })
         }) {
             self.clip = None;
         }
@@ -1769,8 +1774,17 @@ mod controller_tests {
         });
         c.handle(key(K::Char('p'), M::empty()), 80, 24);
         assert!(c.mutation.is_some(), "paste must leave a pending mutation");
+        // A new clipboard selection while the move runs points to the child
+        // that will be unlinked before its sibling triggers the conflict.
+        c.clip = Some((tree.join("a.txt"), false));
         settle(&mut c);
 
+        assert_eq!(
+            c.selected(),
+            Some(dest.join("tree")),
+            "reload the destination listing"
+        );
+        assert!(c.clip.is_none(), "drop the missing clipboard source");
         // The partial move is user-visible.
         let (toast, _) =
             c.ui.toast
@@ -1898,10 +1912,17 @@ mod controller_tests {
         let root_target = dest.join("tree");
         let nested_target = root_target.join("nested");
         let file_target = nested_target.join("b.txt");
-        let at = |path: &std::path::Path| {
+        let stage = taken.first().unwrap().path.parent().unwrap();
+        assert_eq!(
+            stage.parent(),
+            Some(dest.as_path()),
+            "private staging directory"
+        );
+        let at = |final_path: &std::path::Path| {
+            let path = stage.join(final_path.strip_prefix(&dest).unwrap());
             taken
                 .iter()
-                .find(|entry| entry.path == *path)
+                .find(|entry| entry.path == path)
                 .unwrap_or_else(|| panic!("no creation record for {}", path.display()))
         };
         assert_eq!(taken.len(), 3, "unexpected creation records: {taken:?}");
@@ -1951,7 +1972,13 @@ mod controller_tests {
         // copy and the final chmod.
         let taken = crate::actions::take_initial_modes_under(&dest);
         assert_eq!(taken.len(), 1, "unexpected creation records: {taken:?}");
-        assert_eq!(taken[0].path, dest.join("note.txt"));
+        let stage = taken[0].path.parent().unwrap();
+        assert_eq!(
+            stage.parent(),
+            Some(dest.as_path()),
+            "private staging directory"
+        );
+        assert_eq!(taken[0].path, stage.join("note.txt"));
         assert_eq!(taken[0].mode & 0o177, 0, "file not created private");
         assert_eq!(
             taken[0].len, 0,

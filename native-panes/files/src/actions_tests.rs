@@ -13,10 +13,10 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
 
 use crate::actions::{
-    EditorChoice, RestoredPath, cleanup_copied, copy_dir_noreplace, copy_file_noreplace, create,
-    create_private_dir, create_private_file, editor, expanduser, find_executable_in,
-    move_noreplace, parse_editor_choice, paste, remove, rename, rename_noreplace,
-    resolve_editor_argv_with, resolve_state_dir_from, restored_path_plan,
+    EditorChoice, RestoredPath, cleanup_copied, create, create_private_dir, create_private_file,
+    editor, expanduser, find_executable_in, move_noreplace, parse_editor_choice, paste, remove,
+    rename, rename_noreplace, resolve_editor_argv_with, resolve_state_dir_from, restored_path_plan,
+    staged_copy,
 };
 
 fn dir() -> Result<tempfile::TempDir, String> {
@@ -454,7 +454,7 @@ fn copied_tree_cleanup_removes_only_unchanged_entries() -> Result<(), String> {
     write(&source.join("a"), b"copied")?;
     write(&nested.join("changed"), b"before")?;
     let target = root.path().join("target");
-    let copied = copy_dir_noreplace(&source, &target)?;
+    let copied = staged_copy(&source, &target, false)?;
     write(&nested.join("changed"), b"after change")?;
     assert!(cleanup_copied(&copied).is_err());
     assert!(!source.join("a").exists());
@@ -471,7 +471,7 @@ fn copied_tree_cleanup_preserves_new_subtrees() -> Result<(), String> {
     let nested = source.join("nested");
     std::fs::create_dir(&nested).map_err(|error| error.to_string())?;
     write(&nested.join("copied"), b"copied")?;
-    let copied = copy_dir_noreplace(&source, &root.path().join("target"))?;
+    let copied = staged_copy(&source, &root.path().join("target"), false)?;
     let added = nested.join("new");
     std::fs::create_dir(&added).map_err(|error| error.to_string())?;
     write(&added.join("data"), b"new")?;
@@ -486,14 +486,14 @@ fn copied_entries_cleanup_handles_files_symlinks_and_unchanged_tree() -> Result<
     let root = dir()?;
     let source = root.path().join("source");
     write(&source, b"before")?;
-    let copied = copy_file_noreplace(&source, &root.path().join("file-copy"))?;
+    let copied = staged_copy(&source, &root.path().join("file-copy"), false)?;
     write(&source, b"changed")?;
     assert!(cleanup_copied(&copied).is_err());
     assert_eq!(read(&source)?, b"changed");
 
     let link = root.path().join("link");
     std::os::unix::fs::symlink("source", &link).map_err(|error| error.to_string())?;
-    let copied = copy_file_noreplace(&link, &root.path().join("link-copy"))?;
+    let copied = staged_copy(&link, &root.path().join("link-copy"), false)?;
     cleanup_copied(&copied)?;
     assert!(!link.is_symlink());
     assert_eq!(read(&source)?, b"changed");
@@ -502,7 +502,7 @@ fn copied_entries_cleanup_handles_files_symlinks_and_unchanged_tree() -> Result<
     std::fs::create_dir(&tree).map_err(|error| error.to_string())?;
     std::fs::create_dir(tree.join("nested")).map_err(|error| error.to_string())?;
     write(&tree.join("nested/file"), b"data")?;
-    let copied = copy_dir_noreplace(&tree, &root.path().join("tree-copy"))?;
+    let copied = staged_copy(&tree, &root.path().join("tree-copy"), false)?;
     cleanup_copied(&copied)?;
     assert!(!tree.exists());
     Ok(())
@@ -1098,17 +1098,17 @@ fn atomic_copy_rejects_existing_file_directory_and_symlink_destinations() -> Res
     write(&source, b"source")?;
     let rival = root.path().join("rival");
     write(&rival, b"keep")?;
-    assert!(copy_file_noreplace(&source, &rival).is_err());
+    assert!(staged_copy(&source, &rival, false).is_err());
     let link = root.path().join("link");
     std::os::unix::fs::symlink("rival", &link).map_err(|e| e.to_string())?;
-    assert!(copy_file_noreplace(&source, &link).is_err());
+    assert!(staged_copy(&source, &link, false).is_err());
     let source_tree = root.path().join("tree");
     std::fs::create_dir(&source_tree).map_err(|e| e.to_string())?;
     write(&source_tree.join("source"), b"tree")?;
     let rival_tree = root.path().join("existing-tree");
     std::fs::create_dir(&rival_tree).map_err(|e| e.to_string())?;
     write(&rival_tree.join("keep"), b"rival")?;
-    assert!(copy_dir_noreplace(&source_tree, &rival_tree).is_err());
+    assert!(staged_copy(&source_tree, &rival_tree, false).is_err());
     assert_eq!(read(&source)?, b"source");
     assert_eq!(read(&rival)?, b"keep");
     assert_eq!(
@@ -1141,12 +1141,20 @@ fn copied_tree_drops_inherited_acls() -> Result<(), Box<dyn std::error::Error>> 
         acl.extend(perm.to_le_bytes());
         acl.extend(id.to_le_bytes());
     }
-    rustix::fs::setxattr(
-        &dst,
-        "system.posix_acl_default",
-        &acl,
-        rustix::fs::XattrFlags::empty(),
-    )?;
+    match std::process::Command::new("setfacl")
+        .args(["-m", "d:u:65534:r--"])
+        .arg(&dst)
+        .status()
+    {
+        Ok(status) => assert!(status.success()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => rustix::fs::setxattr(
+            &dst,
+            "system.posix_acl_default",
+            &acl,
+            rustix::fs::XattrFlags::empty(),
+        )?,
+        Err(e) => return Err(e.into()),
+    }
     let result = paste(&tree, &dst, false)?;
     for (path, attr) in [
         (&result, "system.posix_acl_default"),
@@ -1172,11 +1180,23 @@ fn move_with_two_names_for_one_inode_completes() -> Result<(), Box<dyn std::erro
     let target = paste(&tree, dst.path(), true)?;
     assert!(!tree.exists());
     assert_eq!(read(&target.join("b"))?, b"linked");
+    assert_eq!(
+        target.join("a").metadata()?.ino(),
+        target.join("b").metadata()?.ino()
+    );
     Ok(())
 }
 
 #[test]
 fn nested_bind_mount_blocks_all_unlinks() -> Result<(), Box<dyn std::error::Error>> {
+    // Probe the live namespace read-only; never run deletion against /proc.
+    let proc = Path::new("/proc");
+    let root = std::fs::File::open("/")?;
+    assert!(
+        crate::actions::checked_dir(&root, proc, crate::actions::identity(proc)?)
+            .unwrap_err()
+            .contains("mount point: /proc")
+    );
     let tmp = dir()?;
     let tree = tmp.path().join("tree");
     let nested = tree.join("nested/bind");
@@ -1189,5 +1209,42 @@ fn nested_bind_mount_blocks_all_unlinks() -> Result<(), Box<dyn std::error::Erro
     assert!(error.contains(nested.to_str().unwrap()), "{error}");
     assert_eq!(read(&tree.join("beside"))?, b"outside");
     assert_eq!(read(&nested.join("inside"))?, b"mounted");
+    Ok(())
+}
+
+#[test]
+fn late_rival_and_foreign_staging_entry_survive_failed_commit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = tempfile::tempdir_in("/dev/shm")?;
+    let tree = src.path().join("tree");
+    std::fs::create_dir(&tree)?;
+    write(&tree.join("payload"), b"old")?;
+    let target = dst.path().join("tree");
+    let rival = target.clone();
+    crate::actions::stash_between_note(&target, move || {
+        let stage = std::fs::read_dir(rival.parent().unwrap())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::create_dir(&rival).unwrap();
+        std::fs::write(rival.join("keep"), b"rival").unwrap();
+        std::fs::write(stage.join("tree/foreign"), b"foreign").unwrap();
+    });
+    let err = paste(&tree, dst.path(), true).unwrap_err();
+    assert!(err.contains("Staging remains"), "{err}");
+    assert_eq!(read(&tree.join("payload"))?, b"old");
+    assert_eq!(read(&target.join("keep"))?, b"rival");
+    let stage = std::fs::read_dir(dst.path())?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .find(|e| e.path() != target)
+        .unwrap()
+        .path();
+    assert!(err.contains(stage.to_str().unwrap()));
+    assert_eq!(read(&stage.join("tree/foreign"))?, b"foreign");
+    assert!(!stage.join("tree/payload").exists());
     Ok(())
 }
