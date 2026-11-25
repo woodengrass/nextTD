@@ -215,7 +215,7 @@ fn paste_copies_file_with_metadata() -> Result<(), String> {
     std::fs::create_dir(&dest_dir).map_err(|error| error.to_string())?;
     let source = source_dir.join("note.txt");
     write(&source, b"hello")?;
-    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640))
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o7640))
         .map_err(|error| error.to_string())?;
     let target = paste(&source, &dest_dir, false)?;
     if target != dest_dir.join("note.txt") {
@@ -224,12 +224,7 @@ fn paste_copies_file_with_metadata() -> Result<(), String> {
     if read(&target)? != b"hello" {
         return Err("pasted content differs".to_string());
     }
-    if mode_of(&target)? != 0o640 {
-        return Err(format!(
-            "pasted mode is {:o}, expected 640",
-            mode_of(&target)?
-        ));
-    }
+    assert_eq!(target.metadata().unwrap().mode() & 0o7777, 0o1640);
     if !source.exists() {
         return Err("copy removed the source".to_string());
     }
@@ -253,10 +248,11 @@ fn paste_copies_file_xattrs_and_times() -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     set_times(&source, 1_700_000_000, 1_700_000_123)?;
     let xattrs = try_set_xattr(&source, "user.tdnext-note", b"pinned")?;
+    let original = times_of(&source)?;
     let target = paste(&source, &dest_dir, false)?;
     // Times first: reading the copy for the content check below would
     // refresh its access time under relatime.
-    if times_of(&target)? != times_of(&source)? {
+    if times_of(&target)? != original {
         return Err("pasted times were not preserved".to_string());
     }
     if mode_of(&target)? != 0o640 {
@@ -292,15 +288,16 @@ fn paste_preserves_nested_tree_metadata_and_xattrs() -> Result<(), String> {
     let dir_xattrs = try_set_xattr(&nested, "user.tdnext-nested", b"nested")?;
     let parent = root.path().join("copy");
     std::fs::create_dir(&parent).map_err(|error| error.to_string())?;
+    let original = [times_of(&source)?, times_of(&nested)?, times_of(&inner)?];
     let copied = paste(&source, &parent, false)?;
     // Times before any read: reading a copy refreshes its access time
     // under relatime, and walking the source refreshes the source dirs.
     // The outermost directory keeps source mode/times too (deliberate
     // divergence recorded in `copy-root-metadata.adr.md`).
-    if times_of(&copied)? != times_of(&source)? {
+    if times_of(&copied)? != original[0] {
         return Err("copied root times were not preserved".to_string());
     }
-    if times_of(&copied.join("nested"))? != times_of(&nested)? {
+    if times_of(&copied.join("nested"))? != original[1] {
         return Err("nested dir times were not preserved".to_string());
     }
     let copied_nested = copied.join("nested");
@@ -311,7 +308,7 @@ fn paste_preserves_nested_tree_metadata_and_xattrs() -> Result<(), String> {
         return Err("nested dir mode was not preserved".to_string());
     }
     let copied_inner = copied_nested.join("b.txt");
-    if times_of(&copied_inner)? != times_of(&inner)? {
+    if times_of(&copied_inner)? != original[2] {
         return Err("nested file times were not preserved".to_string());
     }
     if read(&copied_inner)? != b"b" || mode_of(&copied_inner)? != 0o640 {
@@ -1120,5 +1117,77 @@ fn atomic_copy_rejects_existing_file_directory_and_symlink_destinations() -> Res
     );
     assert_eq!(read(&source_tree.join("source"))?, b"tree");
     assert_eq!(read(&rival_tree.join("keep"))?, b"rival");
+    Ok(())
+}
+
+#[test]
+fn copied_tree_drops_inherited_acls() -> Result<(), Box<dyn std::error::Error>> {
+    let root = dir()?;
+    let tree = root.path().join("src");
+    let dst = root.path().join("dst");
+    std::fs::create_dir(&tree)?;
+    std::fs::create_dir(&dst)?;
+    write(&tree.join("file"), b"data")?;
+    // Linux POSIX ACL xattr, granting an additional named user read access.
+    let mut acl = 2u32.to_le_bytes().to_vec();
+    for (tag, perm, id) in [
+        (1u16, 7u16, u32::MAX),
+        (2, 4, 65534),
+        (4, 0, u32::MAX),
+        (16, 4, u32::MAX),
+        (32, 0, u32::MAX),
+    ] {
+        acl.extend(tag.to_le_bytes());
+        acl.extend(perm.to_le_bytes());
+        acl.extend(id.to_le_bytes());
+    }
+    rustix::fs::setxattr(
+        &dst,
+        "system.posix_acl_default",
+        &acl,
+        rustix::fs::XattrFlags::empty(),
+    )?;
+    let result = paste(&tree, &dst, false)?;
+    for (path, attr) in [
+        (&result, "system.posix_acl_default"),
+        (&result, "system.posix_acl_access"),
+        (&result.join("file"), "system.posix_acl_access"),
+    ] {
+        assert_eq!(
+            rustix::fs::getxattr_query(path, attr),
+            Err(rustix::io::Errno::NODATA)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn move_with_two_names_for_one_inode_completes() -> Result<(), Box<dyn std::error::Error>> {
+    let root = dir()?;
+    let dst = tempfile::tempdir_in("/dev/shm")?;
+    let tree = root.path().join("src");
+    std::fs::create_dir(&tree)?;
+    write(&tree.join("a"), b"linked")?;
+    std::fs::hard_link(tree.join("a"), tree.join("b"))?;
+    let target = paste(&tree, dst.path(), true)?;
+    assert!(!tree.exists());
+    assert_eq!(read(&target.join("b"))?, b"linked");
+    Ok(())
+}
+
+#[test]
+fn nested_bind_mount_blocks_all_unlinks() -> Result<(), Box<dyn std::error::Error>> {
+    let tmp = dir()?;
+    let tree = tmp.path().join("tree");
+    let nested = tree.join("nested/bind");
+    std::fs::create_dir_all(&nested)?;
+    write(&nested.join("inside"), b"mounted")?;
+    write(&tree.join("beside"), b"outside")?;
+    let m = nested.metadata()?;
+    crate::actions::BIND_ROOT.set(Some((m.dev(), m.ino())));
+    let error = remove(&tree).unwrap_err();
+    assert!(error.contains(nested.to_str().unwrap()), "{error}");
+    assert_eq!(read(&tree.join("beside"))?, b"outside");
+    assert_eq!(read(&nested.join("inside"))?, b"mounted");
     Ok(())
 }

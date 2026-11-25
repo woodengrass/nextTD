@@ -225,15 +225,95 @@ pub fn rename(src: &Path, name: &str) -> Result<PathBuf, String> {
 
 /// Remove a file, symlink, or directory tree. A symlink to a directory
 /// removes the link, never the target.
+#[cfg(test)]
 pub fn remove(src: &Path) -> Result<(), String> {
-    let file_type = std::fs::symlink_metadata(src)
-        .map_err(|error| error.to_string())?
-        .file_type();
-    if file_type.is_dir() && !file_type.is_symlink() {
-        std::fs::remove_dir_all(src).map_err(|error| error.to_string())
-    } else {
-        std::fs::remove_file(src).map_err(|error| error.to_string())
+    remove_confirmed(src, identity(src)?)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Identity(u64, u64, std::fs::FileType);
+impl From<&std::fs::Metadata> for Identity {
+    fn from(m: &std::fs::Metadata) -> Self {
+        Self(m.dev(), m.ino(), m.file_type())
     }
+}
+pub fn identity(path: &Path) -> Result<Identity, String> {
+    std::fs::symlink_metadata(path)
+        .map(|m| Identity::from(&m))
+        .map_err(|e| e.to_string())
+}
+fn dir_path(dir: &std::fs::File) -> PathBuf {
+    use std::os::fd::AsRawFd;
+    PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+}
+fn parent_dir(path: &Path) -> Result<std::fs::File, String> {
+    std::fs::File::open(
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )
+    .map_err(|e| e.to_string())
+}
+#[cfg(test)]
+thread_local! { pub(crate) static BIND_ROOT: std::cell::Cell<Option<(u64,u64)>> = const { std::cell::Cell::new(None) }; }
+fn mount(dir: &std::fs::File) -> Result<(u64, u64), String> {
+    use rustix::fs::{AtFlags, StatxFlags, statx};
+    let st = statx(dir, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID).map_err(|e| e.to_string())?;
+    if st.stx_mask & StatxFlags::MNT_ID.bits() == 0 {
+        return Err("Cannot verify mount ID".into());
+    }
+    let m = dir.metadata().map_err(|e| e.to_string())?;
+    #[cfg(test)]
+    if BIND_ROOT.get() == Some((m.dev(), m.ino())) {
+        return Ok((m.dev(), u64::MAX));
+    }
+    Ok((m.dev(), st.stx_mnt_id))
+}
+fn checked_dir(
+    parent: &std::fs::File,
+    path: &Path,
+    expected: Identity,
+) -> Result<std::fs::File, String> {
+    let name = path.file_name().ok_or("Cannot delete filesystem root")?;
+    let dir: std::fs::File = open_dir_nofollow(&dir_path(parent).join(name))?.into();
+    if mount(parent)? != mount(&dir)? {
+        return Err(format!("Cannot remove mount point: {}", path.display()));
+    }
+    if Identity::from(&dir.metadata().map_err(|e| e.to_string())?) != expected {
+        return Err(format!("Source changed: {}", path.display()));
+    }
+    Ok(dir)
+}
+fn scan_removal(parent: &std::fs::File, path: &Path) -> Result<CopiedEntry, String> {
+    let name = path.file_name().ok_or("Cannot delete filesystem root")?;
+    let metadata =
+        std::fs::symlink_metadata(dir_path(parent).join(name)).map_err(|e| e.to_string())?;
+    let mut children = Vec::new();
+    if metadata.is_dir() {
+        let dir = checked_dir(parent, path, Identity::from(&metadata))?;
+        for child in std::fs::read_dir(dir_path(&dir)).map_err(|e| e.to_string())? {
+            children.push(scan_removal(
+                &dir,
+                &path.join(child.map_err(|e| e.to_string())?.file_name()),
+            )?);
+        }
+    }
+    Ok(CopiedEntry {
+        path: path.to_owned(),
+        metadata,
+        children,
+    })
+}
+pub fn remove_confirmed(src: &Path, confirmed: Identity) -> Result<(), String> {
+    let parent = parent_dir(src)?;
+    if identity(src)? != confirmed {
+        return Err(format!("Source changed: {}", src.display()));
+    }
+    let tree = scan_removal(&parent, src)?;
+    if Identity::from(&tree.metadata) != confirmed {
+        return Err(format!("Source changed: {}", src.display()));
+    }
+    unlink_tree(&parent, &tree, &mut Default::default())
 }
 
 /// Atomically recreate a symlink; fails if the destination exists.
@@ -271,7 +351,10 @@ fn copy_xattrs_fd(source: impl rustix::fd::AsFd, target: impl rustix::fd::AsFd) 
         return;
     }
     for name in list.split(|byte| *byte == 0) {
-        if name.is_empty() {
+        if name.is_empty()
+            || name == b"system.posix_acl_access"
+            || name == b"system.posix_acl_default"
+        {
             continue;
         }
         let value_len = match rustix::fs::fgetxattr_query(&source, name) {
@@ -296,10 +379,8 @@ fn open_dir_nofollow(path: &Path) -> Result<rustix::fd::OwnedFd, String> {
     .map_err(|error| error.to_string())
 }
 
-fn copy_metadata(meta: &std::fs::Metadata, target: impl rustix::fd::AsFd) -> Result<(), String> {
-    rustix::fs::fchmod(&target, Mode::from_bits_truncate(meta.mode() & 0o7777))
-        .map_err(|error| error.to_string())?;
-    let times = Timestamps {
+fn timestamps(meta: &std::fs::Metadata) -> Timestamps {
+    Timestamps {
         last_access: Timespec {
             tv_sec: meta.atime() as _,
             tv_nsec: meta.atime_nsec() as _,
@@ -308,9 +389,38 @@ fn copy_metadata(meta: &std::fs::Metadata, target: impl rustix::fd::AsFd) -> Res
             tv_sec: meta.mtime() as _,
             tv_nsec: meta.mtime_nsec() as _,
         },
-    };
-    let _ = rustix::fs::futimens(target, &times);
-    Ok(())
+    }
+}
+
+fn copy_metadata(
+    meta: &std::fs::Metadata,
+    source: impl rustix::fd::AsFd,
+    target: impl rustix::fd::AsFd,
+) -> Result<(), String> {
+    copy_xattrs_fd(&source, &target);
+    for attr in ["system.posix_acl_access", "system.posix_acl_default"] {
+        if attr.ends_with("default") && !meta.is_dir() {
+            continue;
+        }
+        match rustix::fs::fgetxattr_query(&source, attr) {
+            Ok(len) => {
+                let mut acl = vec![0; len];
+                let n = rustix::fs::fgetxattr(&source, attr, &mut acl[..])
+                    .map_err(|e| e.to_string())?;
+                rustix::fs::fsetxattr(&target, attr, &acl[..n], rustix::fs::XattrFlags::empty())
+                    .map_err(|e| e.to_string())?;
+            }
+            Err(Errno::NOTSUP | Errno::NODATA) => match rustix::fs::fremovexattr(&target, attr) {
+                Ok(()) | Err(Errno::NOTSUP | Errno::NODATA) => (),
+                Err(e) => return Err(e.to_string()),
+            },
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    rustix::fs::fchmod(&target, Mode::from_bits_truncate(meta.mode() & 0o1777))
+        .map_err(|e| e.to_string())?;
+    rustix::fs::futimens(&target, &timestamps(meta)).map_err(|e| e.to_string())?;
+    rustix::fs::fsync(target).map_err(|e| e.to_string())
 }
 
 #[derive(Debug)]
@@ -341,21 +451,50 @@ fn unchanged(path: &Path, metadata: &std::fs::Metadata) -> Result<(), String> {
 }
 
 pub(crate) fn cleanup_copied(entry: &CopiedEntry) -> Result<(), String> {
-    unchanged(&entry.path, &entry.metadata)?;
+    let parent = parent_dir(&entry.path)?;
+    scan_removal(&parent, &entry.path)?;
+    unlink_tree(&parent, entry, &mut Default::default())
+}
+fn unlink_tree(
+    parent: &std::fs::File,
+    entry: &CopiedEntry,
+    links: &mut std::collections::HashMap<(u64, u64), std::fs::Metadata>,
+) -> Result<(), String> {
+    let path = dir_path(parent).join(entry.path.file_name().ok_or(NAME_ERROR)?);
+    let key = (entry.metadata.dev(), entry.metadata.ino());
+    let expected = links.get(&key).unwrap_or(&entry.metadata);
+    unchanged(&path, expected).map_err(|_| format!("Source changed: {}", entry.path.display()))?;
     if entry.metadata.is_dir() {
+        let dir = checked_dir(parent, &entry.path, Identity::from(expected))?;
         for child in &entry.children {
-            cleanup_copied(child)?;
+            unlink_tree(&dir, child, links)?;
         }
-        let current = std::fs::symlink_metadata(&entry.path).map_err(|error| error.to_string())?;
-        if current.dev() != entry.metadata.dev()
-            || current.ino() != entry.metadata.ino()
-            || !current.is_dir()
-        {
+        if identity(&path)? != Identity::from(&entry.metadata) {
             return Err(format!("Source changed: {}", entry.path.display()));
         }
-        std::fs::remove_dir(&entry.path).map_err(|error| error.to_string())
+        std::fs::remove_dir(path).map_err(|e| e.to_string())
     } else {
-        std::fs::remove_file(&entry.path).map_err(|error| error.to_string())
+        let held = if expected.nlink() > 1 {
+            Some(std::fs::File::from(
+                rustix::fs::open(&path, OFlags::PATH | OFlags::NOFOLLOW, Mode::empty())
+                    .map_err(|e| e.to_string())?,
+            ))
+        } else {
+            None
+        };
+        std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+        if let Some(fd) = held {
+            let after = fd.metadata().map_err(|e| e.to_string())?;
+            if after.nlink() + 1 != expected.nlink()
+                || after.mode() != expected.mode()
+                || after.len() != expected.len()
+                || (after.mtime(), after.mtime_nsec()) != (expected.mtime(), expected.mtime_nsec())
+            {
+                return Err(format!("Source changed: {}", entry.path.display()));
+            }
+            links.insert(key, after);
+        }
+        Ok(())
     }
 }
 
@@ -516,8 +655,7 @@ pub(crate) fn copy_file_noreplace(source: &Path, target: &Path) -> Result<Copied
             return Err(format!("Source changed: {}", source.display()));
         }
         unchanged(source, &copied)?;
-        copy_xattrs_fd(incoming.as_fd(), outgoing.as_fd());
-        copy_metadata(&copied, outgoing.as_fd())?;
+        copy_metadata(&opened, incoming.as_fd(), outgoing.as_fd())?;
         Ok(CopiedEntry {
             path: source.to_path_buf(),
             metadata: copied,
@@ -617,8 +755,7 @@ fn copy_dir_contents(source: &Path, target: &Path) -> Result<CopiedEntry, String
         return Err(format!("Source changed: {}", source.display()));
     }
     unchanged(source, &copied)?;
-    copy_xattrs_fd(source_fd.as_fd(), &target_fd);
-    copy_metadata(&copied, &target_fd)?;
+    copy_metadata(&metadata, source_fd.as_fd(), &target_fd)?;
     Ok(CopiedEntry {
         path: source.to_path_buf(),
         metadata: copied,
@@ -627,7 +764,6 @@ fn copy_dir_contents(source: &Path, target: &Path) -> Result<CopiedEntry, String
 }
 
 pub(crate) fn copy_dir_noreplace(source: &Path, target: &Path) -> Result<CopiedEntry, String> {
-    ensure_tree_copyable(source)?;
     create_private_dir(target)?;
     #[cfg(test)]
     note_initial(target);
