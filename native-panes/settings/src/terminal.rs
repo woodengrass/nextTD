@@ -10,6 +10,22 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 pub type Screen = Terminal<CrosstermBackend<AnsiOutput>>;
 
+pub fn hung_up() -> io::Result<bool> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    Ok(poll(
+        &mut [PollFd::new(&io::stdin(), PollFlags::empty())],
+        Some(&Timespec::default()),
+    )? != 0)
+}
+
+pub fn is_terminal_disconnect(error: &io::Error) -> bool {
+    use rustix::io::Errno;
+    error.kind() == io::ErrorKind::UnexpectedEof
+        || error.raw_os_error().is_some_and(|code| {
+            [Errno::IO, Errno::NOTTY, Errno::BADF].contains(&Errno::from_raw_os_error(code))
+        })
+}
+
 pub struct AnsiOutput {
     stdout: Stdout,
     buffer: Vec<u8>,

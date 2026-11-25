@@ -22,26 +22,28 @@ fn main() -> anyhow::Result<()> {
     for signal in [SIGTERM, SIGHUP] {
         flag::register(signal, Arc::clone(&stopping))?;
     }
-    terminal::with_screen(|screen| {
-        use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let input_closed = Arc::new(AtomicBool::new(false));
+    let result = terminal::with_screen(|screen| {
         use std::sync::mpsc::{RecvTimeoutError, sync_channel};
         let (tx, rx) = sync_channel(1);
+        let closed = Arc::clone(&input_closed);
         // A disconnected tty can trap crossterm inside read(). Keep terminal
         // restoration on the main thread, independent of the input decoder.
         std::thread::spawn(move || {
             loop {
                 let event = event::read();
+                if event.as_ref().is_err_and(terminal::is_terminal_disconnect) {
+                    closed.store(true, Ordering::Release);
+                }
                 let failed = event.is_err();
                 if tx.send(event).is_err() || failed {
                     break;
                 }
             }
         });
-        let stdin = std::io::stdin();
-        let mut tty = [PollFd::new(&stdin, PollFlags::empty())];
         let mut back = None;
-        while !stopping.load(Ordering::Relaxed) {
-            if poll(&mut tty, Some(&Timespec::default()))? != 0 {
+        while !stopping.load(Ordering::Relaxed) && !input_closed.load(Ordering::Acquire) {
+            if terminal::hung_up()? {
                 break;
             }
             app.poll(&mut back);
@@ -58,5 +60,18 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Ok(())
-    })
+    });
+    // The tty can disappear after poll(), while Terminal::new or draw()
+    // queries its size. Only classify terminal I/O failures as a clean hangup.
+    match result {
+        Err(error)
+            if error.downcast_ref::<std::io::Error>().is_some()
+                && (stopping.load(Ordering::Relaxed)
+                    || input_closed.load(Ordering::Acquire)
+                    || terminal::hung_up()?) =>
+        {
+            Ok(())
+        }
+        other => other,
+    }
 }
