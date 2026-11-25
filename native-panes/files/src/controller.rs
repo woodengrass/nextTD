@@ -2303,10 +2303,11 @@ mod controller_tests {
     }
 
     #[test]
-    fn folder_top_after_resize_matches_direct_start() {
+    fn folder_top_and_file_selection_style_after_resize_match_direct_start() {
         let tmp = tempfile::tempdir().unwrap();
         let work = tmp.path().join("work");
         std::fs::create_dir(&work).unwrap();
+        std::fs::write(work.join("example.txt"), "example").unwrap();
         let render = |sizes: &[(u16, u16)]| {
             let mut c = Controller::new(work.clone());
             for &(w, h) in sizes {
@@ -2317,13 +2318,19 @@ mod controller_tests {
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
             terminal.draw(|f| ui::draw(f, &c.ui)).unwrap();
-            (1..21)
+            let folder_top = (1..21)
                 .map(|x| terminal.backend().buffer()[(x, 4)].symbol())
-                .collect::<String>()
+                .collect::<String>();
+            let table = ui::panes(w, h, &c.ui)[1];
+            (
+                folder_top,
+                terminal.backend().buffer()[(table.x, table.y + 3)].style(),
+            )
         };
         let expected = render(&[(98, 36)]);
-        assert!(expected.contains("..  Parent"));
-        assert_eq!(render(&[(20, 5), (98, 36)]), expected);
+        assert!(expected.0.contains("..  Parent"));
+        assert_eq!(render(&[(1, 1), (20, 5), (98, 36)]), expected);
+        assert_eq!(render(&[(1, 1), (98, 36)]), expected);
     }
 
     #[test]
