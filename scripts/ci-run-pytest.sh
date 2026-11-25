@@ -39,11 +39,23 @@ done
 WORK="$(mktemp -d)"
 trap 'rm -rf -- "$WORK"' EXIT
 LOG="$WORK/pytest.log"
+PY="$PWD/.venv/bin/python"
+# Use the already-synced interpreter directly: neither invocation reads uv
+# env files, user config or project run settings.
+unset UV_ENV_FILE
+env -i HOME="$HOME" PATH="$PATH" TDNEXT_COLLECTION_REPORT="$WORK/full" \
+  "$PY" -I -m pytest -c /dev/null --rootdir=. --collect-only -q tests > "$WORK/collection.log" || {
+  cat "$WORK/collection.log" >&2
+  exit 1
+}
+export TDNEXT_PASSED_REPORT="$WORK/passed"
+: > "$TDNEXT_PASSED_REPORT"
+unset TDNEXT_COLLECTION_REPORT
 export TDNEXT_DESELECTED_REPORT="$WORK/deselected"
 : > "$TDNEXT_DESELECTED_REPORT"
 : > "$WORK/expected"
 if [[ "${TDNEXT_GOLDEN_VIA_VERIFY_DIST:-0}" = 1 ]]; then
-  uv run python - <<'PY' | sort > "$WORK/expected"
+  "$PY" -I - <<'PY' | sort > "$WORK/expected"
 import runpy
 
 gate = runpy.run_path("scripts/verify-dist.py")
@@ -54,7 +66,7 @@ PY
 fi
 
 set +e
-uv run pytest -q -ra 2>&1 | tee "${LOG}"
+"$PY" -I -m pytest -q -ra tests 2>&1 | tee "${LOG}"
 STATUS="${PIPESTATUS[0]}"
 set -e
 
@@ -71,7 +83,12 @@ sort "$TDNEXT_DESELECTED_REPORT" | diff -u "$WORK/expected" - || {
   echo "ci-run-pytest: deselected node IDs differ from the expected golden set" >&2
   exit 1
 }
-if ! grep -qE "[0-9]+ passed" "${LOG}"; then
+sort "$WORK/full" > "$WORK/full.sorted"
+sort "$TDNEXT_PASSED_REPORT" "$WORK/expected" | diff -u "$WORK/full.sorted" - || {
+  echo "ci-run-pytest: passed node IDs plus expected golden IDs differ from full collection" >&2
+  exit 1
+}
+if ! test -s "$TDNEXT_PASSED_REPORT"; then
   echo "ci-run-pytest: error: no passing tests observed; refusing an empty pass." >&2
   exit 1
 fi
