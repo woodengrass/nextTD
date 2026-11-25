@@ -31,13 +31,23 @@ fn control(
     targets: &mut Targets,
     rect: Rect,
     text: &str,
-    _focused: bool,
+    focused: bool,
     hit: Hit,
 ) {
-    let background = Color::Black;
+    let selected = focused && matches!(hit, Hit::Confirm | Hit::Cancel);
+    let background = if selected {
+        Color::DarkGray
+    } else {
+        Color::Black
+    };
     let style = Style::default()
         .fg(Color::White)
         .add_modifier(Modifier::BOLD);
+    let style = if selected {
+        style.add_modifier(Modifier::REVERSED)
+    } else {
+        style
+    };
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)

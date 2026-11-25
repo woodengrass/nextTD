@@ -83,9 +83,14 @@ fn confirm(app: &mut App, yes: bool) {
                     app.choose(focus, &value);
                 }
             }
-            Dialog::Confirm { action, id, .. } => {
+            Dialog::Confirm {
+                action,
+                id,
+                affected,
+                ..
+            } => {
                 if yes {
-                    app.start(action, id);
+                    app.start(action, id, Some(affected));
                 }
             }
             Dialog::Consent { reply, .. } => {

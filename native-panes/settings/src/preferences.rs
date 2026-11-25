@@ -1,8 +1,4 @@
-use std::{
-    fs,
-    io::{ErrorKind, Write},
-    path::Path,
-};
+use std::{fs, io::ErrorKind, path::Path};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -50,7 +46,7 @@ fn read<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
     match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .with_context(|| format!("Cannot read preferences {}", path.display())),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(T::default()),
+        Err(error) if error.kind() == ErrorKind::NotFound && !path.is_symlink() => Ok(T::default()),
         Err(error) => {
             Err(error).with_context(|| format!("Cannot read preferences {}", path.display()))
         }
@@ -81,12 +77,6 @@ pub fn save<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let parent = path.parent().context("Preference path has no parent")?;
     fs::create_dir_all(parent)
         .with_context(|| format!("Cannot save preferences {}", path.display()))?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("Cannot save preferences {}", path.display()))?;
-    serde_json::to_writer_pretty(&mut temporary, value)?;
-    writeln!(temporary)?;
-    temporary
-        .persist(path)
-        .with_context(|| format!("Cannot save preferences {}", path.display()))?;
-    Ok(())
+    tdnext_manager::state::write_atomically(path, serde_json::to_string_pretty(value)?)
+        .with_context(|| format!("Cannot save preferences {}", path.display()))
 }

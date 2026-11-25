@@ -52,6 +52,7 @@ pub enum Dialog {
         text: String,
         action: Action,
         id: String,
+        affected: BTreeSet<String>,
         yes: bool,
     },
     Consent {
@@ -62,6 +63,7 @@ pub enum Dialog {
 }
 pub enum Message {
     Consent(String, Sender<bool>),
+    Changed(Action, String, BTreeSet<String>),
     Done(Result<Vec<String>, String>),
 }
 
@@ -237,6 +239,9 @@ impl App {
         let result = (|| -> anyhow::Result<()> {
             match focus {
                 Focus::Provider | Focus::Style => {
+                    let store =
+                        tdnext_manager::state::StateStore::new(self.root.join("appearance.json"));
+                    let _lock = store.lock()?;
                     let mut appearance = preferences::appearance(&self.root)?;
                     let before = appearance.clone();
                     if focus == Focus::Provider {
@@ -255,6 +260,9 @@ impl App {
                     self.appearance = Some(appearance);
                 }
                 Focus::Editor => {
+                    let store =
+                        tdnext_manager::state::StateStore::new(self.root.join("editor.json"));
+                    let _lock = store.lock()?;
                     let mut editor = preferences::editor(&self.root)?;
                     let before = editor.clone();
                     editor.editor = match value {
@@ -308,34 +316,12 @@ impl App {
         if matches!(action, Action::Disable | Action::Uninstall) {
             match Manager::load().and_then(|m| m.affected(&id)) {
                 Ok(affected) => {
-                    let dependants: Vec<_> = affected
-                        .iter()
-                        .filter(|item| *item != &id)
-                        .cloned()
-                        .collect();
-                    if matches!(action, Action::Uninstall) || !dependants.is_empty() {
-                        self.dialog = Some(Dialog::Confirm {
-                            text: format!(
-                                "{} {}?\nAlso affected: {}",
-                                if matches!(action, Action::Uninstall) {
-                                    "Uninstall"
-                                } else {
-                                    "Disable"
-                                },
-                                id,
-                                if dependants.is_empty() {
-                                    "none".into()
-                                } else {
-                                    dependants.join(", ")
-                                }
-                            ),
-                            action,
-                            id,
-                            yes: false,
-                        });
-                        self.feedback_top = 0;
-                        return;
+                    if action == Action::Uninstall || affected.iter().any(|item| item != &id) {
+                        self.show_preview(action, id, affected);
+                    } else {
+                        self.start(action, id, Some(affected));
                     }
+                    return;
                 }
                 Err(error) => {
                     self.feedback = format!("Cannot preview change: {error:#}");
@@ -343,27 +329,52 @@ impl App {
                 }
             }
         }
-        self.start(action, id);
+        self.start(action, id, None);
     }
 
-    pub fn start(&mut self, action: Action, id: String) {
+    fn show_preview(&mut self, action: Action, id: String, affected: BTreeSet<String>) {
+        let others = affected
+            .iter()
+            .filter(|item| *item != &id)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.dialog = Some(Dialog::Confirm {
+            text: format!(
+                "{action:?} {id}?\nAlso affected: {}",
+                if others.is_empty() { "none" } else { &others }
+            ),
+            action,
+            id,
+            affected,
+            yes: false,
+        });
+        self.feedback_top = 0;
+    }
+
+    pub fn start(&mut self, action: Action, id: String, preview: Option<BTreeSet<String>>) {
         self.busy = true;
         self.feedback = format!("Working on {id}... (operations cannot run concurrently)");
         let tx = self.tx.clone();
         let protected = self.protected.clone();
         thread::spawn(move || {
-            let result = Manager::load()
-                .and_then(|manager| {
-                    manager.apply(action, &id, &protected, |prompt| {
-                        let (reply, response) = mpsc::channel();
-                        if tx.send(Message::Consent(prompt.to_owned(), reply)).is_err() {
-                            return false;
-                        }
-                        response.recv().unwrap_or(false)
-                    })
+            let result = Manager::load().and_then(|manager| {
+                manager.apply_previewed(action, &id, &protected, preview.as_ref(), |prompt| {
+                    let (reply, response) = mpsc::channel();
+                    if tx.send(Message::Consent(prompt.to_owned(), reply)).is_err() {
+                        return false;
+                    }
+                    response.recv().unwrap_or(false)
                 })
-                .map_err(|error| format!("{error:#}"));
-            if let Err(error) = tx.send(Message::Done(result)) {
+            });
+            let message = match result {
+                Err(error) => match error.downcast::<tdnext_manager::ChangedPreview>() {
+                    Ok(changed) => Message::Changed(action, id, changed.0),
+                    Err(error) => Message::Done(Err(format!("{error:#}"))),
+                },
+                Ok(lines) => Message::Done(Ok(lines)),
+            };
+            if let Err(error) = tx.send(message) {
                 eprintln!("Cannot deliver operation result: {error}");
             }
         });
@@ -379,6 +390,11 @@ impl App {
                         reply,
                         yes: false,
                     })
+                }
+                Message::Changed(action, id, affected) => {
+                    self.busy = false;
+                    self.feedback = "Affected plugins changed. Review the new list.".into();
+                    self.show_preview(action, id, affected);
                 }
                 Message::Done(result) => {
                     self.busy = false;
