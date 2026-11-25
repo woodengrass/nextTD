@@ -844,9 +844,18 @@ impl Controller {
             self.ui.focus = v[(i + if back { v.len() - 1 } else { 1 }) % v.len()]
         }
     }
-    pub fn handle(&mut self, event: Event, w: u16, h: u16) -> Effect {
+    pub fn resize(&mut self, w: u16, h: u16) {
+        if (self.width, self.height) == (w, h) {
+            return;
+        }
         self.width = w;
         self.height = h;
+        self.ui.top = 0;
+        self.ui.neighbour_top = 0;
+        self.clamp();
+    }
+    pub fn handle(&mut self, event: Event, w: u16, h: u16) -> Effect {
+        self.resize(w, h);
         match event {
             Event::Key(k) if k.kind != KeyEventKind::Release => {
                 if k.code == K::Char('q') && k.modifiers == M::CONTROL {
@@ -2291,6 +2300,30 @@ mod controller_tests {
             settle(&mut c);
             assert!(!current.join("source.txt").exists());
         }
+    }
+
+    #[test]
+    fn folder_top_after_resize_matches_direct_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let render = |sizes: &[(u16, u16)]| {
+            let mut c = Controller::new(work.clone());
+            for &(w, h) in sizes {
+                c.handle(Event::Resize(w, h), w, h);
+                settle(&mut c);
+            }
+            let &(w, h) = sizes.last().unwrap();
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| ui::draw(f, &c.ui)).unwrap();
+            (1..21)
+                .map(|x| terminal.backend().buffer()[(x, 4)].symbol())
+                .collect::<String>()
+        };
+        let expected = render(&[(98, 36)]);
+        assert!(expected.contains("..  Parent"));
+        assert_eq!(render(&[(20, 5), (98, 36)]), expected);
     }
 
     #[test]

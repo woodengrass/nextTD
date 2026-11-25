@@ -196,22 +196,22 @@ fn draw_general(frame: &mut Frame, app: &mut App, area: Rect, targets: &mut Targ
         })
     );
     let editor_height = if editor_open { 6 } else { 3 };
-    let focus_y = match app.focus {
-        Focus::Provider => 2,
-        Focus::Style => style_y,
-        Focus::Editor => editor_y,
-        _ => app.general_top,
-    };
-    if focus_y < app.general_top {
-        app.general_top = focus_y;
+    let size = (area.width, area.height);
+    if size != app.general_size {
+        app.general_size = size;
+        app.general_top = 0;
     }
-    let focus_height = if app.focus == Focus::Editor {
-        editor_height
-    } else {
-        3
+    let focused_control = match app.focus {
+        Focus::Provider => Some((2, 3)),
+        Focus::Style => Some((style_y, 3)),
+        Focus::Editor => Some((editor_y, editor_height)),
+        _ => None,
     };
-    if focus_y.saturating_add(focus_height) > app.general_top.saturating_add(visible) {
-        app.general_top = focus_y.saturating_add(focus_height).saturating_sub(visible);
+    if let Some((y, height)) = focused_control {
+        app.general_top = app
+            .general_top
+            .min(y)
+            .max((y + height).saturating_sub(visible));
     }
     let lines = [
         (0, "Icon appearance"),

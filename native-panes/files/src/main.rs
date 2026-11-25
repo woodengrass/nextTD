@@ -21,7 +21,11 @@ fn main() -> io::Result<()> {
     terminal::with_screen(|screen| {
         loop {
             app.poll();
-            screen.draw(|frame| ui::draw(frame, &app.ui))?;
+            screen.draw(|frame| {
+                let size = frame.area();
+                app.resize(size.width, size.height);
+                ui::draw(frame, &app.ui);
+            })?;
             if let Some(timeout) = app.timeout()
                 && !event::poll(timeout)?
             {
