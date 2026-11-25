@@ -40,7 +40,7 @@ enum MutRequest {
     },
     Delete {
         path: PathBuf,
-        identity: actions::Identity,
+        identity: actions::Confirmed,
     },
 }
 /// Finished mutation. `dir`/`src` are the context captured at accept time so
@@ -95,7 +95,7 @@ pub struct Controller {
     hidden: bool,
     clip: Option<(PathBuf, bool)>,
     name: Option<Name>,
-    delete: Option<(PathBuf, actions::Identity)>,
+    delete: Option<(PathBuf, actions::Confirmed)>,
     mutation: Option<Receiver<Mutation>>,
     #[cfg(test)]
     test_gate: Option<std::sync::Arc<MutationGate>>,
@@ -280,7 +280,7 @@ impl Controller {
                 }
                 Err(_) => {
                     self.notify("Operation failed.", Severity::Error);
-                    self.ui.loading = self.list_worker.is_some()
+                    self.refresh_after_failure()
                 }
             }
         }
@@ -675,7 +675,7 @@ impl Controller {
         }
     }
     fn delete_dialog(&mut self) {
-        self.delete = self.selected().and_then(|p| match actions::identity(&p) {
+        self.delete = self.selected().and_then(|p| match actions::confirm(&p) {
             Ok(id) => Some((p, id)),
             Err(e) => {
                 self.notify(e, Severity::Error);
@@ -1718,6 +1718,21 @@ mod controller_tests {
         assert!(c.ui.toast.unwrap().0.contains("changed"));
     }
 
+    #[test]
+    fn same_type_replacement_while_dialog_open_is_not_deleted() {
+        let tmp = test_dir(&[("a", "original")]);
+        let name = tmp.path().join("a");
+        let mut c = Controller::new(tmp.path().to_owned());
+        settle(&mut c);
+        c.handle(key(K::Char('d'), M::empty()), 80, 24);
+        std::fs::remove_file(&name).unwrap();
+        std::fs::write(&name, "replacement").unwrap();
+        c.handle(key(K::Tab, M::empty()), 80, 24);
+        c.handle(key(K::Char(' '), M::empty()), 80, 24);
+        settle(&mut c);
+        assert_eq!(std::fs::read(name).unwrap(), b"replacement");
+        assert!(c.ui.toast.unwrap().0.contains("changed"));
+    }
     #[test]
     fn copy_failure_after_publish_reloads_the_listing() {
         let src = test_dir(&[("a", "data")]);

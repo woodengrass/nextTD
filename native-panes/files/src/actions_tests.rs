@@ -1170,7 +1170,8 @@ fn copied_tree_drops_inherited_acls() -> Result<(), Box<dyn std::error::Error>> 
 }
 
 #[test]
-fn move_with_two_names_for_one_inode_completes() -> Result<(), Box<dyn std::error::Error>> {
+fn copy_separates_linked_names_while_cross_device_move_preserves_them()
+-> Result<(), Box<dyn std::error::Error>> {
     let root = dir()?;
     let dst = tempfile::tempdir_in("/dev/shm")?;
     let tree = root.path().join("src");
@@ -1196,6 +1197,19 @@ fn nested_bind_mount_blocks_all_unlinks() -> Result<(), Box<dyn std::error::Erro
     // Probe the live namespace read-only; never run deletion against /proc.
     let proc = Path::new("/proc");
     let root = std::fs::File::open("/")?;
+    use std::os::fd::AsRawFd;
+    let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", root.as_raw_fd()))?;
+    let kernel_id: u64 = fdinfo
+        .lines()
+        .find_map(|l| l.strip_prefix("mnt_id:"))
+        .unwrap()
+        .trim()
+        .parse()?;
+    assert_eq!(crate::actions::mount(&root)?.1, kernel_id);
+    assert_ne!(
+        crate::actions::mount(&root)?.1,
+        crate::actions::mount(&std::fs::File::open(proc)?)?.1
+    );
     assert!(
         crate::actions::checked_dir(&root, proc, crate::actions::identity(proc)?)
             .unwrap_err()
@@ -1209,10 +1223,24 @@ fn nested_bind_mount_blocks_all_unlinks() -> Result<(), Box<dyn std::error::Erro
     write(&tree.join("beside"), b"outside")?;
     let m = nested.metadata()?;
     crate::actions::BIND_ROOT.set(Some((m.dev(), m.ino())));
+    crate::actions::BEFORE_CLAIM.set(Some(Box::new(|_| {
+        panic!("mount preflight must finish before any claim")
+    })));
     let error = remove(&tree).unwrap_err();
-    assert!(error.contains(nested.to_str().unwrap()), "{error}");
+    assert_eq!(
+        error,
+        format!("Cannot remove mount point: {}", nested.display())
+    );
     assert_eq!(read(&tree.join("beside"))?, b"outside");
     assert_eq!(read(&nested.join("inside"))?, b"mounted");
+    let m = nested.join("inside").metadata()?;
+    crate::actions::BIND_ROOT.set(Some((m.dev(), m.ino())));
+    assert!(
+        remove(&tree)
+            .unwrap_err()
+            .contains(nested.join("inside").to_str().unwrap())
+    );
+    assert_eq!(read(&tree.join("beside"))?, b"outside");
     Ok(())
 }
 
@@ -1273,5 +1301,120 @@ fn copy_accepts_destination_timestamp_rounding() -> Result<(), Box<dyn std::erro
     let copy = paste(&file, dst.path(), false)?;
     assert_eq!(copy.metadata()?.mtime(), 1700000000);
     assert_eq!(read(&copy)?, b"content");
+    Ok(())
+}
+
+#[test]
+fn moved_source_survives_replacement_of_published_path() -> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = tempfile::tempdir_in("/dev/shm")?;
+    let file = src.path().join("a");
+    write(&file, b"original")?;
+    let target = dst.path().join("a");
+    let path = target.clone();
+    crate::actions::stash_between_note(&file, move || {
+        std::fs::rename(&path, path.with_file_name("published")).unwrap();
+        std::fs::write(path, b"replacement").unwrap();
+    });
+    assert!(paste(&file, dst.path(), true).is_err());
+    assert_eq!(read(&file)?, b"original");
+    assert_eq!(read(&target)?, b"replacement");
+    Ok(())
+}
+#[test]
+fn staging_replacement_is_not_owned_by_copy() -> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = dir()?;
+    let file = src.path().join("a");
+    write(&file, b"original")?;
+    crate::actions::BEFORE_RECORD.set(Some(Box::new(|p| {
+        std::fs::remove_file(p).unwrap();
+        std::fs::write(p, b"replacement").unwrap();
+    })));
+    let err = paste(&file, dst.path(), false).unwrap_err();
+    assert!(err.contains("Staging remains"), "{err}");
+    let stage = std::fs::read_dir(dst.path())?.next().unwrap()?.path();
+    assert_eq!(read(&stage.join("a"))?, b"replacement");
+    Ok(())
+}
+#[test]
+fn confirmed_unlink_restores_rival_claimed_after_check() -> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let file = src.path().join("a");
+    write(&file, b"original")?;
+    crate::actions::BEFORE_CLAIM.set(Some(Box::new(|p| {
+        std::fs::remove_file(p).unwrap();
+        std::fs::write(p, b"replacement").unwrap();
+    })));
+    assert!(remove(&file).is_err());
+    assert_eq!(read(&file)?, b"replacement");
+    Ok(())
+}
+#[test]
+fn late_regular_file_wins_publish_race() -> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = dir()?;
+    let file = src.path().join("a");
+    write(&file, b"original")?;
+    let target = dst.path().join("a");
+    let rival = target.clone();
+    crate::actions::stash_between_note(&target, move || std::fs::write(rival, b"rival").unwrap());
+    assert!(paste(&file, dst.path(), false).is_err());
+    assert_eq!(read(&target)?, b"rival");
+    Ok(())
+}
+#[test]
+fn setgid_destination_does_not_gain_source_group_permissions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = dir()?;
+    let file = src.path().join("a");
+    write(&file, b"private")?;
+    let gid = file.metadata()?.gid();
+    let groups = std::process::Command::new("id").arg("-G").output()?;
+    if let Some(other) = std::str::from_utf8(&groups.stdout)?
+        .split_whitespace()
+        .flat_map(str::parse::<u32>)
+        .find(|g| *g != gid)
+    {
+        std::os::unix::fs::chown(dst.path(), None, Some(other))?;
+        std::fs::set_permissions(dst.path(), std::fs::Permissions::from_mode(0o2770))?;
+        let copy = paste(&file, dst.path(), false)?;
+        assert_eq!(copy.metadata()?.gid(), gid);
+    }
+    // An unassignable source group exercises the other branch even when
+    // the test runner belongs to only one group. Root may assign the GID.
+    let group = 123454321;
+    crate::actions::TEST_SOURCE_GROUP.set(Some(group));
+    let folder = src.path().join("folder");
+    std::fs::create_dir(&folder)?;
+    let mut acl = 2u32.to_le_bytes().to_vec();
+    for (tag, id) in [
+        (1u16, u32::MAX),
+        (4, u32::MAX),
+        (8, 65534),
+        (16, u32::MAX),
+        (32, u32::MAX),
+    ] {
+        acl.extend(tag.to_le_bytes());
+        acl.extend(if tag == 1 { 7u16 } else { 5u16 }.to_le_bytes());
+        acl.extend(id.to_le_bytes());
+    }
+    for key in ["system.posix_acl_access", "system.posix_acl_default"] {
+        rustix::fs::setxattr(&folder, key, &acl, rustix::fs::XattrFlags::empty())?;
+    }
+    let copy = paste(&folder, dst.path(), false)?;
+    crate::actions::TEST_SOURCE_GROUP.set(None);
+    if copy.metadata()?.gid() != group {
+        assert_eq!(copy.metadata()?.mode() & 0o070, 0);
+        for key in ["system.posix_acl_access", "system.posix_acl_default"] {
+            let stored = get_xattr(&copy, key)?;
+            for record in stored[4..].chunks_exact(8) {
+                if matches!(u16::from_le_bytes([record[0], record[1]]), 4 | 8 | 16) {
+                    assert_eq!(&record[2..4], &[0, 0]);
+                }
+            }
+        }
+    }
     Ok(())
 }
