@@ -116,9 +116,9 @@ Layout: Desktop rail - preserve navigation while reclaiming workspace width -> f
   Size and Modified use 9 and 16 cells when shown. Large sizes use compact
   binary units to keep the unit visible; the preview retains the exact byte count.
   Compact table columns may omit secondary metadata when it cannot fit; selected
-  metadata remains available in preview. Large directories populate
-  progressively without blocking input, and only already displayed rows may be
-  acted on. A newer navigation invalidates any unfinished older population.
+  metadata remains available in preview. A background worker scans the full
+  directory without blocking input, then publishes the rows together. A newer
+  navigation invalidates results from an older scan.
 - **File preview:** show the selected name, type, size and modified time above
   independently scrollable, numbered text lines. Show an inline loading,
   empty, binary, special-file, symlink, unreadable or truncation explanation
@@ -252,20 +252,21 @@ File actions do not target a separate table selection while the folder list is
 focused; explain that the user must focus the file list first. Resizing keeps
 focus on a visible Files pane when the previously focused pane is hidden.
 Settings is a separate view compatible with the selected host interface. Opening it retains
-the original mounted fallback view or native Zellij tab; Back / Escape returns
+the original native Zellij tab; Back / Escape returns
 to that exact view and its contextual footer. Plugin operation shortcuts are
 available only in the Plugins section, never while using General. Native navigation records the
 originating stable tab ID per session, never the positional previous tab. A
 native shell tracks the originating client's stable tab and focused pane IDs.
 The custom Zellij core stores these IDs in its session and restores focus after
-a header click; the legacy fallback encodes them in the header tab's name.
-Independent sessions never share return state. In
-fallback mode, btop owns the full terminal while running: desktop controls
-resume only after btop exits. Slow installs run outside the UI event loop.
-In fallback, Alt+o and Ctrl+q are reserved ahead of focused-plugin bindings;
-Alt+o does nothing in a modal, Escape stays modal-local, and Ctrl+q exits even
-from a modal. F6 focuses the sidebar in fallback, including from Shell; Tab
-and ordinary editing keys remain available to the interactive shell. Native
+a header click. Independent sessions never share return state. Slow installs
+run outside the UI event loop.
+
+Historically, the fallback retained the mounted view, encoded return IDs in
+the header tab's name, and yielded the full terminal to btop until it exited.
+Alt+o and Ctrl+q took priority over focused-plugin bindings; Alt+o did
+nothing in a modal, Escape stayed modal-local, and Ctrl+q exited even from
+a modal. F6 focused the sidebar, including from Shell; Tab and ordinary
+editing keys remained available to the interactive shell. Native
 shortcuts are intercepted by Zellij outside locked mode;
 they cannot inspect a plugin's modal state. Unassigned numeric shortcuts never
 open a header tab.
@@ -289,7 +290,7 @@ Appearance and plugin changes are not hot-loaded into an already-running shell;
 restart is required. Editor preferences instead apply on the next file open.
 Font availability and private-use glyph width cannot be
 reliably detected; Compatibility is the safe manual alternative. Plugin
-lifecycle writes remain uncoordinated across independent management
-processes, so simultaneous CLI/UI writes are unsafe.
+lifecycle writes from the CLI and Settings share one mutation lock; a
+contending operation reports that the state is locked.
 Native re-entry refresh depends on terminal focus reporting; if focus reports
 are unavailable, focusing a General selector refreshes the saved values.

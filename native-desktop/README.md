@@ -12,8 +12,8 @@ If that file is absent, it opens `$SHELL`, or `/bin/sh` if unset.
 An explicit config containing `{"views":[]}`, or only disabled views, opens
 an empty desktop instead; no shell or content program is started. Press
 Ctrl+q to exit. The desktop cannot be started inside an existing Zellij
-session. Changes to the configuration and tool state apply after restarting
-the desktop.
+session. The editor choice applies on the next file open. Other tool state
+and desktop configuration changes apply after restarting the desktop.
 
 The optional JSON configuration lists independent programs, not shell strings:
 
@@ -33,7 +33,9 @@ entrypoint with the sibling executable and its arguments. Migrated Python
 plugins do not run unmodified.
 
 `enabled` defaults to true; `icon`, `shortcuts`, and `args` are optional.
-View names and ids must be unique. Sidebar views are ordered before headers;
+Among enabled views, IDs and generated tab names must each be unique. A
+sidebar tab uses the view name; a header tab uses `tdnext-header:<id>`.
+Sidebar views are ordered before headers;
 Alt+1 through Alt+9 select sidebar views, Alt+o opens the first header,
 and F7 toggles the native sidebar. A header program can return using
 `$TDNEXT_ZELLIJ action return-to-origin`; `TDNEXT_DIRECTORY` is the initial

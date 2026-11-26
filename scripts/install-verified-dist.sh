@@ -10,8 +10,8 @@
 # and the current pointer, all under DEST.
 #
 # Trust boundary (exactly ONE trust option is enforced):
-#   UNTRUSTED: the tarball bytes and anything inside them, including any
-#     checksum file shipped inside the archive (never read).
+#   For untrusted archives use --digest-file only. --verify executes the
+#   archive programs locally as the operator and requires a trusted source.
 #   TRUSTED, option --verify: the shared gate `make verify-dist
 #     ARCHIVE=<private immutable copy>` (scripts/verify-dist.py: frozen lock,
 #     exact tar layout, probes, functional smoke, archive golden scenes) runs
@@ -53,13 +53,14 @@ usage() {
 usage: bash scripts/install-verified-dist.sh --archive <tar.gz> --dest <dir>
        (--digest-file <archive.sha256> | --verify) [--dry-run]
 
-  --archive PATH       candidate distribution tarball (untrusted bytes)
+  --archive PATH       candidate distribution tarball
   --dest DIR           activation root; created when absent. Holds
                        releases/<full-sha256>/ trees and the `current` symlink.
   --digest-file PATH   trusted digest in `sha256sum` output format, obtained
                        over a separate operator-side channel (never from the
                        package dir). Exactly one of --digest-file/--verify.
-  --verify             run the real verifier (`make verify-dist
+  --verify             trusted sources only: run archive programs as this
+                       operator via the real verifier (`make verify-dist
                        ARCHIVE=<private immutable copy>`) on the exact bytes
                        being installed first; exit 0 plus a matching printed
                        digest is required. Needs the verification workstation
@@ -109,9 +110,18 @@ cleanup() {
   if [[ -n "$LINK_TMP" && -L "$LINK_TMP" ]]; then rm -f -- "$LINK_TMP"; fi
   if [[ -n "$WORK" && -d "$WORK" ]]; then rm -rf -- "$WORK"; fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-WORK="$(mktemp -d -t tdnext-install-XXXXXX)"
+[[ ! -L "$DEST/releases" ]] || fail "releases must be a real directory"
+if ((DRY_RUN)); then
+  WORK="$(mktemp -d -t tdnext-install-XXXXXX)"
+else
+  mkdir -p -- "$DEST/releases"
+  WORK="$(mktemp -d -- "$DEST/releases/.stage.XXXXXX")"
+  WORK="$(realpath -- "$WORK")"
+fi
 
 # Always install from a private immutable copy, so the hashed bytes and the
 # unpacked bytes are provably the same even if the source path changes.
@@ -119,49 +129,61 @@ COPY="$WORK/archive.tar.gz"
 cp -- "$ARCHIVE" "$COPY"
 chmod 444 -- "$COPY"
 
-ACTUAL="$(sha256sum -- "$COPY")"
+ACTUAL="$(sha256sum < "$COPY")"
 ACTUAL="${ACTUAL%% *}"
 ACTUAL="${ACTUAL,,}"
 
+read_digest() {
+  local file="$1" record hex basename
+  if IFS= read -r -d '' record < "$file"; then fail "NUL in digest file"; fi
+  record="${record%$'\n'}"
+  [[ "$record" != *$'\n'* ]] || fail "expected one digest record"
+  hex="${record:0:64}"
+  [[ "$hex" =~ ^[0-9a-fA-F]{64}$ ]] || fail "expected a sha256 hex digest"
+  if [[ "$record" != "$hex" ]]; then
+    basename="${record#"$hex  "}"
+    [[ "$basename" != "$record" && -n "$basename" && "$basename" != */* ]] \
+      || fail "expected <digest> or <digest>  <basename>"
+    if (($# == 2)) && [[ "$basename" != "$2" ]]; then
+      fail "digest record basename '$basename' does not match archive basename '$2'"
+    fi
+  fi
+  printf '%s\n' "${hex,,}"
+}
+
 if ((VERIFY == 1)); then
   VERIFY_LOG="$WORK/verify.log"
-  if ! make -C "$ROOT" verify-dist "ARCHIVE=$COPY" >"$VERIFY_LOG" 2>&1; then
+  if ! TDNEXT_VERIFIED_DIGEST_OUT="$WORK/verified.sha256" make -C "$ROOT" verify-dist "ARCHIVE=$COPY" >"$VERIFY_LOG" 2>&1; then
     echo "$PROG: verification failed; leaving current untouched." >&2
     tail -n 20 -- "$VERIFY_LOG" >&2 || true
     exit 1
   fi
-  # Bind the verifier's success to these exact bytes: its printed digest must
+  # Bind the verifier's success to these exact bytes: its recorded digest must
   # equal the digest of the copy it ran on.
-  REPORTED="$(grep -Eo 'sha256=[0-9a-f]{64}' "$VERIFY_LOG" | tail -n 1)"
-  REPORTED="${REPORTED#sha256=}"
+  read -r REPORTED < "$WORK/verified.sha256"
   test -n "$REPORTED" || fail "verifier printed no sha256 digest; no activation"
   test "$REPORTED" = "$ACTUAL" \
     || fail "verifier digest $REPORTED != copied bytes $ACTUAL; no activation"
   EXPECTED="$ACTUAL"
   echo "$PROG: verifier passed on the exact bytes being installed (sha256 $ACTUAL)."
 else
-  # First field of the first content line: the GNU `sha256sum` format the
-  # producer emits (`<hash>  <name>`); a bare hex line is also accepted.
-  EXPECTED="$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' -- "$DIGEST_FILE" | head -n 1)"
-  EXPECTED="${EXPECTED%%[[:space:]]*}"
-  EXPECTED="${EXPECTED,,}"
-  [[ "$EXPECTED" =~ ^[0-9a-f]{64}$ ]] \
-    || fail "digest file does not start with a sha256 hex digest: $DIGEST_FILE"
+  EXPECTED="$(read_digest "$DIGEST_FILE" "${ARCHIVE##*/}")"
   test "$ACTUAL" = "$EXPECTED" \
     || fail "digest mismatch: archive sha256 $ACTUAL != trusted $EXPECTED; no activation"
 fi
 
-# The digest now vouches for these bytes (the verifier already enforced its
-# exact layout on them in --verify mode, and the digest pins them in digest
-# mode), so validation stays simple: reject path escapes before extract, then
-# enforce the exact expected tree on the extracted candidate.
-tar -tzf "$COPY" >"$WORK/members.txt"
-test -s "$WORK/members.txt" || fail "archive lists no members"
-if grep -E '(^/)|(^|/)\.\.(/|$)' "$WORK/members.txt" >/dev/null; then
-  fail "archive contains absolute or parent-escaping paths; no activation"
-fi
+# GNU tar: keep absolute names intact and escape embedded newlines. Compare
+# the complete sorted listing (including types and duplicates) before extract.
+export LC_ALL=C
+tar --absolute-names --numeric-owner --quoting-style=escape -tvzf "$COPY" |
+  awk '{type=substr($0,1,1); if (!sub(/^[^ ]+ +[0-9]+\/[0-9]+ +[0-9]+ [^ ]+ [^ ]+ /,"")) exit 1;
+        print type, $0}' | sort >"$WORK/members.txt"
+{
+  echo "d $EXPECTED_TOP/"
+  for name in $EXPECTED_MEMBERS; do echo "- $EXPECTED_TOP/$name"; done
+} | sort | cmp -s - "$WORK/members.txt" || fail "unexpected archive layout"
 mkdir "$WORK/stage"
-tar --no-same-owner --no-same-permissions -xzf "$COPY" -C "$WORK/stage"
+(umask 022; tar --no-same-owner --no-same-permissions -xzf "$COPY" -C "$WORK/stage")
 
 mapfile -t TOPS < <(find "$WORK/stage" -mindepth 1 -maxdepth 1)
 if ((${#TOPS[@]} != 1)) || [[ "${TOPS[0]}" != "$WORK/stage/$EXPECTED_TOP" ]]; then
@@ -189,14 +211,14 @@ check_exact_layout() {
 # An existing release is reused only when every file byte-matches the freshly
 # validated candidate (contents and modes); anything else is refused.
 compare_release() {
-  local old="$1" new="$2" entry base name om nm
-  while IFS= read -r entry; do
-    base="$(basename -- "$entry")"
-    case " $EXPECTED_MEMBERS digest.sha256 " in
-      *" $base "*) ;;
-      *) echo "existing release has unexpected member: $base"; return 1 ;;
-    esac
-  done < <(find "$old" -mindepth 1 -maxdepth 1)
+  local old="$1" new="$2" name om nm
+  [[ -d "$old" && ! -L "$old" ]] || { echo "not a real release directory"; return 1; }
+  [[ "$(find "$old" -mindepth 1 -maxdepth 1 -printf . | wc -c)" -eq 7 ]] \
+    || { echo "existing release has wrong number of members"; return 1; }
+  [[ -f "$old/digest.sha256" && ! -L "$old/digest.sha256" ]] \
+    || { echo "existing digest.sha256 is not a regular file"; return 1; }
+  [[ "$(read_digest "$old/digest.sha256")" = "$ACTUAL" ]] \
+    || { echo "existing release digest mismatch"; return 1; }
   for name in $EXPECTED_MEMBERS; do
     test -f "$old/$name" && ! test -L "$old/$name" \
       || { echo "existing member $name is missing or not a regular file"; return 1; }
@@ -211,8 +233,11 @@ compare_release() {
 LAYOUT_ERR=""
 LAYOUT_ERR="$(check_exact_layout "$CANDIDATE" 2>&1)" \
   || fail "package layout rejected ($LAYOUT_ERR); no activation"
+for name in $BINARIES; do chmod 0755 -- "$CANDIDATE/$name"; done
+chmod 0644 -- "$CANDIDATE/LICENSE.zellij-0.45.1"
 
 RELEASE="$DEST/releases/$ACTUAL"
+printf '%s  %s\n' "$ACTUAL" "${ARCHIVE##*/}" >"$CANDIDATE/digest.sha256"
 
 OLD="absent"
 if [[ -L "$DEST/current" ]]; then
@@ -221,7 +246,12 @@ elif [[ -e "$DEST/current" ]]; then
   fail "DEST/current exists and is not a symlink; refusing to clobber: $DEST/current"
 fi
 
-if [[ -d "$RELEASE" ]]; then
+if ((!DRY_RUN)) && [[ ! -e "$RELEASE" && ! -L "$RELEASE" ]]; then
+  # No clobber or nesting: a concurrent winner leaves our candidate in place.
+  mv -nT -- "$CANDIDATE" "$RELEASE" || [[ -e "$RELEASE" || -L "$RELEASE" ]] \
+    || fail "cannot commit release $RELEASE"
+fi
+if [[ -d "$CANDIDATE" && ( -e "$RELEASE" || -L "$RELEASE" ) ]]; then
   REUSE_ERR=""
   REUSE_ERR="$(compare_release "$RELEASE" "$CANDIDATE" 2>&1)" \
     || fail "existing release $RELEASE differs from the verified bytes ($REUSE_ERR); refusing to activate"
@@ -242,15 +272,6 @@ dry-run: no switch performed
 EOF
   exit 0
 fi
-
-mkdir -p -- "$DEST/releases"
-if [[ -d "$RELEASE" ]]; then
-  echo "$PROG: reusing byte-identical release $RELEASE."
-else
-  mv -- "$CANDIDATE" "$RELEASE"
-  echo "$PROG: staged $RELEASE."
-fi
-printf '%s  %s\n' "$ACTUAL" "$(basename -- "$ARCHIVE")" >"$RELEASE/digest.sha256"
 
 LINK_TMP="$DEST/.current.new.$$"
 ln -s "releases/$ACTUAL" "$LINK_TMP"

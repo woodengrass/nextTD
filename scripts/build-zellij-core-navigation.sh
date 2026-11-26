@@ -126,7 +126,7 @@ fi
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "${WORK_DIR}"' EXIT INT TERM
 
-git -C "${ZELLIJ_SRC}" archive HEAD | tar -x -C "${WORK_DIR}"
+git -C "${ZELLIJ_SRC}" archive "${PINNED_HEAD}" | tar -x -C "${WORK_DIR}"
 
 (cd "${WORK_DIR}" && git apply --check "${PATCH_FILE}" && git apply "${PATCH_FILE}")
 (cd "${WORK_DIR}" && git apply --check "${CHROME_PATCH_FILE}" && git apply "${CHROME_PATCH_FILE}")

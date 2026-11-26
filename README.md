@@ -1,14 +1,14 @@
 # Terminal Desktop Next
 
 Terminal Desktop Next is a native terminal desktop. The product is compiled
-binaries: no Python is needed to stage or use it. Python remains only for
-development of the legacy test suite (see Development).
+binaries: no Python is needed to stage or use it. The archive verifier
+(`make verify-dist`) and development checks require Python.
 
 A distribution directory holds the product siblings together: `tdnext` (tool
 manager CLI), `tdnext-desktop` (launcher), `tdnext-core` (matching patched
 core), `tdnext-settings`, and `tdnext-files`. The launcher
-probes the core at startup and refuses anything but the matching patched
-build; stock Zellij is not used.
+accepts a core that reports native chrome protocol v1 at startup. This is
+a compatibility probe, not a build-identity check; stock Zellij is not used.
 
 ## Requirements
 
@@ -38,20 +38,18 @@ it only writes under the given destination, keeps every previous release,
 never touches user settings or sessions, and performs no network or publish
 writes.
 
-Trust boundary (exactly one of the two): the tarball bytes and anything
-inside them (including any checksum shipped inside the archive) are
-untrusted. Either `--verify` re-runs the shared gate `make verify-dist
-ARCHIVE=...` (`scripts/verify-dist.py`) on a private immutable copy of the
-same bytes before activation, and the digest the verifier prints must match
-those bytes; or `--digest-file` supplies the producer-emitted
-`<ARCHIVE>.sha256` obtained separately (for example the CI digest written
-after the passed run). The digest file is never auto-read from the package
-directory. Without a passing verification or a matching trusted digest the
-script exits nonzero and leaves `current` untouched.
+Choose exactly one trust option:
 
-Usage (digest mode on the target needs only bash, tar and sha256sum, no
-Python; `--verify` needs the verification workstation with this checkout's
-Python/venv toolchain because it runs the real verifier):
+- **Trusted sources only:** `--verify` runs the archive's programs on this
+  machine as the operator. It runs `make verify-dist` on a private copy
+  and checks the verifier's digest before activating those same bytes.
+- **For untrusted archives, the only supported mode is `--digest-file`.**
+  Obtain the producer's digest from a passed verification over a separate,
+  trusted channel. A checksum supplied inside the archive is not evidence
+  of verification. A digest mismatch leaves `current` untouched.
+
+Digest mode uses standard Linux shell tools and needs no Python. `--verify`
+needs the verification workstation with this checkout's Python environment:
 
 ```sh
 bash scripts/install-verified-dist.sh --archive /path/to/tdnext-linux-x86_64.tar.gz \
@@ -149,8 +147,9 @@ Keys:
 
 ## Development (Python, dev only)
 
-Python and `uv` are needed only for the legacy checks, not for `make dist`
-or any shipped executable. To run the full development gate:
+`make verify-dist` requires Python and the project's locked test dependencies
+(`uv sync --locked`). Neither `make dist` nor the shipped executables need
+Python. To run the full development gate:
 
 ```sh
 make check ZELLIJ_SRC=/path/to/pinned-zellij

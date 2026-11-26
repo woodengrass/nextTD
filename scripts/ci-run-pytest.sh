@@ -29,17 +29,44 @@ cd "${ROOT}"
 
 export TDNEXT_TEST_PATCHED_CORE=1
 
-GOLDEN_SPEC="tests/test_desktop_golden.py"
-PYTEST_ARGS=()
-if test "${TDNEXT_GOLDEN_VIA_VERIFY_DIST:-0}" = "1"; then
-  PYTEST_ARGS=(--deselect "${GOLDEN_SPEC}")
+for var in PYTEST_ADDOPTS PYTEST_PLUGINS PYTEST_DISABLE_PLUGIN_AUTOLOAD; do
+  if [[ -n "${!var:-}" ]]; then
+    echo "ci-run-pytest: refusing inherited $var for the full suite" >&2
+    exit 1
+  fi
+  unset "$var"
+done
+WORK="$(mktemp -d)"
+trap 'rm -rf -- "$WORK"' EXIT
+LOG="$WORK/pytest.log"
+PY="$PWD/.venv/bin/python"
+# Use the already-synced interpreter directly: neither invocation reads uv
+# env files, user config or project run settings.
+unset UV_ENV_FILE
+env -i HOME="$HOME" PATH="$PATH" TDNEXT_COLLECTION_REPORT="$WORK/full" \
+  "$PY" -I -m pytest -c /dev/null --rootdir=. --collect-only -q tests > "$WORK/collection.log" || {
+  cat "$WORK/collection.log" >&2
+  exit 1
+}
+export TDNEXT_PASSED_REPORT="$WORK/passed"
+: > "$TDNEXT_PASSED_REPORT"
+unset TDNEXT_COLLECTION_REPORT
+export TDNEXT_DESELECTED_REPORT="$WORK/deselected"
+: > "$TDNEXT_DESELECTED_REPORT"
+: > "$WORK/expected"
+if [[ "${TDNEXT_GOLDEN_VIA_VERIFY_DIST:-0}" = 1 ]]; then
+  "$PY" -I - <<'PY' | sort > "$WORK/expected"
+import runpy
+
+gate = runpy.run_path("scripts/verify-dist.py")
+for scene in gate["lock_screens"]():
+    for term in gate["TERMINALS"]:
+        print(f'{gate["GOLDEN_TEST"]}::{gate["GOLDEN_CASE"]}[{scene}-{term}]')
+PY
 fi
 
-LOG="$(mktemp)"
-trap 'rm -f "${LOG}"' EXIT INT TERM
-
 set +e
-uv run pytest -q -ra "${PYTEST_ARGS[@]}" 2>&1 | tee "${LOG}"
+"$PY" -I -m pytest -q -ra tests 2>&1 | tee "${LOG}"
 STATUS="${PIPESTATUS[0]}"
 set -e
 
@@ -52,18 +79,16 @@ if grep -qE "^(SKIPPED|XFAIL|XPASS)" "${LOG}"; then
   grep -E "^(SKIPPED|XFAIL|XPASS)" "${LOG}" >&2
   exit 1
 fi
-if test "${TDNEXT_GOLDEN_VIA_VERIFY_DIST:-0}" = "1"; then
-  # The verifier owns the golden component in this run: prove it was excluded
-  # here (so it runs exactly once there, never twice and never zero times).
-  grep -qE "[0-9]+ deselected" "${LOG}" \
-    || { echo "ci-run-pytest: error: expected ${GOLDEN_SPEC} to be deselected via TDNEXT_GOLDEN_VIA_VERIFY_DIST=1." >&2; exit 1; }
-else
-  if grep -qE "[0-9]+ deselected" "${LOG}"; then
-    echo "ci-run-pytest: error: unexpected deselection without TDNEXT_GOLDEN_VIA_VERIFY_DIST=1; refusing reduced coverage." >&2
-    exit 1
-  fi
-fi
-if ! grep -qE "[0-9]+ passed" "${LOG}"; then
+sort "$TDNEXT_DESELECTED_REPORT" | diff -u "$WORK/expected" - || {
+  echo "ci-run-pytest: deselected node IDs differ from the expected golden set" >&2
+  exit 1
+}
+sort "$WORK/full" > "$WORK/full.sorted"
+sort "$TDNEXT_PASSED_REPORT" "$WORK/expected" | diff -u "$WORK/full.sorted" - || {
+  echo "ci-run-pytest: passed node IDs plus expected golden IDs differ from full collection" >&2
+  exit 1
+}
+if ! test -s "$TDNEXT_PASSED_REPORT"; then
   echo "ci-run-pytest: error: no passing tests observed; refusing an empty pass." >&2
   exit 1
 fi
