@@ -45,8 +45,9 @@ pub struct StateStore {
 /// write, so two simultaneous operations cannot interleave. A second
 /// operation fails fast with an actionable busy error instead of waiting or
 /// overwriting. Reads never take it: atomic replacement keeps them consistent.
-pub(crate) struct StateLock {
+pub struct StateLock {
     _file: std::fs::File,
+    target: StateStore,
 }
 
 impl StateStore {
@@ -58,7 +59,9 @@ impl StateStore {
     /// Read the snapshot; missing file means empty, corrupt file is an error.
     pub fn read(&self) -> Result<State> {
         let text = match std::fs::read_to_string(&self.path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && !self.path.is_symlink() =>
+            {
                 return Ok(State::default());
             }
             Err(error) => {
@@ -79,12 +82,16 @@ impl StateStore {
     /// Take the mutation lock without blocking. Contention is an error naming
     /// the state file and telling the caller to retry after the in-flight
     /// operation (possibly one waiting on user consent) finishes.
-    pub(crate) fn lock(&self) -> Result<StateLock> {
+    pub fn lock(&self) -> Result<StateLock> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Cannot lock plugin state {}", self.path.display()))?;
         }
-        let sidecar = self.sidecar();
+        let target = resolve_target(&self.path)?;
+        check_writable(&target)
+            .with_context(|| format!("Cannot lock plugin state {}", target.display()))?;
+        let mut sidecar = target.as_os_str().to_owned();
+        sidecar.push(".lock");
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -92,19 +99,25 @@ impl StateStore {
             .truncate(false)
             .open(&sidecar)
             .with_context(|| format!("Cannot lock plugin state {}", self.path.display()))?;
-        // A lone lock call can report a transient busy status under process
-        // load, so spin briefly before treating it as a concurrent holder.
-        // A genuine holder keeps the lock far longer than this spin, so two
-        // simultaneous mutations still fail fast with the busy error below.
-        let mut attempts = 0;
+        // A child forked by another thread holds a copy of this descriptor
+        // until it execs, which can take milliseconds under load and makes
+        // the lock look busy. Retry for a bounded time, not a spin count,
+        // before treating it as a concurrent holder; a genuine holder keeps
+        // the lock far longer, so two mutations still fail fast below.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         loop {
             match file.try_lock_exclusive() {
-                Ok(()) => return Ok(StateLock { _file: file }),
+                Ok(()) => {
+                    return Ok(StateLock {
+                        _file: file,
+                        target: StateStore::new(target),
+                    });
+                }
                 Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock && attempts < 10_000 =>
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
                 {
-                    attempts += 1;
-                    std::thread::yield_now();
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 Err(error) => {
                     if error.kind() == std::io::ErrorKind::WouldBlock {
@@ -122,14 +135,11 @@ impl StateStore {
         }
     }
 
-    fn sidecar(&self) -> PathBuf {
-        self.path.with_extension("json.lock")
-    }
-
     /// Atomically replace the snapshot; the target is never truncated in place.
     ///
     /// The caller must hold [`StateStore::lock`]: the write itself takes no
     /// lock, so taking one here would deadlock a holder that calls back in.
+    #[cfg(test)]
     pub fn write(&self, state: &State) -> Result<()> {
         let checked = State::new(state.installed.clone(), state.enabled.clone())?;
         if let Some(parent) = self.path.parent() {
@@ -141,17 +151,89 @@ impl StateStore {
     }
 }
 
-fn write_atomically(path: &Path, text: String) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+impl StateLock {
+    pub fn path(&self) -> &Path {
+        &self.target.path
+    }
+
+    pub(crate) fn read_state(&self) -> Result<State> {
+        self.target.read()
+    }
+
+    /// Rename is the commit point. Keep its subsequent durability check separate.
+    pub fn replace(&self, value: &impl Serialize) -> Result<RenamedFile> {
+        replace_at(self.path(), serde_json::to_string_pretty(value)?)
+            .with_context(|| format!("Cannot save {}", self.path().display()))
+    }
+}
+
+#[must_use = "sync the directory after committing the resources referenced by this file"]
+pub struct RenamedFile {
+    directory: std::fs::File,
+    path: PathBuf,
+}
+
+impl RenamedFile {
+    pub fn sync(self) -> Result<()> {
+        self.directory.sync_all().with_context(|| {
+            format!(
+                "Saved {} but could not sync its directory",
+                self.path.display()
+            )
+        })
+    }
+}
+
+fn resolve_target(path: &Path) -> std::io::Result<PathBuf> {
+    match path.canonicalize() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !path.is_symlink() => {
+            Ok(parent_dir(path)
+                .canonicalize()?
+                .join(path.file_name().ok_or(error)?))
+        }
+        result => result,
+    }
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn check_writable(target: &Path) -> std::io::Result<()> {
+    use rustix::fs::{Access, AtFlags, CWD, accessat};
+    if target.try_exists()? {
+        accessat(CWD, target, Access::WRITE_OK, AtFlags::EACCESS)?;
+    }
+    accessat(
+        CWD,
+        parent_dir(target),
+        Access::WRITE_OK | Access::EXEC_OK,
+        AtFlags::EACCESS,
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn write_atomically(path: &Path, text: String) -> Result<()> {
+    replace_at(&resolve_target(path)?, text)?.sync()
+}
+
+fn replace_at(path: &Path, text: String) -> std::io::Result<RenamedFile> {
+    check_writable(path)?;
+    let parent = parent_dir(path);
+    let directory = std::fs::File::open(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     use std::io::Write as _;
     temporary.write_all(text.as_bytes())?;
     temporary.write_all(b"\n")?;
-    temporary.flush()?;
-    temporary
-        .persist(path)
-        .map(|_| ())
-        .map_err(|error| error.error)
+    temporary.as_file().sync_all()?;
+    temporary.persist(path)?;
+    Ok(RenamedFile {
+        directory,
+        path: path.to_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -162,6 +244,58 @@ mod tests {
 
     fn set(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn linked_read_only_target_is_left_untouched() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = tempfile::tempdir()?;
+        let target = root.path().join("saved");
+        std::fs::write(&target, b"old")?;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o444))?;
+        let link = root.path().join("appearance.json");
+        symlink(&target, &link)?;
+        assert!(write_atomically(&link, "new".into()).is_err());
+        assert!(StateStore::new(link.clone()).lock().is_err());
+        assert!(!root.path().join("saved.lock").exists());
+        assert_eq!(std::fs::read(&target)?, b"old");
+        assert!(link.is_symlink());
+        Ok(())
+    }
+
+    #[test]
+    fn repointing_a_link_does_not_redirect_the_locked_operation() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir()?;
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        let link = root.path().join("plugins.json");
+        let state = State::new(set(&["first"]), set(&[]))?;
+        std::fs::write(&first, serde_json::to_vec(&state)?)?;
+        std::fs::write(&second, b"{}")?;
+        symlink(&first, &link)?;
+        let guard = StateStore::new(link.clone()).lock()?;
+        std::fs::remove_file(&link)?;
+        symlink(&second, &link)?;
+        assert_eq!(guard.read_state()?, state);
+        let changed = State::new(set(&["first"]), set(&["first"]))?;
+        guard.replace(&changed)?.sync()?;
+        assert_eq!(StateStore::new(first).read()?, changed);
+        assert_eq!(std::fs::read(&second)?, b"{}");
+        assert_eq!(std::fs::read_link(link)?, second);
+        Ok(())
+    }
+
+    #[test]
+    fn aliases_of_one_state_share_its_mutation_lock() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let target = root.path().join("shared");
+        std::fs::write(&target, b"{}")?;
+        let link = root.path().join("editor.json");
+        std::os::unix::fs::symlink(&target, &link)?;
+        let _guard = StateStore::new(target).lock()?;
+        assert!(StateStore::new(link).lock().is_err());
+        Ok(())
     }
 
     #[test]

@@ -589,6 +589,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "fs2",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "tempfile",
@@ -603,8 +604,10 @@ dependencies = [
  "anyhow",
  "crossterm",
  "ratatui",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
+ "signal-hook",
  "tdnext-manager",
  "tempfile",
 ]

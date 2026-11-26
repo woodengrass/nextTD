@@ -3,9 +3,8 @@
 import typer
 
 from .core.errors import InstallationConsentRequired, PluginError
-from .core.executables import install_executable
 from .core.local_env import bootstrap as _bootstrap_local_path
-from .runtime import manager, state_dir
+from .runtime import manager
 
 cli = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
 
@@ -65,12 +64,6 @@ def uninstall(plugin: str) -> None:
     """Uninstall a plugin and disable every enabled dependent, keeping dependants installed."""
     affected = manager().uninstall(plugin)
     typer.echo(f"Uninstalled: {plugin}; Disabled: {', '.join(sorted(affected)) or '(already disabled)'}")
-
-
-@cli.command("install-zellij")
-def install_zellij() -> None:
-    """Install the pinned optional Zellij binary under the local state directory."""
-    typer.echo(f"Installed Zellij: {install_executable('zellij', state_dir() / 'bin')}")
 
 
 def main() -> None:

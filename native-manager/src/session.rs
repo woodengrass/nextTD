@@ -27,6 +27,18 @@ impl Session {
         errors: &BTreeMap<String, String>,
         enabled: &BTreeSet<String>,
     ) -> Result<Self> {
+        for manifest in manifests.values().filter(|m| enabled.contains(&m.id)) {
+            let closure = tdnext_manager::graph::dependency_order(manifests, &manifest.id, errors)
+                .map_err(|error| anyhow::anyhow!("{}: {error}", manifest.id))?;
+            for dependency in closure {
+                if !enabled.contains(&dependency) {
+                    anyhow::bail!(
+                        "Enabled plugin {} requires disabled plugin {dependency}",
+                        manifest.id
+                    );
+                }
+            }
+        }
         for id in enabled {
             if !manifests.contains_key(id) {
                 if let Some(diagnostic) = errors.get(id) {

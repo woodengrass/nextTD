@@ -1419,7 +1419,7 @@ index df5585d..e533b31 100644
 +            senders
 +                .send_to_screen(ScreenInstruction::SetPaneFixedWidth(
 +                    pane_id.into(),
-+                    width,
++                    width as usize,
 +                    Some(NotificationEnd::new(completion_tx)),
 +                ))
 +                .with_context(err_context)?;
@@ -1741,7 +1741,7 @@ index 68f27d1..2a4743d 100644
 +        pane_id: String,
 +        /// Fixed width in columns (eg. 22)
 +        #[clap(short, long, value_parser)]
-+        width: usize,
++        width: u32,
 +    },
      /// Change focus to the next pane
      FocusNextPane,
@@ -1806,7 +1806,7 @@ index 5897f3b..2ccd218 100644
      },
 +    SetPaneFixedWidth {
 +        pane_id: PaneId,
-+        width: usize,
++        width: u32,
 +    },
      MovePaneByPaneId {
          pane_id: PaneId,
@@ -1880,7 +1880,7 @@ index 4a9caf4..404f680 100644
 +            crate::input::actions::Action::SetPaneFixedWidth { pane_id, width } => {
 +                ActionType::SetPaneFixedWidth(SetPaneFixedWidthAction {
 +                    pane_id: Some(pane_id.into()),
-+                    width: width as u32,
++                    width,
 +                })
 +            },
              crate::input::actions::Action::MovePaneByPaneId { pane_id, direction } => {
@@ -1896,7 +1896,7 @@ index 4a9caf4..404f680 100644
 +                        .pane_id
 +                        .ok_or_else(|| anyhow!("SetPaneFixedWidth missing pane_id"))?
 +                        .try_into()?,
-+                    width: a.width as usize,
++                    width: a.width,
 +                })
 +            },
              ActionType::MovePaneBackwardsByPaneId(a) => {

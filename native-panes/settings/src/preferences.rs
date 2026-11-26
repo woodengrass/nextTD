@@ -1,8 +1,4 @@
-use std::{
-    fs,
-    io::{ErrorKind, Write},
-    path::Path,
-};
+use std::{fs, io::ErrorKind, path::Path};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -50,7 +46,7 @@ fn read<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
     match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .with_context(|| format!("Cannot read preferences {}", path.display())),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(T::default()),
+        Err(error) if error.kind() == ErrorKind::NotFound && !path.is_symlink() => Ok(T::default()),
         Err(error) => {
             Err(error).with_context(|| format!("Cannot read preferences {}", path.display()))
         }
@@ -58,7 +54,11 @@ fn read<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
 }
 
 pub fn appearance(root: &Path) -> Result<Appearance> {
-    let value: Appearance = read(&root.join("appearance.json"))?;
+    read_appearance(&root.join("appearance.json"))
+}
+
+pub fn read_appearance(path: &Path) -> Result<Appearance> {
+    let value: Appearance = read(path)?;
     if let Some(id) = &value.provider_id {
         let mut chars = id.chars();
         if !chars.next().is_some_and(|c| c.is_ascii_lowercase())
@@ -66,7 +66,7 @@ pub fn appearance(root: &Path) -> Result<Appearance> {
         {
             bail!(
                 "Cannot read preferences {}: invalid provider id",
-                root.join("appearance.json").display()
+                path.display()
             );
         }
     }
@@ -74,19 +74,17 @@ pub fn appearance(root: &Path) -> Result<Appearance> {
 }
 
 pub fn editor(root: &Path) -> Result<EditorPreferences> {
-    read(&root.join("editor.json"))
+    read_editor(&root.join("editor.json"))
 }
 
+pub fn read_editor(path: &Path) -> Result<EditorPreferences> {
+    read(path)
+}
+
+#[cfg(test)]
 pub fn save<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let parent = path.parent().context("Preference path has no parent")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("Cannot save preferences {}", path.display()))?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("Cannot save preferences {}", path.display()))?;
-    serde_json::to_writer_pretty(&mut temporary, value)?;
-    writeln!(temporary)?;
-    temporary
-        .persist(path)
-        .with_context(|| format!("Cannot save preferences {}", path.display()))?;
-    Ok(())
+    tdnext_manager::state::StateStore::new(path.to_owned())
+        .lock()?
+        .replace(value)?
+        .sync()
 }

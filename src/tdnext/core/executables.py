@@ -9,7 +9,6 @@ import tarfile
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Final
 
 from .errors import PluginError
 
@@ -19,23 +18,6 @@ class Release:
     url: str
     sha256: str
     member: str
-
-
-RELEASES: Final = {
-    "zellij": Release(
-        "https://github.com/zellij-org/zellij/releases/download/v0.45.1/"
-        "zellij-no-web-x86_64-unknown-linux-musl.tar.gz",
-        "d7bda1e18c30a688833ae7627f1d6a253bbba5349a4bc48e4f0ec008aaf75ed1",
-        "zellij",
-    ),
-}
-
-
-def install_executable(name: str, local_bin: Path) -> Path:
-    """Download one allowlisted binary, never extracting arbitrary archive paths."""
-    if name not in RELEASES:
-        raise PluginError(f"No local installer for '{name}'; install it yourself and add it to PATH.")
-    return install_release(name, local_bin, RELEASES[name])
 
 
 def install_release(name: str, local_bin: Path, release: Release) -> Path:

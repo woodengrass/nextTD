@@ -17,7 +17,7 @@ pub use state::State;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
 use state::StateStore;
 
@@ -30,6 +30,16 @@ pub enum Action {
     Disable,
     Uninstall,
 }
+
+/// A confirmation no longer describes the cascade under the mutation lock.
+#[derive(Debug)]
+pub struct ChangedPreview(pub BTreeSet<String>);
+impl std::fmt::Display for ChangedPreview {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Affected plugins changed; confirm the new list")
+    }
+}
+impl std::error::Error for ChangedPreview {}
 
 /// Catalog, state, and local binaries rooted at one state directory.
 #[derive(Debug)]
@@ -139,55 +149,61 @@ impl Manager {
         action: Action,
         id: &str,
         protected: &BTreeSet<String>,
+        approve: impl FnMut(&str) -> bool,
+    ) -> Result<Vec<String>> {
+        self.apply_previewed(action, id, protected, None, approve)
+    }
+
+    /// Refuse a changed preview before mutating the locked snapshot.
+    pub fn apply_previewed(
+        &self,
+        action: Action,
+        id: &str,
+        protected: &BTreeSet<String>,
+        preview: Option<&BTreeSet<String>>,
         mut approve: impl FnMut(&str) -> bool,
     ) -> Result<Vec<String>> {
-        let _guard = self.store.lock()?;
+        let guard = self.store.lock()?;
+        let state = guard.read_state()?;
         match action {
-            Action::Install => {
-                let order = graph::dependency_order(&self.manifests, id, &self.errors)?;
-                self.check_dependencies(&order, &mut approve)?;
-                let state = self.store.read()?;
-                let installed: BTreeSet<String> =
-                    state.installed.union(&order_set(&order)).cloned().collect();
-                self.store.write(&State::new(installed, state.enabled)?)?;
-                Ok(order)
-            }
-            Action::Enable => {
-                let order = self.enable_order(id)?;
-                self.check_dependencies(&order, &mut approve)?;
-                let state = self.store.read()?;
+            Action::Install | Action::Enable => {
+                let order = if action == Action::Enable {
+                    self.enable_order(id, &state)?
+                } else {
+                    graph::dependency_order(&self.manifests, id, &self.errors)?
+                };
                 let additions = order_set(&order);
-                let installed: BTreeSet<String> =
-                    state.installed.union(&additions).cloned().collect();
-                let enabled: BTreeSet<String> = state.enabled.union(&additions).cloned().collect();
-                self.store.write(&State::new(installed, enabled)?)?;
+                let installed = state.installed.union(&additions).cloned().collect();
+                let enabled = if action == Action::Enable {
+                    state.enabled.union(&additions).cloned().collect()
+                } else {
+                    state.enabled
+                };
+                let next = State::new(installed, enabled)?;
+                let tools = self.check_dependencies(&order, &mut approve)?;
+                let committed = guard.replace(&next)?;
+                for tool in tools {
+                    tool.commit();
+                }
+                committed.sync()?;
                 Ok(order)
             }
-            Action::Disable => {
-                let affected = self.affected(id)?;
-                self.guard_protected(&affected, protected)?;
-                let state = self.store.read()?;
-                let enabled: BTreeSet<String> =
-                    state.enabled.difference(&affected).cloned().collect();
-                self.store.write(&State::new(state.installed, enabled)?)?;
-                Ok(affected.into_iter().collect())
-            }
-            Action::Uninstall => {
-                let state = self.store.read()?;
+            Action::Disable | Action::Uninstall => {
                 if !self.manifests.contains_key(id) && !state.installed.contains(id) {
                     bail!("Plugin not found: {id}");
                 }
                 let affected = graph::dependants(&self.manifests, id, &state.enabled);
+                if preview.is_some_and(|expected| expected != &affected) {
+                    return Err(ChangedPreview(affected).into());
+                }
                 self.guard_protected(&affected, protected)?;
-                let installed: BTreeSet<String> = state
-                    .installed
-                    .iter()
-                    .filter(|name| name.as_str() != id)
-                    .cloned()
-                    .collect();
+                let mut installed = state.installed;
+                if action == Action::Uninstall {
+                    installed.remove(id);
+                }
                 let enabled: BTreeSet<String> =
                     state.enabled.difference(&affected).cloned().collect();
-                self.store.write(&State::new(installed, enabled)?)?;
+                guard.replace(&State::new(installed, enabled)?)?.sync()?;
                 Ok(affected.into_iter().collect())
             }
         }
@@ -199,50 +215,40 @@ impl Manager {
         &self,
         order: &[String],
         approve: &mut impl FnMut(&str) -> bool,
-    ) -> Result<()> {
+    ) -> Result<Vec<installer::PendingTool>> {
+        let mut downloads = Vec::new();
+        let mut seen = BTreeSet::new();
         for name in order {
-            let manifest = self
-                .manifests
-                .get(name)
-                .with_context(|| format!("Required plugin not found: {name}"))?;
+            let manifest = &self.manifests[name];
             for executable in &manifest.requires_executables {
-                if self.executable(executable).is_none() {
-                    let prompt = installer::description(executable, &self.bin)?;
-                    if !approve(&prompt) {
-                        bail!("Installation declined; plugin state was not changed");
+                if !seen.insert(executable) {
+                    continue;
+                }
+                if let Some(binary) = self.executable(executable) {
+                    if executable == "btop" {
+                        installer::check_btop(&binary)?;
                     }
-                    installer::install(executable, &self.bin)?;
-                    if self.executable(executable).is_none() {
-                        bail!(
-                            "Dependency installation for {name} did not resolve its requirements"
-                        );
-                    }
+                } else {
+                    downloads.push((executable, installer::description(executable, &self.bin)?));
                 }
             }
         }
-        for name in order {
-            let manifest = self
-                .manifests
-                .get(name)
-                .with_context(|| format!("Required plugin not found: {name}"))?;
-            for executable in &manifest.requires_executables {
-                let binary = self.executable(executable).with_context(|| {
-                    format!("{name} requires missing executable '{executable}'; install it on PATH")
-                })?;
-                if executable == "btop" {
-                    installer::check_btop(&binary)?;
-                }
+        for (_, prompt) in &downloads {
+            if !approve(prompt) {
+                bail!("Installation declined; plugin state was not changed");
             }
         }
-        Ok(())
+        downloads
+            .into_iter()
+            .map(|(executable, _)| installer::install(executable, &self.bin))
+            .collect()
     }
 
     /// Dependency order for enabling `id`, selecting the single compatible
     /// host: the already-enabled one, the requested one, or the unique
     /// candidate compatible with every view.
-    fn enable_order(&self, plugin_id: &str) -> Result<Vec<String>> {
+    fn enable_order(&self, plugin_id: &str, state: &State) -> Result<Vec<String>> {
         let mut order = graph::dependency_order(&self.manifests, plugin_id, &self.errors)?;
-        let state = self.store.read()?;
         let mut hosts: BTreeMap<&str, &Manifest> = BTreeMap::new();
         for name in state.enabled.iter().chain(order.iter()) {
             if let Some(manifest) = self.manifests.get(name)
@@ -655,6 +661,63 @@ command = "tdnext-strict"
         assert_eq!(prompted.len(), 1);
         assert!(prompted[0].contains("btop 1.4.8"), "{}", prompted[0]);
         assert_eq!(manager.state()?, crate::state::State::default());
+        Ok(())
+    }
+
+    #[test]
+    fn declining_second_tool_leaves_first_and_state_untouched() -> Result<()> {
+        let empty = tempfile::tempdir()?;
+        with_path(
+            empty.path(),
+            "tests::declining_second_tool_leaves_first_and_state_untouched",
+        )?;
+        if !is_child() {
+            return Ok(());
+        }
+        let (_dir, manager) = programmatic(&[("app", Role::View, &[], &["btop", "test-tool"])])?;
+        write_state(&manager, &[], &[])?;
+        let before = std::fs::read(&manager.store.path)?;
+        let result = manager.apply(Action::Install, "app", &set(&[]), |prompt| {
+            !prompt.contains("test-tool")
+        });
+        assert!(
+            matches!(result, Err(ref e) if e.to_string().contains("declined")),
+            "{result:?}"
+        );
+        assert!(!manager.bin.join("btop").exists());
+        assert_eq!(std::fs::read(&manager.store.path)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn unwritable_state_directory_prevents_download() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let empty = tempfile::tempdir()?;
+        with_path(
+            empty.path(),
+            "tests::unwritable_state_directory_prevents_download",
+        )?;
+        if !is_child() {
+            return Ok(());
+        }
+        let (root, manager) = programmatic(&[("app", Role::View, &[], &["btop"])])?;
+        std::fs::create_dir(&manager.bin)?;
+        let dir = root.path().join("settings");
+        std::fs::create_dir(&dir)?;
+        let target = dir.join("saved.json");
+        std::fs::write(&target, b"{}")?;
+        symlink(&target, &manager.store.path)?;
+        // A previously created lock remains writable in a now read-only directory.
+        drop(manager.store.lock()?);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))?;
+        let result = manager.apply(Action::Install, "app", &set(&[]), |_| true);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        assert!(
+            matches!(result, Err(ref e) if format!("{e:#}").contains("Permission denied")),
+            "{result:?}"
+        );
+        assert!(!manager.bin.join("btop").exists());
+        assert_eq!(std::fs::read(target)?, b"{}");
         Ok(())
     }
 
