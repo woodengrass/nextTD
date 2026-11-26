@@ -169,7 +169,6 @@ fn heading(f: &mut Frame, r: Rect, s: &str, focused: bool) {
     );
     text(f, line(r, 1), &"─".repeat(r.width.into()), style().dim())
 }
-use ratatui::style::Stylize;
 fn table_row(f: &mut Frame, r: Rect, cols: [&str; 3], st: Style) {
     f.render_widget(Block::default().style(st), r);
     let avail = r.width.saturating_sub(6);
