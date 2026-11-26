@@ -1,4 +1,5 @@
 import json
+import shlex
 import sys
 from pathlib import Path
 
@@ -148,16 +149,24 @@ def test_native_numeric_shortcuts_follow_three_sidebar_views(
     session = NativeSession(tmp_path, env, binary, expected_tabs=4)
     try:
         panes = json.loads(session.action("list-panes", "--all", "--json"))
-        commands = [pane.get("pane_command") or "" for pane in panes]
-        assert any("tdnext-files" in command for command in commands), commands
-        assert not any("tdnext-files" in command and "third" in command.lower() for command in commands), commands
+        # Match the program name, not the whole command line: the checkout
+        # path itself may contain "tdnext-files".
+        argvs = [shlex.split(pane.get("pane_command") or "") for pane in panes]
+        files = [argv for argv in argvs if argv and Path(argv[0]).name == "tdnext-files"]
+        assert files, argvs
+        assert not any("third" in arg.lower() for argv in files for arg in argv[1:]), files
         target = session.tab_id("Third")
         session.send_key("M-3")
         wait_for(lambda: session.active_tab() == target)
-        panes = json.loads(session.action("list-panes", "--all", "--json"))
-        third = next(
-            pane for pane in panes if "tdnext.pane view third" in (pane.get("pane_command") or "")
-        )
+
+        def third_pane() -> dict[str, object] | None:
+            panes = json.loads(session.action("list-panes", "--all", "--json"))
+            return next(
+                (pane for pane in panes if "tdnext.pane view third" in (pane.get("pane_command") or "")),
+                None,
+            )
+
+        third = wait_for(third_pane)
         pane_id = f"terminal_{third['id']}"
         session.send_key("printf 'THIRD_%s\\n' READY; read -r answer; printf 'THIRD_RESULT:%s\\n' \"$answer\"")
         session.send_key("Enter")
