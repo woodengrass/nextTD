@@ -4,7 +4,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier},
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 fn paint_rect(f: &mut Frame, rect: Rect, fg: Color, bg: Color, modifiers: Modifier) {
     let rect = rect.intersection(f.area());
@@ -253,11 +253,7 @@ pub fn paint_modal(f: &mut Frame, dialog: &Dialog) {
             }
         }
         let width = usize::from(input.width.saturating_sub(6));
-        let cursor_width: usize = value
-            .chars()
-            .take(*cursor)
-            .map(|c| c.width().unwrap_or(0))
-            .sum();
+        let cursor_width = value.chars().take(*cursor).collect::<String>().width();
         let offset = cursor_width.saturating_sub(width.saturating_sub(1));
         let start = input.x.saturating_add(3);
         if *selected && input.y.saturating_add(1) < area.bottom() {

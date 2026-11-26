@@ -40,6 +40,7 @@ enum MutRequest {
     },
     Delete {
         path: PathBuf,
+        identity: actions::Confirmed,
     },
 }
 /// Finished mutation. `dir`/`src` are the context captured at accept time so
@@ -94,7 +95,7 @@ pub struct Controller {
     hidden: bool,
     clip: Option<(PathBuf, bool)>,
     name: Option<Name>,
-    delete: Option<PathBuf>,
+    delete: Option<(PathBuf, actions::Confirmed)>,
     mutation: Option<Receiver<Mutation>>,
     #[cfg(test)]
     test_gate: Option<std::sync::Arc<MutationGate>>,
@@ -279,7 +280,7 @@ impl Controller {
                 }
                 Err(_) => {
                     self.notify("Operation failed.", Severity::Error);
-                    self.ui.loading = self.list_worker.is_some()
+                    self.refresh_after_failure()
                 }
             }
         }
@@ -293,7 +294,7 @@ impl Controller {
         }
     }
     fn notify(&mut self, s: impl Into<String>, severity: Severity) {
-        self.ui.toast = Some((s.into(), severity));
+        self.ui.toast = Some((data::message(&s.into()), severity));
         self.expires = Some(Instant::now() + Duration::from_secs(3))
     }
     fn selected(&self) -> Option<PathBuf> {
@@ -337,11 +338,11 @@ impl Controller {
             MutRequest::Paste { src, moving, .. } => format!(
                 "{}: {}",
                 if *moving { "Moving" } else { "Copying" },
-                src.file_name().unwrap_or_default().to_string_lossy()
+                data::single_line(src.file_name().unwrap_or_default())
             ),
-            MutRequest::Delete { path } => format!(
+            MutRequest::Delete { path, .. } => format!(
                 "Deleting: {}",
-                path.file_name().unwrap_or_default().to_string_lossy()
+                data::single_line(path.file_name().unwrap_or_default())
             ),
         };
         let (tx, rx) = mpsc::channel();
@@ -365,8 +366,8 @@ impl Controller {
                         result,
                     }
                 }
-                MutRequest::Delete { path } => {
-                    let result = actions::remove(&path);
+                MutRequest::Delete { path, identity } => {
+                    let result = actions::remove_confirmed(&path, identity);
                     Mutation::Delete { path, result }
                 }
             };
@@ -394,7 +395,7 @@ impl Controller {
                         format!(
                             "{}: {}",
                             if moving { "Moved" } else { "Copied" },
-                            target.file_name().unwrap_or_default().to_string_lossy()
+                            data::single_line(target.file_name().unwrap_or_default())
                         ),
                         Severity::Info,
                     );
@@ -402,7 +403,7 @@ impl Controller {
                 }
                 Err(e) => {
                     self.notify(e, Severity::Error);
-                    self.ui.loading = self.list_worker.is_some()
+                    self.refresh_after_failure();
                 }
             },
             Mutation::Delete { path, result } => match result {
@@ -410,7 +411,7 @@ impl Controller {
                     self.notify(
                         format!(
                             "Deleted: {}",
-                            path.file_name().unwrap_or_default().to_string_lossy()
+                            data::single_line(path.file_name().unwrap_or_default())
                         ),
                         Severity::Info,
                     );
@@ -418,10 +419,23 @@ impl Controller {
                 }
                 Err(e) => {
                     self.notify(e, Severity::Error);
-                    self.ui.loading = self.list_worker.is_some()
+                    self.refresh_after_failure()
                 }
             },
         }
+    }
+    fn refresh_after_failure(&mut self) {
+        if self.clip.as_ref().is_some_and(|(p, _)| {
+            std::fs::symlink_metadata(p).is_err_and(|e| {
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                )
+            })
+        }) {
+            self.clip = None;
+        }
+        self.reload(self.selected());
     }
     fn preview(&mut self) {
         self.ui.preview = None;
@@ -619,25 +633,30 @@ impl Controller {
         }
         let result = match kind {
             None => return,
-            Some(Name::Folder) => actions::create(&self.ui.directory, &s, true),
-            Some(Name::File) => actions::create(&self.ui.directory, &s, false),
+            Some(Name::Folder) => actions::create(&self.ui.directory, data::edited_name(&s), true),
+            Some(Name::File) => actions::create(&self.ui.directory, data::edited_name(&s), false),
             Some(Name::Rename(p, initial)) => {
                 if s == initial {
                     return;
                 }
-                actions::rename(&p, &s)
+                actions::rename(&p, data::edited_name(&s))
             }
             Some(Name::Go) => {
                 let p = if s == "~" || s.starts_with("~/") {
                     std::env::var_os("HOME")
                         .map(PathBuf::from)
                         .unwrap_or_default()
-                        .join(s.trim_start_matches('~').trim_start_matches('/'))
+                        .join(data::edited_name(
+                            s.trim_start_matches('~').trim_start_matches('/'),
+                        ))
                 } else {
-                    self.ui.directory.join(&s)
+                    self.ui.directory.join(data::edited_name(&s))
                 };
                 if !p.is_dir() {
-                    self.notify(format!("Not a directory: {}", p.display()), Severity::Error)
+                    self.notify(
+                        format!("Not a directory: {}", data::single_line(&p)),
+                        Severity::Error,
+                    )
                 } else {
                     match p.canonicalize() {
                         Ok(p) => {
@@ -656,11 +675,17 @@ impl Controller {
         }
     }
     fn delete_dialog(&mut self) {
-        self.delete = self.selected();
+        self.delete = self.selected().and_then(|p| match actions::confirm(&p) {
+            Ok(id) => Some((p, id)),
+            Err(e) => {
+                self.notify(e, Severity::Error);
+                None
+            }
+        });
         let name = self
             .delete
             .as_ref()
-            .and_then(|p| p.file_name())
+            .and_then(|(p, _)| p.file_name())
             .map_or_else(
                 || {
                     if self.ui.loading {
@@ -669,7 +694,7 @@ impl Controller {
                         "No current selection. Cancel and choose a file.".into()
                     }
                 },
-                |s| s.to_string_lossy().into_owned(),
+                data::single_line,
             );
         self.ui.dialog = Some(Dialog::Delete {
             name,
@@ -682,14 +707,14 @@ impl Controller {
             Some(Dialog::Name { value, .. }) => self.submit(value),
             Some(Dialog::Delete { ready: true, .. }) => {
                 if self.mutation_busy() {
-                } else if let Some(p) = self.delete.take() {
+                } else if let Some((p, identity)) = self.delete.take() {
                     if Some(&p) != self.selected().as_ref() {
                         self.notify(
                             "Selection changed; delete was cancelled.",
                             Severity::Warning,
                         )
                     } else {
-                        self.start_mutation(MutRequest::Delete { path: p });
+                        self.start_mutation(MutRequest::Delete { path: p, identity });
                     }
                 }
             }
@@ -714,8 +739,9 @@ impl Controller {
                 .char_indices()
                 .nth(*cursor)
                 .map_or(value.len(), |(i, _)| i);
-            value.insert_str(idx, s);
-            *cursor += s.chars().count()
+            let escaped = data::single_line(s);
+            value.insert_str(idx, &escaped);
+            *cursor += escaped.chars().count()
         }
     }
     fn modal_key(&mut self, k: KeyEvent) {
@@ -931,15 +957,11 @@ impl Controller {
                         K::Char('g') => self.name(
                             Name::Go,
                             "Go to folder",
-                            self.ui.directory.to_string_lossy().into_owned(),
+                            data::single_line(&self.ui.directory),
                         ),
                         K::Char('r') => {
                             if let Some(p) = self.target() {
-                                let initial = p
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .into_owned();
+                                let initial = data::single_line(p.file_name().unwrap_or_default());
                                 self.name(Name::Rename(p, initial.clone()), "Rename to", initial)
                             }
                         }
@@ -961,7 +983,7 @@ impl Controller {
                                     format!(
                                         "{}: {}",
                                         if c == 'x' { "Cut" } else { "Copied" },
-                                        p.file_name().unwrap_or_default().to_string_lossy()
+                                        data::single_line(p.file_name().unwrap_or_default())
                                     ),
                                     Severity::Info,
                                 );
@@ -1407,6 +1429,7 @@ mod controller_tests {
         assert_eq!(c.selected(), Some(raw.clone()));
 
         c.handle(key(K::Char('r'), M::empty()), 80, 24);
+        assert!(matches!(&c.ui.dialog,Some(Dialog::Name{value,..}) if value==r"bad\xffname.txt"));
         c.handle(key(K::Enter, M::empty()), 80, 24);
         assert!(raw.exists());
         assert!(!tmp.path().join("bad\u{FFFD}name.txt").exists());
@@ -1683,6 +1706,65 @@ mod controller_tests {
         assert!(tmp.path().join("b.txt").exists());
     }
 
+    #[test]
+    fn confirmed_delete_preserves_same_name_replacement() {
+        let tmp = test_dir(&[("a", "old")]);
+        let mut c = Controller::new(tmp.path().to_owned());
+        settle(&mut c);
+        let gate = std::sync::Arc::new(super::MutationGate::new_closed());
+        c.test_gate = Some(gate.clone());
+        c.handle(key(K::Char('d'), M::empty()), 80, 24);
+        c.handle(key(K::Tab, M::empty()), 80, 24);
+        c.handle(key(K::Char(' '), M::empty()), 80, 24);
+        wait_gate(&gate);
+        let name = tmp.path().join("a");
+        std::fs::remove_file(&name).unwrap();
+        std::fs::create_dir(&name).unwrap();
+        std::fs::write(name.join("keep"), "new").unwrap();
+        gate.open();
+        settle(&mut c);
+        assert_eq!(std::fs::read(name.join("keep")).unwrap(), b"new");
+        assert!(c.ui.toast.unwrap().0.contains("changed"));
+    }
+
+    #[test]
+    fn same_type_replacement_while_dialog_open_is_not_deleted() {
+        let tmp = test_dir(&[("a", "original")]);
+        let name = tmp.path().join("a");
+        let mut c = Controller::new(tmp.path().to_owned());
+        settle(&mut c);
+        c.handle(key(K::Char('d'), M::empty()), 80, 24);
+        std::fs::remove_file(&name).unwrap();
+        std::fs::write(&name, "replacement").unwrap();
+        c.handle(key(K::Tab, M::empty()), 80, 24);
+        c.handle(key(K::Char(' '), M::empty()), 80, 24);
+        settle(&mut c);
+        assert_eq!(std::fs::read(name).unwrap(), b"replacement");
+        assert!(c.ui.toast.unwrap().0.contains("changed"));
+    }
+    #[test]
+    fn copy_failure_after_publish_reloads_the_listing() {
+        let src = test_dir(&[("a", "data")]);
+        let dst = tempfile::tempdir().unwrap();
+        let parent = dst.path().to_owned();
+        crate::actions::stash_between_note(&parent.join("a"), move || {
+            let stage = std::fs::read_dir(parent)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            std::fs::write(stage.join("foreign"), "keep").unwrap();
+        });
+        let mut c = Controller::new(dst.path().to_owned());
+        settle(&mut c);
+        c.clip = Some((src.path().join("a"), false));
+        c.handle(key(K::Char('p'), M::empty()), 80, 24);
+        settle(&mut c);
+        assert!(dst.path().join("a").exists());
+        assert_eq!(c.selected(), Some(dst.path().join("a")));
+    }
+
     fn cross_device_dirs() -> (tempfile::TempDir, tempfile::TempDir) {
         use std::os::unix::fs::MetadataExt as _;
         // Two genuine devices: the default tempdir and a tmpfs one. A
@@ -1738,8 +1820,17 @@ mod controller_tests {
         });
         c.handle(key(K::Char('p'), M::empty()), 80, 24);
         assert!(c.mutation.is_some(), "paste must leave a pending mutation");
+        // A new clipboard selection while the move runs points to the child
+        // that will be unlinked before its sibling triggers the conflict.
+        c.clip = Some((tree.join("a.txt"), false));
         settle(&mut c);
 
+        assert_eq!(
+            c.selected(),
+            Some(dest.join("tree")),
+            "reload the destination listing"
+        );
+        assert!(c.clip.is_none(), "drop the missing clipboard source");
         // The partial move is user-visible.
         let (toast, _) =
             c.ui.toast
@@ -1867,10 +1958,17 @@ mod controller_tests {
         let root_target = dest.join("tree");
         let nested_target = root_target.join("nested");
         let file_target = nested_target.join("b.txt");
-        let at = |path: &std::path::Path| {
+        let stage = taken.first().unwrap().path.parent().unwrap();
+        assert_eq!(
+            stage.parent(),
+            Some(dest.as_path()),
+            "private staging directory"
+        );
+        let at = |final_path: &std::path::Path| {
+            let path = stage.join(final_path.strip_prefix(&dest).unwrap());
             taken
                 .iter()
-                .find(|entry| entry.path == *path)
+                .find(|entry| entry.path == path)
                 .unwrap_or_else(|| panic!("no creation record for {}", path.display()))
         };
         assert_eq!(taken.len(), 3, "unexpected creation records: {taken:?}");
@@ -1920,7 +2018,13 @@ mod controller_tests {
         // copy and the final chmod.
         let taken = crate::actions::take_initial_modes_under(&dest);
         assert_eq!(taken.len(), 1, "unexpected creation records: {taken:?}");
-        assert_eq!(taken[0].path, dest.join("note.txt"));
+        let stage = taken[0].path.parent().unwrap();
+        assert_eq!(
+            stage.parent(),
+            Some(dest.as_path()),
+            "private staging directory"
+        );
+        assert_eq!(taken[0].path, stage.join("note.txt"));
         assert_eq!(taken[0].mode & 0o177, 0, "file not created private");
         assert_eq!(
             taken[0].len, 0,
@@ -2412,7 +2516,7 @@ mod controller_tests {
         settle(&mut c);
         let target = tmp.path().join("remove.txt");
         assert_eq!(c.selected(), Some(target.clone()));
-        assert_eq!(c.delete, Some(target.clone()));
+        assert_eq!(c.delete.as_ref().map(|v| v.0.clone()), Some(target.clone()));
         if let Some(Dialog::Delete { name, ready, .. }) = &c.ui.dialog {
             assert!(ready, "scan completion must enable the delete button");
             assert_eq!(name, "remove.txt");
@@ -2513,7 +2617,10 @@ mod controller_tests {
             .send(Reply::List(crate::data::list(&old, false), None))
             .unwrap();
         settle(&mut c);
-        assert_eq!(c.delete, Some(old.join("old.txt")));
+        assert_eq!(
+            c.delete.as_ref().map(|v| v.0.clone()),
+            Some(old.join("old.txt"))
+        );
         assert_eq!(std::fs::read(new.join("new.txt")).unwrap(), b"new");
     }
 
@@ -2570,7 +2677,10 @@ mod controller_tests {
         settle(&mut c);
         assert_eq!(c.ui.directory, new);
         assert_eq!(c.selected(), Some(new_file.clone()));
-        assert_eq!(c.delete, Some(old_file.clone()));
+        assert_eq!(
+            c.delete.as_ref().map(|v| v.0.clone()),
+            Some(old_file.clone())
+        );
         c.handle(key(K::Tab, M::empty()), 80, 24);
         c.handle(key(K::Char(' '), M::empty()), 80, 24);
         assert!(

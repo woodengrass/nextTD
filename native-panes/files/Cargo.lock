@@ -705,6 +705,7 @@ dependencies = [
  "rustix 1.1.6",
  "serde_json",
  "shlex 1.3.0",
+ "signal-hook",
  "tempfile",
  "unicase",
  "unicode-general-category",

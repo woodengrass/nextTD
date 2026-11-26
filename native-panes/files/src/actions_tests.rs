@@ -13,10 +13,10 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
 
 use crate::actions::{
-    EditorChoice, RestoredPath, cleanup_copied, copy_dir_noreplace, copy_file_noreplace, create,
-    create_private_dir, create_private_file, editor, expanduser, find_executable_in,
-    move_noreplace, parse_editor_choice, paste, remove, rename, rename_noreplace,
-    resolve_editor_argv_with, resolve_state_dir_from, restored_path_plan,
+    EditorChoice, RestoredPath, cleanup_copied, create, create_private_dir, create_private_file,
+    editor, expanduser, find_executable_in, move_noreplace, parse_editor_choice, paste, remove,
+    rename, rename_noreplace, resolve_editor_argv_with, resolve_state_dir_from, restored_path_plan,
+    staged_copy,
 };
 
 fn dir() -> Result<tempfile::TempDir, String> {
@@ -215,7 +215,7 @@ fn paste_copies_file_with_metadata() -> Result<(), String> {
     std::fs::create_dir(&dest_dir).map_err(|error| error.to_string())?;
     let source = source_dir.join("note.txt");
     write(&source, b"hello")?;
-    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640))
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o7640))
         .map_err(|error| error.to_string())?;
     let target = paste(&source, &dest_dir, false)?;
     if target != dest_dir.join("note.txt") {
@@ -224,12 +224,7 @@ fn paste_copies_file_with_metadata() -> Result<(), String> {
     if read(&target)? != b"hello" {
         return Err("pasted content differs".to_string());
     }
-    if mode_of(&target)? != 0o640 {
-        return Err(format!(
-            "pasted mode is {:o}, expected 640",
-            mode_of(&target)?
-        ));
-    }
+    assert_eq!(target.metadata().unwrap().mode() & 0o7777, 0o1640);
     if !source.exists() {
         return Err("copy removed the source".to_string());
     }
@@ -253,10 +248,11 @@ fn paste_copies_file_xattrs_and_times() -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     set_times(&source, 1_700_000_000, 1_700_000_123)?;
     let xattrs = try_set_xattr(&source, "user.tdnext-note", b"pinned")?;
+    let original = times_of(&source)?;
     let target = paste(&source, &dest_dir, false)?;
     // Times first: reading the copy for the content check below would
     // refresh its access time under relatime.
-    if times_of(&target)? != times_of(&source)? {
+    if times_of(&target)? != original {
         return Err("pasted times were not preserved".to_string());
     }
     if mode_of(&target)? != 0o640 {
@@ -292,15 +288,16 @@ fn paste_preserves_nested_tree_metadata_and_xattrs() -> Result<(), String> {
     let dir_xattrs = try_set_xattr(&nested, "user.tdnext-nested", b"nested")?;
     let parent = root.path().join("copy");
     std::fs::create_dir(&parent).map_err(|error| error.to_string())?;
+    let original = [times_of(&source)?, times_of(&nested)?, times_of(&inner)?];
     let copied = paste(&source, &parent, false)?;
     // Times before any read: reading a copy refreshes its access time
     // under relatime, and walking the source refreshes the source dirs.
     // The outermost directory keeps source mode/times too (deliberate
     // divergence recorded in `copy-root-metadata.adr.md`).
-    if times_of(&copied)? != times_of(&source)? {
+    if times_of(&copied)? != original[0] {
         return Err("copied root times were not preserved".to_string());
     }
-    if times_of(&copied.join("nested"))? != times_of(&nested)? {
+    if times_of(&copied.join("nested"))? != original[1] {
         return Err("nested dir times were not preserved".to_string());
     }
     let copied_nested = copied.join("nested");
@@ -311,7 +308,7 @@ fn paste_preserves_nested_tree_metadata_and_xattrs() -> Result<(), String> {
         return Err("nested dir mode was not preserved".to_string());
     }
     let copied_inner = copied_nested.join("b.txt");
-    if times_of(&copied_inner)? != times_of(&inner)? {
+    if times_of(&copied_inner)? != original[2] {
         return Err("nested file times were not preserved".to_string());
     }
     if read(&copied_inner)? != b"b" || mode_of(&copied_inner)? != 0o640 {
@@ -456,13 +453,23 @@ fn copied_tree_cleanup_removes_only_unchanged_entries() -> Result<(), String> {
     std::fs::create_dir(&nested).map_err(|error| error.to_string())?;
     write(&source.join("a"), b"copied")?;
     write(&nested.join("changed"), b"before")?;
+    for p in [&nested, &source] {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o555))
+            .map_err(|e| e.to_string())?;
+    }
     let target = root.path().join("target");
-    let copied = copy_dir_noreplace(&source, &target)?;
+    let copied = staged_copy(&source, &target, false)?;
     write(&nested.join("changed"), b"after change")?;
     assert!(cleanup_copied(&copied).is_err());
     assert!(!source.join("a").exists());
     assert_eq!(read(&nested.join("changed"))?, b"after change");
     assert_eq!(read(&target.join("nested/changed"))?, b"before");
+    assert_eq!(mode_of(&source)?, 0o555);
+    assert_eq!(mode_of(&nested)?, 0o555);
+    for path in [&source, &nested, &target, &target.join("nested")] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -474,7 +481,7 @@ fn copied_tree_cleanup_preserves_new_subtrees() -> Result<(), String> {
     let nested = source.join("nested");
     std::fs::create_dir(&nested).map_err(|error| error.to_string())?;
     write(&nested.join("copied"), b"copied")?;
-    let copied = copy_dir_noreplace(&source, &root.path().join("target"))?;
+    let copied = staged_copy(&source, &root.path().join("target"), false)?;
     let added = nested.join("new");
     std::fs::create_dir(&added).map_err(|error| error.to_string())?;
     write(&added.join("data"), b"new")?;
@@ -489,14 +496,14 @@ fn copied_entries_cleanup_handles_files_symlinks_and_unchanged_tree() -> Result<
     let root = dir()?;
     let source = root.path().join("source");
     write(&source, b"before")?;
-    let copied = copy_file_noreplace(&source, &root.path().join("file-copy"))?;
+    let copied = staged_copy(&source, &root.path().join("file-copy"), false)?;
     write(&source, b"changed")?;
     assert!(cleanup_copied(&copied).is_err());
     assert_eq!(read(&source)?, b"changed");
 
     let link = root.path().join("link");
     std::os::unix::fs::symlink("source", &link).map_err(|error| error.to_string())?;
-    let copied = copy_file_noreplace(&link, &root.path().join("link-copy"))?;
+    let copied = staged_copy(&link, &root.path().join("link-copy"), false)?;
     cleanup_copied(&copied)?;
     assert!(!link.is_symlink());
     assert_eq!(read(&source)?, b"changed");
@@ -505,7 +512,7 @@ fn copied_entries_cleanup_handles_files_symlinks_and_unchanged_tree() -> Result<
     std::fs::create_dir(&tree).map_err(|error| error.to_string())?;
     std::fs::create_dir(tree.join("nested")).map_err(|error| error.to_string())?;
     write(&tree.join("nested/file"), b"data")?;
-    let copied = copy_dir_noreplace(&tree, &root.path().join("tree-copy"))?;
+    let copied = staged_copy(&tree, &root.path().join("tree-copy"), false)?;
     cleanup_copied(&copied)?;
     assert!(!tree.exists());
     Ok(())
@@ -1101,17 +1108,17 @@ fn atomic_copy_rejects_existing_file_directory_and_symlink_destinations() -> Res
     write(&source, b"source")?;
     let rival = root.path().join("rival");
     write(&rival, b"keep")?;
-    assert!(copy_file_noreplace(&source, &rival).is_err());
+    assert!(staged_copy(&source, &rival, false).is_err());
     let link = root.path().join("link");
     std::os::unix::fs::symlink("rival", &link).map_err(|e| e.to_string())?;
-    assert!(copy_file_noreplace(&source, &link).is_err());
+    assert!(staged_copy(&source, &link, false).is_err());
     let source_tree = root.path().join("tree");
     std::fs::create_dir(&source_tree).map_err(|e| e.to_string())?;
     write(&source_tree.join("source"), b"tree")?;
     let rival_tree = root.path().join("existing-tree");
     std::fs::create_dir(&rival_tree).map_err(|e| e.to_string())?;
     write(&rival_tree.join("keep"), b"rival")?;
-    assert!(copy_dir_noreplace(&source_tree, &rival_tree).is_err());
+    assert!(staged_copy(&source_tree, &rival_tree, false).is_err());
     assert_eq!(read(&source)?, b"source");
     assert_eq!(read(&rival)?, b"keep");
     assert_eq!(
@@ -1120,5 +1127,549 @@ fn atomic_copy_rejects_existing_file_directory_and_symlink_destinations() -> Res
     );
     assert_eq!(read(&source_tree.join("source"))?, b"tree");
     assert_eq!(read(&rival_tree.join("keep"))?, b"rival");
+    Ok(())
+}
+
+#[test]
+fn copied_tree_drops_inherited_acls() -> Result<(), Box<dyn std::error::Error>> {
+    let root = dir()?;
+    let tree = root.path().join("src");
+    let dst = root.path().join("dst");
+    std::fs::create_dir(&tree)?;
+    std::fs::create_dir(&dst)?;
+    write(&tree.join("file"), b"data")?;
+    // Linux POSIX ACL xattr, granting an additional named user read access.
+    let mut acl = 2u32.to_le_bytes().to_vec();
+    for (tag, perm, id) in [
+        (1u16, 7u16, u32::MAX),
+        (2, 4, 65534),
+        (4, 0, u32::MAX),
+        (16, 4, u32::MAX),
+        (32, 0, u32::MAX),
+    ] {
+        acl.extend(tag.to_le_bytes());
+        acl.extend(perm.to_le_bytes());
+        acl.extend(id.to_le_bytes());
+    }
+    match std::process::Command::new("setfacl")
+        .args(["-m", "d:u:65534:r--"])
+        .arg(&dst)
+        .status()
+    {
+        Ok(status) => assert!(status.success()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => rustix::fs::setxattr(
+            &dst,
+            "system.posix_acl_default",
+            &acl,
+            rustix::fs::XattrFlags::empty(),
+        )?,
+        Err(e) => return Err(e.into()),
+    }
+    let result = paste(&tree, &dst, false)?;
+    for (path, attr) in [
+        (&result, "system.posix_acl_default"),
+        (&result, "system.posix_acl_access"),
+        (&result.join("file"), "system.posix_acl_access"),
+    ] {
+        assert_eq!(
+            rustix::fs::getxattr_query(path, attr),
+            Err(rustix::io::Errno::NODATA)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn copy_separates_linked_names_while_cross_device_move_preserves_them()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = dir()?;
+    let dst = tempfile::tempdir_in("/dev/shm")?;
+    let tree = root.path().join("src");
+    std::fs::create_dir(&tree)?;
+    write(&tree.join("a"), b"linked")?;
+    std::fs::hard_link(tree.join("a"), tree.join("b"))?;
+    let copy_dir = dir()?;
+    let copy = paste(&tree, copy_dir.path(), false)?;
+    write(&copy.join("a"), b"edited")?;
+    assert_eq!(read(&copy.join("b"))?, b"linked");
+    let target = paste(&tree, dst.path(), true)?;
+    assert!(!tree.exists());
+    assert_eq!(read(&target.join("b"))?, b"linked");
+    assert_eq!(
+        target.join("a").metadata()?.ino(),
+        target.join("b").metadata()?.ino()
+    );
+    Ok(())
+}
+
+#[test]
+fn nested_bind_mount_blocks_all_unlinks() -> Result<(), Box<dyn std::error::Error>> {
+    // Probe the live namespace read-only; never run deletion against /proc.
+    let proc = Path::new("/proc");
+    let root = std::fs::File::open("/")?;
+    use std::os::fd::AsRawFd;
+    let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", root.as_raw_fd()))?;
+    let kernel_id: u64 = fdinfo
+        .lines()
+        .find_map(|l| l.strip_prefix("mnt_id:"))
+        .unwrap()
+        .trim()
+        .parse()?;
+    assert_eq!(crate::actions::mount(&root)?.1, kernel_id);
+    assert_ne!(
+        crate::actions::mount(&root)?.1,
+        crate::actions::mount(&std::fs::File::open(proc)?)?.1
+    );
+    assert!(
+        crate::actions::checked_dir(&root, proc, crate::actions::identity(proc)?)
+            .unwrap_err()
+            .contains("mount point: /proc")
+    );
+    let tmp = dir()?;
+    let tree = tmp.path().join("tree");
+    let nested = tree.join("nested/bind");
+    std::fs::create_dir_all(&nested)?;
+    write(&nested.join("inside"), b"mounted")?;
+    write(&tree.join("beside"), b"outside")?;
+    let m = nested.metadata()?;
+    crate::actions::BIND_ROOT.set(Some((m.dev(), m.ino())));
+    crate::actions::BEFORE_CLAIM.set(Some(Box::new(|_| {
+        panic!("mount preflight must finish before any claim")
+    })));
+    let error = remove(&tree).unwrap_err();
+    assert_eq!(
+        error,
+        format!("Cannot remove mount point: {}", nested.display())
+    );
+    assert_eq!(read(&tree.join("beside"))?, b"outside");
+    assert_eq!(read(&nested.join("inside"))?, b"mounted");
+    let m = nested.join("inside").metadata()?;
+    crate::actions::BIND_ROOT.set(Some((m.dev(), m.ino())));
+    assert!(
+        remove(&tree)
+            .unwrap_err()
+            .contains(nested.join("inside").to_str().unwrap())
+    );
+    assert_eq!(read(&tree.join("beside"))?, b"outside");
+    Ok(())
+}
+
+#[test]
+fn late_rival_and_foreign_staging_entry_survive_failed_commit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = tempfile::tempdir_in("/dev/shm")?;
+    let tree = src.path().join("tree");
+    std::fs::create_dir(&tree)?;
+    write(&tree.join("payload"), b"old")?;
+    let target = dst.path().join("tree");
+    let rival = target.clone();
+    crate::actions::stash_between_note(&target, move || {
+        let stage = std::fs::read_dir(rival.parent().unwrap())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::create_dir(&rival).unwrap();
+        std::fs::write(rival.join("keep"), b"rival").unwrap();
+        std::fs::write(stage.join("tree/foreign"), b"foreign").unwrap();
+    });
+    let err = paste(&tree, dst.path(), true).unwrap_err();
+    assert!(err.contains("Staging remains"), "{err}");
+    assert_eq!(read(&tree.join("payload"))?, b"old");
+    assert_eq!(read(&target.join("keep"))?, b"rival");
+    let stage = std::fs::read_dir(dst.path())?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .find(|e| e.path() != target)
+        .unwrap()
+        .path();
+    assert!(err.contains(stage.to_str().unwrap()));
+    assert_eq!(read(&stage.join("tree/foreign"))?, b"foreign");
+    assert!(!stage.join("tree/payload").exists());
+    Ok(())
+}
+
+#[test]
+fn copy_accepts_destination_timestamp_rounding() -> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = dir()?;
+    let file = src.path().join("file");
+    write(&file, b"content")?;
+    set_times(&file, 1700000001, 1700000001)?;
+    // Emulate the precision of the timestamp actually stored by futimens,
+    // before recording the fd snapshot (not a subsequent external edit).
+    crate::actions::AFTER_FILE_METADATA.set(Some(Box::new(|p| {
+        set_times(p, 1700000000, 1700000000).unwrap()
+    })));
+    let copy = paste(&file, dst.path(), false)?;
+    assert_eq!(copy.metadata()?.mtime(), 1700000000);
+    assert_eq!(read(&copy)?, b"content");
+    Ok(())
+}
+
+#[test]
+fn moved_source_survives_replacement_of_published_path() -> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = tempfile::tempdir_in("/dev/shm")?;
+    let file = src.path().join("a");
+    write(&file, b"original")?;
+    let target = dst.path().join("a");
+    let path = target.clone();
+    crate::actions::stash_between_note(&file, move || {
+        std::fs::rename(&path, path.with_file_name("published")).unwrap();
+        std::fs::write(path, b"replacement").unwrap();
+    });
+    assert!(paste(&file, dst.path(), true).is_err());
+    assert_eq!(read(&file)?, b"original");
+    assert_eq!(read(&target)?, b"replacement");
+    Ok(())
+}
+#[test]
+fn staging_replacement_is_not_owned_by_copy() -> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = dir()?;
+    let file = src.path().join("a");
+    write(&file, b"original")?;
+    crate::actions::BEFORE_RECORD.set(Some(Box::new(|p| {
+        std::fs::remove_file(p).unwrap();
+        std::fs::write(p, b"replacement").unwrap();
+    })));
+    let err = paste(&file, dst.path(), false).unwrap_err();
+    assert!(err.contains("Staging remains"), "{err}");
+    let stage = std::fs::read_dir(dst.path())?.next().unwrap()?.path();
+    assert_eq!(read(&stage.join("a"))?, b"replacement");
+    Ok(())
+}
+#[test]
+fn confirmed_unlink_restores_rival_claimed_after_check() -> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let file = src.path().join("a");
+    write(&file, b"original")?;
+    crate::actions::BEFORE_CLAIM.set(Some(Box::new(|p| {
+        std::fs::remove_file(p).unwrap();
+        std::fs::write(p, b"replacement").unwrap();
+    })));
+    assert!(remove(&file).is_err());
+    assert_eq!(read(&file)?, b"replacement");
+    Ok(())
+}
+#[test]
+fn late_regular_file_wins_publish_race() -> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = dir()?;
+    let file = src.path().join("a");
+    write(&file, b"original")?;
+    let target = dst.path().join("a");
+    let rival = target.clone();
+    crate::actions::stash_between_note(&target, move || std::fs::write(rival, b"rival").unwrap());
+    assert!(paste(&file, dst.path(), false).is_err());
+    assert_eq!(read(&target)?, b"rival");
+    Ok(())
+}
+#[test]
+fn setgid_destination_does_not_gain_source_group_permissions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = dir()?;
+    let file = src.path().join("a");
+    write(&file, b"private")?;
+    let gid = file.metadata()?.gid();
+    let groups = std::process::Command::new("id").arg("-G").output()?;
+    if let Some(other) = std::str::from_utf8(&groups.stdout)?
+        .split_whitespace()
+        .flat_map(str::parse::<u32>)
+        .find(|g| *g != gid)
+    {
+        std::os::unix::fs::chown(dst.path(), None, Some(other))?;
+        std::fs::set_permissions(dst.path(), std::fs::Permissions::from_mode(0o2770))?;
+        let copy = paste(&file, dst.path(), false)?;
+        assert_eq!(copy.metadata()?.gid(), gid);
+    }
+    // An unassignable source group exercises the other branch even when
+    // the test runner belongs to only one group. Root may assign the GID.
+    let group = 123454321;
+    crate::actions::TEST_SOURCE_GROUP.set(Some(group));
+    let restricted = src.path().join("restricted");
+    write(&restricted, b"data")?;
+    std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o604))?;
+    let restricted = paste(&restricted, dst.path(), false)?;
+    if restricted.metadata()?.gid() != group {
+        assert_eq!(mode_of(&restricted)?, 0o600);
+    }
+    let folder = src.path().join("folder");
+    std::fs::create_dir(&folder)?;
+    let mut acl = 2u32.to_le_bytes().to_vec();
+    for (tag, id) in [
+        (1u16, u32::MAX),
+        (4, u32::MAX),
+        (8, 65534),
+        (16, u32::MAX),
+        (32, u32::MAX),
+    ] {
+        acl.extend(tag.to_le_bytes());
+        acl.extend(
+            match tag {
+                1 | 16 => 7u16,
+                32 => 4,
+                _ => 5,
+            }
+            .to_le_bytes(),
+        );
+        acl.extend(id.to_le_bytes());
+    }
+    for key in ["system.posix_acl_access", "system.posix_acl_default"] {
+        rustix::fs::setxattr(&folder, key, &acl, rustix::fs::XattrFlags::empty())?;
+    }
+    let copy = paste(&folder, dst.path(), false)?;
+    crate::actions::TEST_SOURCE_GROUP.set(None);
+    if copy.metadata()?.gid() != group {
+        assert_eq!(copy.metadata()?.mode() & 0o077, 0o44);
+        for key in ["system.posix_acl_access", "system.posix_acl_default"] {
+            let stored = get_xattr(&copy, key)?;
+            for record in stored[4..].chunks_exact(8) {
+                if matches!(u16::from_le_bytes([record[0], record[1]]), 4 | 8 | 16 | 32) {
+                    assert_eq!(&record[2..4], &[4, 0]);
+                }
+            }
+        }
+    }
+    // The inherited owning GID has an explicit denial in the source ACL.
+    let contractor = dst.path().metadata()?.gid();
+    let denied = src.path().join("denied");
+    std::fs::create_dir(&denied)?;
+    let rules = format!("g::r--,g:{contractor}:---,m::r--,o::r--");
+    for default in [false, true] {
+        let mut cmd = std::process::Command::new("setfacl");
+        if default {
+            cmd.arg("-d");
+        }
+        match cmd.args(["-m", &rules]).arg(&denied).status() {
+            Ok(status) => assert!(status.success()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut denied_acl = acl.clone();
+                for record in denied_acl[4..].chunks_exact_mut(8) {
+                    let tag = u16::from_le_bytes([record[0], record[1]]);
+                    record[2] = match tag {
+                        1 => 7,
+                        8 => 0,
+                        _ => 4,
+                    };
+                    if tag == 8 {
+                        record[4..].copy_from_slice(&contractor.to_le_bytes());
+                    }
+                }
+                let name = if default {
+                    "system.posix_acl_default"
+                } else {
+                    "system.posix_acl_access"
+                };
+                rustix::fs::setxattr(&denied, name, &denied_acl, rustix::fs::XattrFlags::empty())?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    crate::actions::TEST_SOURCE_GROUP.set(Some(group));
+    let copy = paste(&denied, dst.path(), false)?;
+    crate::actions::TEST_SOURCE_GROUP.set(None);
+    if copy.metadata()?.gid() != group {
+        assert_eq!(copy.metadata()?.gid(), contractor);
+        for name in ["system.posix_acl_access", "system.posix_acl_default"] {
+            let stored = get_xattr(&copy, name)?;
+            for record in stored[4..].chunks_exact(8) {
+                if matches!(u16::from_le_bytes([record[0], record[1]]), 4 | 8 | 16 | 32) {
+                    assert_eq!(record[2], 0, "{name}: named group denied read");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn delete_in_unwritable_parent_keeps_all_contents() -> Result<(), Box<dyn std::error::Error>> {
+    let root = dir()?;
+    let work = root.path().join("work");
+    std::fs::create_dir(&work)?;
+    std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o755))?;
+    for name in ["a", "b"] {
+        write(&work.join(name), name.as_bytes())?;
+    }
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o555))?;
+    // A privileged runner can legitimately remove the directory despite 0555.
+    let writable = rustix::fs::accessat(
+        rustix::fs::CWD,
+        root.path(),
+        rustix::fs::Access::WRITE_OK,
+        rustix::fs::AtFlags::EACCESS,
+    )
+    .is_ok();
+    let result = remove(&work);
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755))?;
+    if writable {
+        result?;
+        assert!(!work.exists());
+        return Ok(());
+    }
+    assert!(result.is_err());
+    for name in ["a", "b"] {
+        assert_eq!(read(&work.join(name))?, name.as_bytes());
+    }
+    Ok(())
+}
+
+fn transfer_read_only_tree(moving: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = if moving {
+        tempfile::tempdir_in("/dev/shm")?
+    } else {
+        dir()?
+    };
+    let tree = src.path().join("readonly");
+    let nested = tree.join("nested");
+    std::fs::create_dir_all(&nested)?;
+    write(&nested.join("file"), b"payload")?;
+    if moving {
+        assert_ne!(tree.metadata()?.dev(), dst.path().metadata()?.dev());
+    }
+    for (path, stamp) in [(&tree, 1600000010), (&nested, 1600000020)] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555))?;
+        set_times(path, stamp, stamp + 1)?;
+    }
+    let target = paste(&tree, dst.path(), moving)?;
+    for (path, stamp) in [(&target, 1600000010), (&target.join("nested"), 1600000020)] {
+        assert_eq!(mode_of(path)?, 0o555);
+        assert_eq!(times_of(path)?, (stamp, 0, stamp + 1, 0));
+    }
+    assert_eq!(read(&target.join("nested/file"))?, b"payload");
+    assert_eq!(tree.exists(), !moving);
+    for root in [target, tree].into_iter().filter(|root| root.exists()) {
+        for path in [root.clone(), root.join("nested")] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn copy_read_only_tree() -> Result<(), Box<dyn std::error::Error>> {
+    transfer_read_only_tree(false)
+}
+
+#[test]
+fn move_read_only_tree_across_devices() -> Result<(), Box<dyn std::error::Error>> {
+    transfer_read_only_tree(true)
+}
+
+#[test]
+fn interrupted_delete_keeps_remaining_children_visible() -> Result<(), Box<dyn std::error::Error>> {
+    let tmp = dir()?;
+    let tree = tmp.path().join("tree");
+    std::fs::create_dir(&tree)?;
+    for n in ["a", "b"] {
+        write(&tree.join(n), b"keep")?;
+    }
+    crate::actions::AFTER_UNLINK.set(Some(Box::new(|_| panic!("interrupt after first unlink"))));
+    assert!(std::panic::catch_unwind(|| remove(&tree)).is_err());
+    assert_eq!(std::fs::read_dir(&tree)?.count(), 1);
+    Ok(())
+}
+#[test]
+fn missing_published_child_preserves_its_source_only() -> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = tempfile::tempdir_in("/dev/shm")?;
+    let tree = src.path().join("tree");
+    std::fs::create_dir(&tree)?;
+    for n in ["a", "b"] {
+        write(&tree.join(n), b"original")?;
+    }
+    let missing = dst.path().join("tree/a");
+    crate::actions::stash_between_note(&tree, move || std::fs::remove_file(missing).unwrap());
+    let err = paste(&tree, dst.path(), true).unwrap_err();
+    assert!(err.contains("Partial move"));
+    assert_eq!(read(&tree.join("a"))?, b"original");
+    assert!(!tree.join("b").exists());
+    Ok(())
+}
+fn replaced_stage_entry(directory: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = dir()?;
+    let item = src.path().join("item");
+    if directory {
+        std::fs::create_dir(&item)?;
+    } else {
+        std::os::unix::fs::symlink("original", &item)?;
+    }
+    crate::actions::BEFORE_RECORD.set(Some(Box::new(move |p| {
+        std::fs::rename(p, p.with_file_name("displaced")).unwrap();
+        if directory {
+            std::fs::create_dir(p).unwrap();
+        } else {
+            std::os::unix::fs::symlink("replaced", p).unwrap();
+        }
+    })));
+    let err = paste(&item, dst.path(), false).unwrap_err();
+    assert!(err.contains("Staging remains"), "{err}");
+    assert!(!dst.path().join("item").exists());
+    let stage = std::fs::read_dir(dst.path())?.next().unwrap()?.path();
+    if directory {
+        assert!(stage.join("item").is_dir());
+    } else {
+        assert_eq!(
+            std::fs::read_link(stage.join("item"))?,
+            Path::new("replaced")
+        );
+    }
+    Ok(())
+}
+#[test]
+fn staged_directory_replacement_survives_rollback() -> Result<(), Box<dyn std::error::Error>> {
+    replaced_stage_entry(true)
+}
+#[test]
+fn staged_symlink_replacement_survives_rollback() -> Result<(), Box<dyn std::error::Error>> {
+    replaced_stage_entry(false)
+}
+#[test]
+fn same_length_staged_edit_is_not_published() -> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = dir()?;
+    let item = src.path().join("file");
+    write(&item, b"good")?;
+    set_times(&item, 1700000000, 1700000000)?;
+    let parent = dst.path().to_owned();
+    crate::actions::stash_between_note(&parent.join("file"), move || {
+        let stage = std::fs::read_dir(parent)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(stage.join("file"), b"evil").unwrap();
+    });
+    let err = paste(&item, dst.path(), false).unwrap_err();
+    assert!(err.contains("Staging remains"), "{err}");
+    let stage = std::fs::read_dir(dst.path())?.next().unwrap()?.path();
+    assert_eq!(read(&stage.join("file"))?, b"evil");
+    assert!(!dst.path().join("file").exists());
+    Ok(())
+}
+
+#[test]
+fn published_same_length_edit_keeps_move_source() -> Result<(), Box<dyn std::error::Error>> {
+    let src = dir()?;
+    let dst = tempfile::tempdir_in("/dev/shm")?;
+    let file = src.path().join("file");
+    write(&file, b"good")?;
+    set_times(&file, 1700000000, 1700000000)?;
+    let visible = dst.path().join("file");
+    crate::actions::stash_between_note(&file, move || std::fs::write(visible, b"edit").unwrap());
+    assert!(
+        paste(&file, dst.path(), true)
+            .unwrap_err()
+            .contains("Partial move")
+    );
+    assert_eq!(read(&file)?, b"good");
     Ok(())
 }
