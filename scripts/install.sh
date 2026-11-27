@@ -11,8 +11,9 @@
 # published checksum only guards against a corrupted download, not against a
 # tampered release; the script says so.
 #
-# Writes only under DEST (default ${XDG_DATA_HOME:-~/.local/share}/tdnext;
-# earlier releases are kept) and one `tdnext` symlink in BIN_DIR (default
+# Writes only under DEST (default ~/.local/opt/tdnext; earlier releases are
+# kept; deliberately not the settings directory ~/.local/share/tdnext, so
+# removing DEST never removes settings) and one `tdnext` symlink in BIN_DIR (default
 # ~/.local/bin). An existing BIN_DIR/tdnext that is not this installation's
 # symlink is never replaced. No root, no Python, no settings or sessions are
 # touched. Needs bash, curl, tar, gzip, coreutils, findutils, diffutils, awk.
@@ -34,7 +35,7 @@ usage() {
 usage: install.sh [--version vX.Y.Z] [--dest DIR] [--bin-dir DIR] [--base-url URL]
 
   --version TAG    release tag to install (default: the latest release)
-  --dest DIR       installation root (default: ${XDG_DATA_HOME:-~/.local/share}/tdnext)
+  --dest DIR       installation root (default: ~/.local/opt/tdnext)
   --bin-dir DIR    where the `tdnext` command link goes (default: ~/.local/bin)
   --base-url URL   download the release assets from URL instead of GitHub
                    (for mirrors and offline copies; file:// works)
@@ -46,7 +47,7 @@ EOF
 # running anything.
 main() {
   VERSION="latest"
-  DEST="${XDG_DATA_HOME:-$HOME/.local/share}/tdnext"
+  DEST="$HOME/.local/opt/tdnext"
   BIN_DIR="$HOME/.local/bin"
   BASE_URL=""
 
@@ -127,6 +128,7 @@ Next steps:
   tdnext desktop .
 The Monitor view needs btop, installed separately.
 To uninstall: rm -- "$LINK" && rm -rf -- "$DEST"
+(settings stay in the state directory, ~/.local/share/tdnext by default)
 EOF
 }
 
