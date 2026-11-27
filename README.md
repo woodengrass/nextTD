@@ -12,12 +12,42 @@ a compatibility probe, not a build-identity check; stock Zellij is not used.
 
 ## Requirements
 
-- Linux x86-64 (the first officially supported platform)
+- Linux x86-64 (the first officially supported platform). The release
+  executables are statically linked, so any distribution works regardless
+  of its glibc or OpenSSL version.
 - A terminal; a Nerd Font only if you select Codicons (see Icons below)
 
 The project does not require root access or modify existing user settings or
 terminal sessions. External tools are installed separately; tool-managed
 downloads require your confirmation before anything is installed.
+
+## Installing
+
+Install the latest release for the current user (no root, no Python):
+
+```sh
+curl -fsSL https://github.com/woodengrass/nextTD/releases/latest/download/install.sh | bash
+```
+
+This puts the programs in `~/.local/opt/tdnext` and links `tdnext` into
+`~/.local/bin`; running it again updates to the latest release and keeps
+the previous ones. Pass options after `bash -s --`, for example
+`bash -s -- --version v0.1.0`; `--help` lists `--dest` and `--bin-dir`. The
+installer needs `bash`, `curl`, `tar`, `gzip` and the standard GNU
+coreutils, findutils, diffutils and awk.
+
+Each release is built and attested by this repository's release workflow.
+When the [GitHub CLI](https://cli.github.com/) is logged in, the installer
+checks that attestation and refuses a release without one; otherwise it
+only checks the published checksum, which detects a corrupted download but
+not a tampered release. To check a downloaded archive yourself:
+
+```sh
+gh attestation verify tdnext-linux-x86_64.tar.gz --repo woodengrass/nextTD
+```
+
+To uninstall, remove `~/.local/bin/tdnext` and `~/.local/opt/tdnext`. Your
+settings stay in the state directory (`~/.local/share/tdnext` by default).
 
 ## Staging a distribution
 
@@ -25,9 +55,12 @@ downloads require your confirmation before anything is installed.
 make dist DIST=/path/to/dist ZELLIJ_SRC=/path/to/pinned-zellij
 ```
 
-`DIST` must be a new directory. Building requires Rust 1.95, a C compiler,
-`pkg-config`, OpenSSL development headers and a local `ZELLIJ_SRC` checkout
-at the pinned commit. Move the resulting directory as a unit; it needs
+`DIST` must be a new directory. Building requires Rust 1.95 with the
+`x86_64-unknown-linux-musl` target (rustup installs it from
+`rust-toolchain.toml`), a C compiler, `musl-gcc` (Ubuntu/Debian:
+`musl-tools`), `perl`, `make`, `pkg-config` and a local `ZELLIJ_SRC`
+checkout at the pinned commit. `make check` also needs OpenSSL development
+headers for the core's host test suites. Move the resulting directory as a unit; it needs
 neither the source tree nor those build tools to run.
 
 ## Installing a verified distribution (operator-local)
