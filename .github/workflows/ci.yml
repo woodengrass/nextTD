@@ -5,7 +5,9 @@
 # runs the project check entry `make check` exactly once, which owns all
 # build, test, lint, probe, stage, archive, and archive-verification logic
 # (including the golden desktop suite via the archive gate). No other step
-# builds, archives, or re-verifies: `make check` is the single gate.
+# builds, archives, or re-verifies: `make check` is the single gate. Its
+# exported archive plus the two install scripts are then installed on clean
+# distributions by install-test.yml, exactly as a release would publish them.
 # The immutable-refs job refuses any alteration or deletion of frozen
 # baselines (see frozen-release-verification.adr.md). Tagged releases reuse
 # the tested archive in release-smoke.yml and never rebuild.
@@ -50,14 +52,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            attr btop build-essential libssl-dev neovim pkg-config tmux vim
+            attr btop build-essential libssl-dev musl-tools neovim pkg-config tmux vim
 
       - name: Install the toolchain from rust-toolchain.toml
         working-directory: ${{ github.workspace }}
         run: |
           channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
           test -n "${channel}"
-          rustup toolchain install --profile minimal --component rustfmt,clippy
+          rustup toolchain install --profile minimal --component rustfmt,clippy --target x86_64-unknown-linux-musl
           case "$(rustc --version)" in
             "rustc ${channel}."*) ;;
             *) echo "error: expected rustc ${channel}.x, got: $(rustc --version)" >&2; exit 1 ;;
@@ -88,9 +90,23 @@ jobs:
           test "$(git -C zellij-ci rev-parse HEAD)" = "${pin}"
           echo "ZELLIJ_SRC=${RUNNER_TEMP}/zellij-ci" >> "${GITHUB_ENV}"
 
-      - name: Run the project check entry point
+      - name: Run the project check entry point (exports the tested archive)
         working-directory: ${{ github.workspace }}
-        run: make check
+        run: make check ARCHIVE_OUT="${RUNNER_TEMP}/dist/tdnext-linux-x86_64.tar.gz"
+
+      - name: Add the install scripts a release publishes
+        working-directory: ${{ github.workspace }}
+        run: install -m 0755 scripts/install.sh scripts/install-verified-dist.sh "${RUNNER_TEMP}/dist/"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verified-dist
+          if-no-files-found: error
+          path: ${{ runner.temp }}/dist/
+
+  install-test:
+    needs: ci
+    uses: ./.github/workflows/install-test.yml
 
   immutable-refs:
     name: immutable-refs
@@ -192,11 +208,12 @@ jobs:
     name: ci-required
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    needs: [ci, immutable-refs]
+    needs: [ci, install-test, immutable-refs]
     if: always()
     steps:
       - name: Check the required results
         working-directory: ${{ github.workspace }}
         run: |
           test "${{ needs.ci.result }}" = "success"
+          test "${{ needs.install-test.result }}" = "success"
           test "${{ needs.immutable-refs.result }}" = "success"
