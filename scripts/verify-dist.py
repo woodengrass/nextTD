@@ -175,17 +175,20 @@ def elf_interpreter(path: Path) -> str | None:
         data = path.read_bytes()
     except OSError as exc:
         fail(step, f'cannot read {path.name}: {exc}')
-    if data[:4] != b'\x7fELF' or data[4] != 2 or data[5] != 1:
+    if data[:4] != b'\x7fELF' or data[4:6] != b'\x02\x01':
         fail(step, f'{path.name} is not an ELF64 little-endian executable')
-    phoff, = struct.unpack_from('<Q', data, 0x20)
-    phentsize, phnum = struct.unpack_from('<HH', data, 0x36)
-    for index in range(phnum):
-        header = phoff + index * phentsize
-        p_type, = struct.unpack_from('<I', data, header)
-        if p_type == 3:  # PT_INTERP
-            offset, = struct.unpack_from('<Q', data, header + 8)
-            size, = struct.unpack_from('<Q', data, header + 32)
-            return data[offset:offset + size].rstrip(b'\0').decode(errors='replace')
+    try:
+        phoff, = struct.unpack_from('<Q', data, 0x20)
+        phentsize, phnum = struct.unpack_from('<HH', data, 0x36)
+        for index in range(phnum):
+            header = phoff + index * phentsize
+            p_type, = struct.unpack_from('<I', data, header)
+            if p_type == 3:  # PT_INTERP
+                offset, = struct.unpack_from('<Q', data, header + 8)
+                size, = struct.unpack_from('<Q', data, header + 32)
+                return data[offset:offset + size].rstrip(b'\0').decode(errors='replace')
+    except struct.error:
+        fail(step, f'{path.name} has a truncated ELF header')
     return None
 
 

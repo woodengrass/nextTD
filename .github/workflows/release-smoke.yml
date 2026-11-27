@@ -136,7 +136,7 @@ jobs:
       - name: Check the downloaded bytes against the verified digest
         working-directory: assets
         run: |
-          test "$(ls | sort | tr '\n' ' ')" = "install-verified-dist.sh install.sh tdnext-linux-x86_64.tar.gz tdnext-linux-x86_64.tar.gz.sha256 "
+          test "$(ls | LC_ALL=C sort | tr '\n' ' ')" = "install-verified-dist.sh install.sh tdnext-linux-x86_64.tar.gz tdnext-linux-x86_64.tar.gz.sha256 "
           sha256sum tdnext-linux-x86_64.tar.gz | cmp - tdnext-linux-x86_64.tar.gz.sha256
 
       - name: Attest build provenance for the published files

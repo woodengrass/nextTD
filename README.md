@@ -26,13 +26,13 @@ downloads require your confirmation before anything is installed.
 Install the latest release for the current user (no root, no Python):
 
 ```sh
-curl -fsSL https://github.com/woodengrass/nextTD/releases/latest/download/install.sh | bash
+curl -fsSLO https://github.com/woodengrass/nextTD/releases/latest/download/install.sh && bash install.sh
 ```
 
 This puts the programs in `~/.local/opt/tdnext` and links `tdnext` into
 `~/.local/bin`; running it again updates to the latest release and keeps
-the previous ones. Pass options after `bash -s --`, for example
-`bash -s -- --version v0.1.0`; `--help` lists `--dest` and `--bin-dir`. The
+the previous ones. Pass options to `install.sh`, for example
+`bash install.sh --version v0.1.0`; `--help` lists `--dest` and `--bin-dir`. The
 installer needs `bash`, `curl`, `tar`, `gzip` and the standard GNU
 coreutils, findutils, diffutils and awk.
 

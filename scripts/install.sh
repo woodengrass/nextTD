@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install or update Terminal Desktop Next for the current user.
 #
-#   curl -fsSL https://github.com/woodengrass/nextTD/releases/latest/download/install.sh | bash
+#   curl -fsSLO https://github.com/woodengrass/nextTD/releases/latest/download/install.sh && bash install.sh
 #   bash install.sh [--version vX.Y.Z] [--dest DIR] [--bin-dir DIR] [--base-url URL]
 #
 # Downloads one release (the archive, its .sha256 and install-verified-dist.sh
@@ -12,9 +12,10 @@
 # tampered release; the script says so.
 #
 # Writes only under DEST (default ~/.local/opt/tdnext; earlier releases are
-# kept; deliberately not the settings directory ~/.local/share/tdnext, so
-# removing DEST never removes settings) and one `tdnext` symlink in BIN_DIR (default
-# ~/.local/bin). An existing BIN_DIR/tdnext that is not this installation's
+# kept) and one `tdnext` symlink in BIN_DIR (default ~/.local/bin). DEST may
+# not overlap the settings directory (TDNEXT_STATE_DIR, else
+# ${XDG_DATA_HOME:-~/.local/share}/tdnext), so removing DEST never removes
+# settings. An existing BIN_DIR/tdnext that is not this installation's
 # symlink is never replaced. No root, no Python, no settings or sessions are
 # touched. Needs bash, curl, tar, gzip, coreutils, findutils, diffutils, awk.
 set -euo pipefail
@@ -43,31 +44,56 @@ usage: install.sh [--version vX.Y.Z] [--dest DIR] [--bin-dir DIR] [--base-url UR
 EOF
 }
 
-# The whole script is one function so `curl | bash` parses all of it before
-# running anything.
+need_arg() {
+  (($# >= 2)) && [[ -n "$2" ]] || fail "$1 needs a value (see --help)"
+}
+
+# Settings directory as native-manager/src/state_dir.rs resolves it for an
+# installed binary.
+state_dir() {
+  local dir
+  if [[ -n "${TDNEXT_STATE_DIR:-}" ]]; then
+    dir="$TDNEXT_STATE_DIR"
+    # shellcheck disable=SC2088 # matching a literal leading ~ on purpose
+    [[ "$dir" = "~" || "$dir" = "~/"* ]] && dir="$HOME${dir:1}"
+  elif [[ "${XDG_DATA_HOME:-}" = /* ]]; then
+    dir="$XDG_DATA_HOME/tdnext"
+  else
+    dir="$HOME/.local/share/tdnext"
+  fi
+  realpath -m -- "$dir"
+}
+
+# The whole script is one function so a piped or partly downloaded script
+# never runs a prefix of itself.
 main() {
   VERSION="latest"
-  DEST="$HOME/.local/opt/tdnext"
-  BIN_DIR="$HOME/.local/bin"
+  DEST=""
+  BIN_DIR=""
   BASE_URL=""
 
   while (($# > 0)); do
     case "$1" in
-      --version) VERSION="${2:-}"; shift 2 ;;
-      --dest) DEST="${2:-}"; shift 2 ;;
-      --bin-dir) BIN_DIR="${2:-}"; shift 2 ;;
-      --base-url) BASE_URL="${2:-}"; shift 2 ;;
+      --version) need_arg "$@"; VERSION="$2"; shift 2 ;;
+      --dest) need_arg "$@"; DEST="$2"; shift 2 ;;
+      --bin-dir) need_arg "$@"; BIN_DIR="$2"; shift 2 ;;
+      --base-url) need_arg "$@"; BASE_URL="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) fail "unknown argument: $1 (see --help)" ;;
     esac
   done
 
-  test -n "$VERSION" || fail "--version needs a release tag"
-  test -n "$DEST" || fail "--dest needs a directory"
-  test -n "$BIN_DIR" || fail "--bin-dir needs a directory"
+  [[ -n "${HOME:-}" ]] || fail "HOME is not set"
+  DEST="${DEST:-$HOME/.local/opt/tdnext}"
+  BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
+  STATE="$(state_dir)"
+  DEST_ABS="$(realpath -m -- "$DEST")"
+  if [[ "$DEST_ABS" = "$STATE" || "$DEST_ABS/" = "$STATE/"* || "$STATE/" = "$DEST_ABS/"* ]]; then
+    fail "--dest $DEST_ABS overlaps the settings directory $STATE; choose another --dest"
+  fi
   [[ "$(uname -s)" = Linux && "$(uname -m)" = x86_64 ]] \
     || fail "only Linux x86-64 is supported (this is $(uname -s) $(uname -m))"
-  for tool in curl tar gzip sha256sum find cmp awk; do
+  for tool in curl tar gzip sha256sum find cmp awk realpath; do
     command -v "$tool" >/dev/null 2>&1 || fail "required tool '$tool' not found on PATH"
   done
 
@@ -89,14 +115,15 @@ main() {
       || fail "download failed: $BASE_URL/$name"
   done
 
-  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+  if command -v gh >/dev/null 2>&1 && gh attestation verify --help >/dev/null 2>&1 \
+    && gh auth status >/dev/null 2>&1; then
     for name in "$ASSET" "$ACTIVATOR"; do
       gh attestation verify "$WORK/$name" --repo "$REPO" --signer-workflow "$SIGNER_WORKFLOW" >/dev/null \
         || fail "$name has no valid build attestation from $SIGNER_WORKFLOW; nothing installed"
     done
     echo "$PROG: build attestation verified: built and published by $SIGNER_WORKFLOW."
   else
-    echo "$PROG: note: GitHub CLI not logged in; skipping the build attestation check." >&2
+    echo "$PROG: note: no logged-in GitHub CLI with 'gh attestation'; skipping the build attestation check." >&2
     echo "$PROG: note: the checksum below only detects a corrupted download. To check the" >&2
     echo "$PROG: note: release's origin, run: gh attestation verify $ASSET --repo $REPO" >&2
   fi
