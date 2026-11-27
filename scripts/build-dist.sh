@@ -12,6 +12,10 @@
 #   Standalone `make dist` leaves it unset and builds the core from scratch.
 #   The staged binary must report native chrome version 1 either way.
 #
+# Every staged executable is built for the static musl target, so the
+# distribution runs on any Linux x86-64 system regardless of its glibc or
+# OpenSSL version (scripts/verify-dist.py rejects dynamic executables).
+#
 # There is no default destination: DIST must always be given explicitly, and
 # it must not exist yet (mkdir is the atomic no-overwrite claim; only the
 # directory this script created is ever removed). All paths are quoted and
@@ -23,6 +27,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 dist="${1:-}"
 zellij="${2:-${TDNEXT_ZELLIJ_SRC:-}}"
 unset CARGO_TARGET_DIR
+target="x86_64-unknown-linux-musl"
 if [[ -z "$dist" || -z "$zellij" ]]; then
   echo 'usage: make dist DIST=<new-directory> ZELLIJ_SRC=<pinned-zellij-checkout>' >&2
   exit 2
@@ -39,7 +44,7 @@ for crate in native-manager native-panes/settings native-desktop native-panes/fi
   }
 done
 for crate in native-manager native-panes/settings native-desktop native-panes/files; do
-  cargo build --locked --release --manifest-path "$root/$crate/Cargo.toml"
+  cargo build --locked --release --target "$target" --manifest-path "$root/$crate/Cargo.toml"
 done
 
 # mkdir is the atomic no-overwrite claim; only remove the directory we created.
@@ -49,10 +54,10 @@ cleanup() {
   if [[ "$complete" = 0 ]]; then rm -rf -- "$dist"; fi
 }
 trap cleanup EXIT
-install -m 0755 -- "$root/native-manager/target/release/tdnext" "$dist/tdnext"
-install -m 0755 -- "$root/native-panes/settings/target/release/tdnext-settings" "$dist/tdnext-settings"
-install -m 0755 -- "$root/native-desktop/target/release/tdnext-desktop" "$dist/tdnext-desktop"
-install -m 0755 -- "$root/native-panes/files/target/release/tdnext-files" "$dist/tdnext-files"
+install -m 0755 -- "$root/native-manager/target/$target/release/tdnext" "$dist/tdnext"
+install -m 0755 -- "$root/native-panes/settings/target/$target/release/tdnext-settings" "$dist/tdnext-settings"
+install -m 0755 -- "$root/native-desktop/target/$target/release/tdnext-desktop" "$dist/tdnext-desktop"
+install -m 0755 -- "$root/native-panes/files/target/$target/release/tdnext-files" "$dist/tdnext-files"
 if [[ -n "${TDNEXT_PREBUILT_CORE:-}" ]]; then
   test -x "${TDNEXT_PREBUILT_CORE}" \
     || { echo "build-dist: TDNEXT_PREBUILT_CORE is not executable: ${TDNEXT_PREBUILT_CORE}" >&2; exit 1; }

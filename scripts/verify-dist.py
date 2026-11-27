@@ -20,8 +20,10 @@ The verifier never builds anything; it only checks and runs:
 3. Read the archive bytes once: the same private bytes are hashed,
    layout-checked, and extracted. The tree is extracted once to a fresh
    directory outside the checkout, removed on every exit.
-4. Probe the archived pane executables themselves (core chrome version,
-   desktop help, manager list) -- executables, not text.
+4. Probe the archived pane executables themselves: each must be a static
+   ELF executable (no program interpreter, so it runs on any Linux x86-64
+   glibc or musl system), then core chrome version, desktop help, manager
+   list -- executables, not text.
 5. Run the existing functional smoke (``scripts/smoke-dist.sh``) against
    the extracted tree.
 6. Run every named scene in each terminal mode (``linux``,
@@ -46,6 +48,7 @@ import io
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -165,6 +168,30 @@ def extract_once(data: bytes, dest: Path) -> Path:
     return dest / TOP
 
 
+def elf_interpreter(path: Path) -> str | None:
+    """Return the PT_INTERP path of an ELF64 little-endian executable, or None."""
+    step = 'static executables'
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        fail(step, f'cannot read {path.name}: {exc}')
+    if data[:4] != b'\x7fELF' or data[4:6] != b'\x02\x01':
+        fail(step, f'{path.name} is not an ELF64 little-endian executable')
+    try:
+        phoff, = struct.unpack_from('<Q', data, 0x20)
+        phentsize, phnum = struct.unpack_from('<HH', data, 0x36)
+        for index in range(phnum):
+            header = phoff + index * phentsize
+            p_type, = struct.unpack_from('<I', data, header)
+            if p_type == 3:  # PT_INTERP
+                offset, = struct.unpack_from('<Q', data, header + 8)
+                size, = struct.unpack_from('<Q', data, header + 32)
+                return data[offset:offset + size].rstrip(b'\0').decode(errors='replace')
+    except struct.error:
+        fail(step, f'{path.name} has a truncated ELF header')
+    return None
+
+
 def scrub_env() -> dict[str, str]:
     """Verifier environment: no nesting, no test overrides, no hooks."""
     env = dict(os.environ)
@@ -192,6 +219,11 @@ def probe_executables(dist: Path, env: dict[str, str]) -> None:
         candidate = dist / name
         if not candidate.is_file() or not os.access(candidate, os.X_OK):
             fail(step, f'{name} is missing or not executable after extraction')
+        interpreter = elf_interpreter(candidate)
+        if interpreter is not None:
+            fail('static executables',
+                 f'{name} is dynamically linked (interpreter {interpreter}); '
+                 'release executables must be static')
     if list(dist.glob('*.whl')):
         fail(step, 'wheel present in native distribution')
     if (dist / 'LICENSE.zellij-0.45.1').stat().st_size == 0:

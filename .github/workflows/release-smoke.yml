@@ -4,7 +4,9 @@
 # exactly once (the same closure as `ci`, no duplicated build); the check
 # stages, archives, and verifies the distribution itself, then exports the
 # tested archive bytes plus `<archive>.sha256` (sha256sum text format) via
-# ARCHIVE_OUT. This workflow publishes exactly those tested bytes and never
+# ARCHIVE_OUT. install-test.yml then installs those bytes with the two
+# install scripts on clean distributions. Only after both pass does publish
+# attest (GitHub build provenance) and release exactly those files; it never
 # rebuilds, re-archives, or re-verifies. Nothing touches branch protection.
 #
 name: release-smoke
@@ -52,13 +54,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            attr btop build-essential libssl-dev neovim pkg-config tmux vim
+            attr btop build-essential libssl-dev musl-tools neovim pkg-config tmux vim
 
       - name: Install the toolchain from rust-toolchain.toml
         run: |
           channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
           test -n "${channel}"
-          rustup toolchain install --profile minimal --component rustfmt,clippy
+          rustup toolchain install --profile minimal --component rustfmt,clippy --target x86_64-unknown-linux-musl
           case "$(rustc --version)" in
             "rustc ${channel}."*) ;;
             *) echo "error: expected rustc ${channel}.x, got: $(rustc --version)" >&2; exit 1 ;;
@@ -89,24 +91,32 @@ jobs:
           echo "ZELLIJ_SRC=${RUNNER_TEMP}/zellij-ci" >> "${GITHUB_ENV}"
 
       - name: Run the project check entry point (exports the tested archive)
-        run: make check ARCHIVE_OUT="${RUNNER_TEMP}/tdnext-linux-x86_64.tar.gz"
+        run: make check ARCHIVE_OUT="${RUNNER_TEMP}/dist/tdnext-linux-x86_64.tar.gz"
+
+      - name: Add the install scripts from the verified commit
+        run: install -m 0755 scripts/install.sh scripts/install-verified-dist.sh "${RUNNER_TEMP}/dist/"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: verified-dist
           if-no-files-found: error
-          path: |
-            ${{ runner.temp }}/tdnext-linux-x86_64.tar.gz
-            ${{ runner.temp }}/tdnext-linux-x86_64.tar.gz.sha256
+          path: ${{ runner.temp }}/dist/
+
+  install-test:
+    needs: verify
+    uses: ./.github/workflows/install-test.yml
 
   publish:
-    needs: verify
+    needs: [verify, install-test]
     env:
       VERIFIED_COMMIT: ${{ needs.verify.outputs.commit }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - name: Confirm the tagged commit belongs to main
         run: |
@@ -123,7 +133,21 @@ jobs:
           name: verified-dist
           path: assets
 
-      - name: Publish the tested native archive
+      - name: Check the downloaded bytes against the verified digest
+        working-directory: assets
+        run: |
+          test "$(ls | LC_ALL=C sort | tr '\n' ' ')" = "install-verified-dist.sh install.sh tdnext-linux-x86_64.tar.gz tdnext-linux-x86_64.tar.gz.sha256 "
+          sha256sum tdnext-linux-x86_64.tar.gz | cmp - tdnext-linux-x86_64.tar.gz.sha256
+
+      - name: Attest build provenance for the published files
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            assets/tdnext-linux-x86_64.tar.gz
+            assets/install.sh
+            assets/install-verified-dist.sh
+
+      - name: Publish the tested native archive and installer
         env:
           GH_TOKEN: ${{ github.token }}
         working-directory: assets
@@ -133,4 +157,5 @@ jobs:
           git -C ../history fetch --no-tags origin "$GITHUB_REF"
           test "$(git -C ../history rev-parse 'FETCH_HEAD^{commit}')" = "$VERIFIED_COMMIT"
           gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
-            --verify-tag --target "$VERIFIED_COMMIT" --generate-notes "$asset" "$asset.sha256"
+            --verify-tag --target "$VERIFIED_COMMIT" --generate-notes \
+            "$asset" "$asset.sha256" install.sh install-verified-dist.sh

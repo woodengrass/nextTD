@@ -1,0 +1,74 @@
+# Install the verified release assets on clean Linux distributions.
+#
+# Called by ci.yml and release-smoke.yml after `make check` exported the
+# tested archive. The `verified-dist` artifact holds exactly the files a
+# release publishes: the archive, its .sha256, install.sh and
+# install-verified-dist.sh. Each image runs install.sh as an unprivileged
+# user from those files (no Python, no build tools, no root for the
+# install itself) and then runs the installed programs, which proves the
+# static executables start on older and non-Debian systems. Nothing is
+# rebuilt or published here.
+#
+name: install-test
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  install-test:
+    name: install-test (${{ matrix.image }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:12", "ubuntu:20.04", "fedora:43"]
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: verified-dist
+          path: assets
+
+      - name: Install and run as an unprivileged user on ${{ matrix.image }}
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          name="install-test-$$"
+          docker run -d --name "$name" -v "$PWD/assets:/assets:ro" "$IMAGE" sleep infinity
+          trap 'docker rm -f "$name" >/dev/null' EXIT
+          # Only the downloader and the standard tools install.sh documents.
+          docker exec -u 0 "$name" sh -euc '
+            if command -v apt-get >/dev/null; then
+              apt-get update -qq
+              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ca-certificates curl >/dev/null
+            else
+              dnf install -y -q curl tar gzip findutils diffutils gawk
+            fi'
+          docker exec -u 1000:1000 -e HOME=/tmp/home -i "$name" bash -s <<'EOF'
+          set -euo pipefail
+          mkdir -p "$HOME"
+          bash /assets/install.sh --base-url file:///assets
+          export PATH="$HOME/.local/bin:$PATH"
+          root="$HOME/.local/opt/tdnext/current"
+          test "$("$root/tdnext-core" --tdnext-chrome-version)" = 1
+          "$root/tdnext-desktop" --help >/dev/null
+          tdnext list | grep -q '^files '
+          tdnext enable files
+          tdnext list | grep -Eq '^files +enabled'
+          # A second run reuses the byte-identical release and keeps the link.
+          bash /assets/install.sh --base-url file:///assets >/dev/null
+          test "$(readlink "$HOME/.local/bin/tdnext")" = "$root/tdnext"
+          # The printed uninstall command removes the programs, not settings.
+          test -f "$HOME/.local/share/tdnext/plugins.json"
+          rm -- "$HOME/.local/bin/tdnext" && rm -rf -- "$HOME/.local/opt/tdnext"
+          test -f "$HOME/.local/share/tdnext/plugins.json"
+          echo "install-test: ok on $(. /etc/os-release && echo "$PRETTY_NAME")"
+          EOF

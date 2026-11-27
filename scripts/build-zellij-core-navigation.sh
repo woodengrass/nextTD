@@ -18,7 +18,9 @@
 #      never modified).
 #   3. Applies the navigation patch followed by the native chrome patch.
 #   4. Builds `cargo build --locked --release --no-default-features
-#      --bin zellij` inside the exported source.
+#      --features vendored_curl --target x86_64-unknown-linux-musl --bin
+#      zellij` inside the exported source: a static executable with curl and
+#      OpenSSL built in, independent of the host's glibc and libssl.
 #   5. When TDNEXT_TEST_PATCHED_CORE=1, runs the navigation test suites
 #      inside the SAME exported patched source (zellij-server navigation +
 #      fixed-width tests, then the full zellij-utils lib suite) and refuses
@@ -36,9 +38,12 @@
 #     filter that matched no passing tests, abort before install.
 #   PATH and CARGO_HOME are used as inherited from the caller's
 #   environment and are never overridden here. Install the Rust 1.95
-#   toolchain (e.g. `rustup toolchain install 1.95`) plus the upstream
-#   native build prerequisites (a C compiler, pkg-config, and OpenSSL
-#   development headers; see the Zellij repository README) before running.
+#   toolchain with the x86_64-unknown-linux-musl target (rust-toolchain.toml
+#   lists it) plus the upstream native build prerequisites (a C compiler,
+#   pkg-config, OpenSSL development headers for the host-target test suites,
+#   perl and make for the vendored OpenSSL, and musl-gcc, e.g. Ubuntu's
+#   musl-tools) before running. CC_x86_64_unknown_linux_musl overrides the
+#   musl C compiler.
 #   Cargo may download locked dependencies unless its offline mode is enabled.
 #   The script does not use sudo, change Git configuration, commit, or operate
 #   on any session.
@@ -51,6 +56,7 @@ PATCH_NAME="zellij-0.45.1-core-navigation.patch"
 CHROME_PATCH_NAME="zellij-0.45.1-native-chrome.patch"
 LICENSE_NAME="LICENSE.zellij-0.45.1"
 DEST_NAME="tdnext"
+RUST_TARGET="x86_64-unknown-linux-musl"
 
 usage() {
   echo "usage: $(basename "$0") <path-to-zellij-git-checkout> [destination]" >&2
@@ -97,7 +103,7 @@ if [ -e "${DEST_FILE}" ]; then
   exit 1
 fi
 
-for tool in git cargo rustc tar; do
+for tool in git cargo rustc tar perl make; do
   if ! command -v "${tool}" >/dev/null 2>&1; then
     echo "error: required tool '${tool}' not found on PATH." >&2
     echo "Install the Rust 1.95 toolchain (rustup) plus the upstream native" >&2
@@ -105,6 +111,18 @@ for tool in git cargo rustc tar; do
     exit 1
   fi
 done
+
+if [ -z "${CC_x86_64_unknown_linux_musl:-}" ]; then
+  if command -v x86_64-linux-musl-gcc >/dev/null 2>&1; then
+    export CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc
+  elif command -v musl-gcc >/dev/null 2>&1; then
+    export CC_x86_64_unknown_linux_musl=musl-gcc
+  else
+    echo "error: musl C compiler not found (musl-gcc or x86_64-linux-musl-gcc)." >&2
+    echo "Install it (Ubuntu/Debian: apt install musl-tools) and retry." >&2
+    exit 1
+  fi
+fi
 
 RUSTC_VERSION="$(rustc --version | awk '{print $2}')"
 RUST_MAJOR="$(echo "${RUSTC_VERSION}" | cut -d. -f1)"
@@ -135,9 +153,9 @@ TARGET_DIR="${CARGO_TARGET_DIR:-${WORK_DIR}/target}"
 if [[ "${TARGET_DIR}" != /* ]]; then
   TARGET_DIR="${WORK_DIR}/${TARGET_DIR}"
 fi
-(cd "${WORK_DIR}" && cargo build --locked --release --no-default-features --bin zellij --target-dir "${TARGET_DIR}")
+(cd "${WORK_DIR}" && cargo build --locked --release --no-default-features --features vendored_curl --target "${RUST_TARGET}" --bin zellij --target-dir "${TARGET_DIR}")
 
-BUILT_BIN="${TARGET_DIR}/release/zellij"
+BUILT_BIN="${TARGET_DIR}/${RUST_TARGET}/release/zellij"
 if [ ! -x "${BUILT_BIN}" ]; then
   echo "error: expected build output missing: ${BUILT_BIN}" >&2
   exit 1
